@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,28 @@ def _run(args: list[str], env: dict[str, str] | None = None) -> subprocess.Compl
     return subprocess.run(
         args,
         cwd=ROOT,
+        env={**os.environ, **(env or {})},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _public_workspace(tmp_path: Path) -> Path:
+    """Fresh-checkout workspace: public example config only, no private lekiwi.yaml."""
+    shutil.copy2(ROOT / "lekiwi.example.yaml", tmp_path / "lekiwi.example.yaml")
+    shutil.copytree(ROOT / "scripts", tmp_path / "scripts")
+    return tmp_path
+
+
+def _run_in(
+    cwd: Path,
+    args: list[str],
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=cwd,
         env={**os.environ, **(env or {})},
         capture_output=True,
         text=True,
@@ -66,6 +89,15 @@ def test_sync_dry_run_quotes_remote_repo_with_spaces():
 
     assert proc.returncode == 0, proc.stderr
     assert "pi@lekiwi.local:le\\ kiwi/lerobot/" in proc.stdout
+
+
+def test_sync_dry_run_uses_example_config_when_private_config_is_absent(tmp_path):
+    workspace = _public_workspace(tmp_path)
+
+    proc = _run_in(workspace, ["bash", "scripts/sync.sh", "--dry-run"])
+
+    assert proc.returncode == 0, proc.stderr
+    assert "rsync" in proc.stdout
 
 
 def test_sync_rejects_host_that_could_be_an_option():

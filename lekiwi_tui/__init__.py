@@ -29,8 +29,8 @@ def _resolve_root() -> Path:
 
 ROOT: Path = _resolve_root()
 
-CFG_FILE: Path = ROOT / "lekiwi.yaml"      # single source of truth (all commands +
-                                           # the _launcher: ops knobs, env > yaml > default)
-CFG_CACHE: Path = ROOT / ".lekiwi-cache"   # per-command blocks sliced from lekiwi.yaml
+CFG_FILE: Path = ROOT / "lekiwi.yaml"          # private local config (real robot runs)
+EXAMPLE_CFG_FILE: Path = ROOT / "lekiwi.example.yaml"  # public read-only preview fallback
+CFG_CACHE: Path = ROOT / ".lekiwi-cache"       # per-command blocks sliced from config yaml
 
-__all__ = ["PKG_DIR", "ROOT", "CFG_FILE", "CFG_CACHE"]
+__all__ = ["PKG_DIR", "ROOT", "CFG_FILE", "EXAMPLE_CFG_FILE", "CFG_CACHE"]

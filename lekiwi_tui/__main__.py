@@ -20,7 +20,7 @@ import importlib
 import os
 import sys
 
-from . import CFG_FILE, ROOT
+from . import CFG_FILE, EXAMPLE_CFG_FILE, ROOT
 from .app_registry import ACTIONS, ACTIONS_BY_ID, ALIASES, resolve_action
 from .context import load_context
 from .dispatch import Dispatcher
@@ -104,17 +104,18 @@ def _action_suggestions(name: str) -> list[str]:
     return out
 
 
-def _workspace_ready() -> bool:
+def _workspace_ready(*, require_private_config: bool) -> bool:
     """Validate the project workspace before any action that needs config/scripts."""
     scripts = ROOT / "scripts"
-    example_cfg = ROOT / "lekiwi.example.yaml"
     missing: list[str] = []
     if not ROOT.is_dir():
         missing.append(str(ROOT))
-    if not CFG_FILE.exists():
+    if require_private_config and not CFG_FILE.exists():
         missing.append(str(CFG_FILE))
     if not scripts.is_dir():
         missing.append(str(scripts))
+    if not require_private_config and not (CFG_FILE.exists() or EXAMPLE_CFG_FILE.exists()):
+        missing.append(str(EXAMPLE_CFG_FILE))
     if not missing:
         return True
     print("✗ lekiwi workspace is incomplete.", file=sys.stderr)
@@ -126,7 +127,7 @@ def _workspace_ready() -> bool:
         "LEKIWI_ROOT=/path/to/lekiwi-tui.",
         file=sys.stderr,
     )
-    if not CFG_FILE.exists() and example_cfg.exists():
+    if require_private_config and not CFG_FILE.exists() and EXAMPLE_CFG_FILE.exists():
         print(
             "  First-run setup: `cp lekiwi.example.yaml lekiwi.yaml`, then edit "
             "lekiwi.yaml for your robot.",
@@ -145,14 +146,11 @@ def main(argv: list[str] | None = None) -> int:
         args = [a for a in args if a not in ("--dry-run", "-n")]
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
 
-    wants_help = bool(args) and args[0] in ("-h", "--help", "help")
-    if not wants_help:
-        if not _workspace_ready():
-            return 1
-        os.chdir(ROOT)  # relative dataset/model paths resolve against the workspace root
-
     # ── no args → the interactive menu (needs a TTY) ──────────────────────────
     if not args:
+        if not _workspace_ready(require_private_config=True):
+            return 1
+        os.chdir(ROOT)  # relative dataset/model paths resolve against the workspace root
         if not is_tty:
             print(
                 "The menu needs an interactive terminal. Use: python -m lekiwi_tui <action>",
@@ -181,6 +179,12 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+
+    from .framework import runner
+
+    if not _workspace_ready(require_private_config=not runner.DRY_RUN):
+        return 1
+    os.chdir(ROOT)  # relative dataset/model paths resolve against the workspace root
 
     ctx = load_context(is_tty=is_tty)
 

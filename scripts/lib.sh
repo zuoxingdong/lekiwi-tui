@@ -71,7 +71,12 @@ import yaml
 
 root = Path(sys.argv[1]).resolve()
 cmd = sys.argv[2]
-doc = yaml.safe_load((root / "lekiwi.yaml").read_text()) or {}
+cfg = root / "lekiwi.yaml"
+if not cfg.exists():
+    cfg = root / "lekiwi.example.yaml"
+if not cfg.exists():
+    sys.exit(0)
+doc = yaml.safe_load(cfg.read_text()) or {}
 block = doc.get(cmd)
 if block is None:
     sys.exit(0)                      # absent block -> empty output (cfg_for None)
@@ -98,7 +103,12 @@ import yaml
 
 root = Path(sys.argv[1]).resolve()
 dotted = sys.argv[2]
-cur = yaml.safe_load((root / "lekiwi.yaml").read_text()) or {}
+cfg = root / "lekiwi.yaml"
+if not cfg.exists():
+    cfg = root / "lekiwi.example.yaml"
+if not cfg.exists():
+    sys.exit(0)
+cur = yaml.safe_load(cfg.read_text()) or {}
 for part in dotted.split("."):
     if not isinstance(cur, dict) or part not in cur:
         sys.exit(0)                  # miss -> empty output

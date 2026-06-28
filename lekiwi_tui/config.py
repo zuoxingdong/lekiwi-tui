@@ -31,7 +31,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.scalarstring import SingleQuotedScalarString
 
-from . import CFG_CACHE, CFG_FILE, ROOT
+from . import CFG_CACHE, CFG_FILE, EXAMPLE_CFG_FILE, ROOT
 
 # kind strings, mirroring the bash registry's third axis:
 #   text | path | int | enum:<a>,<b>,...   (path defaults expand $HOME/$ROOT)
@@ -201,12 +201,27 @@ class Config:
         return dict(self.values)
 
 
+def _readable_yaml_path(path: Path) -> Path | None:
+    """Return the config path to read.
+
+    The private ``lekiwi.yaml`` remains the real-run source of truth. In a fresh public
+    checkout, preview commands and CI can read ``lekiwi.example.yaml`` instead so dry-run
+    paths still exercise argv construction without requiring private robot config.
+    """
+    if path.exists():
+        return path
+    if path == CFG_FILE and EXAMPLE_CFG_FILE.exists():
+        return EXAMPLE_CFG_FILE
+    return None
+
+
 def load_yaml(path: Path = CFG_FILE) -> dict:
     """yaml.safe_load of lekiwi.yaml; anchors + `<<:` merges resolved into a plain
     dict. Returns {} for a missing/empty file so callers can fail soft like bash."""
-    if not path.exists():
+    readable = _readable_yaml_path(path)
+    if readable is None:
         return {}
-    data = yaml.safe_load(path.read_text())
+    data = yaml.safe_load(readable.read_text())
     return data or {}
 
 

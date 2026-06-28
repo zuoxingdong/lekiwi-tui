@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import lekiwi_tui.screens.teleop as teleop_mod
 from lekiwi_tui.config import Config
@@ -10,6 +13,16 @@ from lekiwi_tui.context import Context
 from lekiwi_tui.framework.events import DOWN, ENTER, Key
 from lekiwi_tui.framework.screen import Invoke, Nothing
 from lekiwi_tui.screens.teleop import TELEOP_SCRIPT, TeleopScreen
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _public_workspace(tmp_path: Path) -> dict[str, str]:
+    """Fresh-checkout workspace: public example config only, no private lekiwi.yaml."""
+    shutil.copy2(ROOT / "lekiwi.example.yaml", tmp_path / "lekiwi.example.yaml")
+    shutil.copytree(ROOT / "scripts", tmp_path / "scripts")
+    return {**os.environ, "LEKIWI_ROOT": str(tmp_path)}
 
 
 def _ctx() -> Context:
@@ -70,9 +83,10 @@ def test_teleop_start_still_suspends_to_script_with_passthrough_args(monkeypatch
     ]
 
 
-def test_headless_dry_run_teleop_prints_preview_not_real_run():
+def test_headless_dry_run_teleop_prints_preview_not_real_run(tmp_path):
     proc = subprocess.run(
         [sys.executable, "-m", "lekiwi_tui", "--dry-run", "teleop"],
+        env=_public_workspace(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -83,9 +97,10 @@ def test_headless_dry_run_teleop_prints_preview_not_real_run():
     assert "--display_data=" in proc.stdout
 
 
-def test_headless_dry_run_host_launch_does_not_scp_or_ssh():
+def test_headless_dry_run_host_launch_does_not_scp_or_ssh(tmp_path):
     proc = subprocess.run(
         [sys.executable, "-m", "lekiwi_tui", "--dry-run", "host-launch"],
+        env=_public_workspace(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -96,9 +111,10 @@ def test_headless_dry_run_host_launch_does_not_scp_or_ssh():
     assert "ssh" in proc.stdout
 
 
-def test_headless_dry_run_host_kill_does_not_ssh():
+def test_headless_dry_run_host_kill_does_not_ssh(tmp_path):
     proc = subprocess.run(
         [sys.executable, "-m", "lekiwi_tui", "--dry-run", "host-kill"],
+        env=_public_workspace(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -110,9 +126,10 @@ def test_headless_dry_run_host_kill_does_not_ssh():
     assert "emit-kill" not in proc.stderr
 
 
-def test_unknown_cli_action_suggests_near_matches():
+def test_unknown_cli_action_suggests_near_matches(tmp_path):
     proc = subprocess.run(
         [sys.executable, "-m", "lekiwi_tui", "hots"],
+        env={**os.environ, "LEKIWI_ROOT": str(tmp_path)},
         capture_output=True,
         text=True,
         check=False,
