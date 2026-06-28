@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lekiwi-tui"
+version = "0.1.0"
+description = "Standalone LeKiwi TUI control center built with pyratatui (Rust/ratatui) and local lerobot launcher scripts."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Xingdong Zuo", email = "18168681+zuoxingdong@users.noreply.github.com" }]
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Runtime deps. pyratatui (PyO3 bindings to Rust ratatui) is the UI engine.
+# ruamel.yaml + pyyaml back the lossless config layer (config.py). evdev is optional
+# (one kbd_listener backend) and imported lazily, so it is not a hard dep.
+dependencies = [
+    "pyratatui>=0.2.9",
+    "ruamel.yaml>=0.18",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+# Console entry points -> main() in lekiwi_tui/__main__.py
+# (`python -m lekiwi_tui` also works).
+lekiwi = "lekiwi_tui.__main__:main"
+
+[tool.setuptools.packages.find]
+# Flat repo layout (scripts/, assets/ are siblings of the package); pin discovery to the
+# package tree only so setuptools auto-discovery does not error on the sibling dirs.
+include = ["lekiwi_tui*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["E702"]

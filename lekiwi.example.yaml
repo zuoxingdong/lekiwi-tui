@@ -1,0 +1,160 @@
+################################################################################
+# lekiwi.example.yaml
+#
+# Copy this file to lekiwi.yaml before first use:
+#
+#   cp lekiwi.example.yaml lekiwi.yaml
+#
+# Then edit lekiwi.yaml for your robot, laptop, dataset paths, policy paths, and
+# network. lekiwi.yaml is intentionally ignored by Git so local hostnames, IPs,
+# usernames, serial ports, dataset names, and model paths do not get published.
+################################################################################
+
+# Shared launcher and ops knobs. These configure the TUI and local launcher
+# scripts, not a lerobot command block. Keep values quoted so YAML loads them as
+# strings; the Settings screen preserves that shape when saving lekiwi.yaml.
+_launcher:
+  LAPTOP_ENV: 'lekiwi'
+  MAMBA_ROOT: '/home/YOUR_USER/miniforge3'
+  LEADER_PORT: '/dev/ttyACM0'
+  LEADER_ID: 'lekiwi_leader'
+  LEKIWI_HOST: 'lekiwi.local'
+  ROBOT_ID: 'lekiwi'
+  CONNECTION_TIME: '600'
+  CONDA_ENV: 'lekiwi'
+  PI_REPO: 'lekiwi/lerobot'
+  POLICY_PATH: ''
+  POLICY_ROOT: '../models'
+  INFERENCE: 'sync'
+  EXECUTION_HORIZON: '20'
+  DISPLAY_DATA: 'off'
+
+# Cameras shared by the host and client. Adjust device paths, sizes, FPS, and
+# rotations for your robot.
+_cameras: &cameras
+  front:
+    type: opencv
+    index_or_path: /dev/video0
+    width: 640
+    height: 480
+    fps: 30
+    rotation: NO_ROTATION
+  wrist:
+    type: opencv
+    index_or_path: /dev/video2
+    width: 640
+    height: 480
+    fps: 30
+    rotation: ROTATE_180
+  top:
+    type: opencv
+    index_or_path: /dev/video4
+    width: 640
+    height: 480
+    fps: 30
+    rotation: NO_ROTATION
+
+# Laptop-side client connection to the LeKiwi host running on the robot.
+_robot: &robot
+  type: lekiwi_client
+  remote_ip: 192.168.0.123
+  id: lekiwi
+  polling_timeout_ms: 40
+  cameras: *cameras
+
+# SO101 leader arm used during teleop and recording.
+_leader_arm: &leader_arm
+  type: so101_leader
+  port: /dev/ttyACM0
+  id: lekiwi_leader
+
+# Local dataset location. The root is resolved from this checkout directory.
+_dataset: &dataset
+  repo_id: local/lekiwi-example
+  root: ../datasets/lekiwi-example
+
+# Language instruction shared by record and rollout/eval.
+_task: &task "Pick up the object and place it in the target container."
+
+
+# Host process run on the robot/Pi.
+host:
+  robot:
+    cameras: *cameras
+    use_degrees: true
+  host:
+    max_loop_freq_hz: 30
+    watchdog_timeout_ms: 500
+
+
+# Teleoperation without recording.
+teleop:
+  robot: *robot
+  teleop: *leader_arm
+  fps: 30
+  display_data: true
+
+
+# Teleoperation while recording a dataset.
+record:
+  robot: *robot
+  teleop: *leader_arm
+  dataset:
+    <<: *dataset
+    single_task: *task
+    fps: 30
+    num_episodes: 5
+    episode_time_s: 60
+    reset_time_s: 8
+    streaming_encoding: true
+    encoder_threads: 1
+    video_encoding_batch_size: 1
+    num_image_writer_threads_per_camera: 3
+    push_to_hub: false
+  resume: false
+  display_data: false
+
+
+# Replay a recorded episode back to the robot.
+replay:
+  robot: *robot
+  dataset:
+    <<: *dataset
+    episode: 0
+    fps: 30
+
+
+# Autonomous policy rollout/eval.
+rollout:
+  robot: *robot
+  strategy:
+    type: base
+  inference:
+    type: sync
+  rename_map:
+    observation.images.front: observation.images.camera1
+    observation.images.wrist: observation.images.camera2
+    observation.images.top: observation.images.camera3
+  fps: 30
+  duration: 60
+  task: *task
+  display_data: false
+
+
+# Local SmolVLA fine-tune.
+train:
+  dataset:
+    <<: *dataset
+  policy:
+    path: lerobot/smolvla_base
+    freeze_vision_encoder: true
+    train_expert_only: true
+    push_to_hub: false
+  batch_size: 8
+  steps: 20000
+  save_freq: 5000
+  log_freq: 100
+  num_workers: 4
+  seed: 1000
+  wandb:
+    enable: false

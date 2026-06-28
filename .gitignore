@@ -1,0 +1,9 @@
+# Local robot configuration. Publish lekiwi.example.yaml instead.
+lekiwi.yaml
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.lekiwi-cache/
