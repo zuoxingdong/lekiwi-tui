@@ -1,10 +1,15 @@
 """eval.py — EvalScreen: configure + launch a policy rollout on the robot (lerobot-rollout).
 
-A form with a DYNAMIC field list (the exec-horizon row appears only for the rtc backend), a
-PolicyPicker, an editable Task, and Backend/Duration/Display. Start validates the checkpoint
-then SUSPENDS into the rollout (pause=True) — it owns the real TTY for its keyboard controls.
-Fronts scripts/eval.sh (the sole argv source). NO compile toggle (intentional). Ports
-resolve_eval_policy / _device_note / _checkpoint_error verbatim.
+A form with a DYNAMIC field list (the exec-horizon row appears only for the rtc backend,
+the action-steps row only for sync), a PolicyPicker, an editable Task, a flow-steps row
+(FM integration steps; a policy that never reads num_steps ignores the override, so
+deliberately NO model-type gating), a camera-slots mode (auto-detected from the
+checkpoint's config.json input_features — see detect_cam_slots), and
+Backend/Duration/Display. The action/flow-steps 0-sentinels display the checkpoint's OWN
+values (read once per policy via _ckpt_info) so "checkpoint default" is never a surprise. Start validates the checkpoint then SUSPENDS into the rollout
+(pause=True) — it owns the real TTY for its keyboard controls. Fronts scripts/eval.sh (the
+sole argv source). NO compile toggle (intentional). Ports resolve_eval_policy /
+_device_note / _checkpoint_error verbatim.
 """
 from __future__ import annotations
 
@@ -37,6 +42,10 @@ EVAL_SCRIPT = ROOT / "scripts" / "eval.sh"
 STATE_KEY = "eval"
 FORM_LABEL_WIDTH = 13
 SUMMARY_LABEL_WIDTH = 10
+
+# Camera-slots modes, in ←→ cycle order. "auto" resolves per checkpoint via
+# detect_cam_slots; "map"/"native" force the eval.sh --cam-slots value.
+CAM_MODES = ("auto", "map", "native")
 
 
 def _tilde(path: str) -> str:
@@ -95,6 +104,36 @@ def _device_note(policy: str, gpu_name: str) -> str:
     return "No NVIDIA GPU detected; CPU will likely be slow"
 
 
+def detect_cam_slots(policy: str, rename_map: dict | None) -> tuple[str, str]:
+    """Resolve the camera-slots mode for a checkpoint: ("map"|"native", note).
+
+    The checkpoint's config.json input_features names the camera keys the policy was
+    trained on; the yaml rollout.rename_map maps robot-side keys -> trained slots.
+    Trained keys ⊆ map VALUES → "map" (the yaml rename applies, e.g. camera1/2/3
+    FT checkpoints); trained keys ⊆ map KEYS → "native" (the policy wants the raw
+    robot names — eval.sh then neutralizes the yaml map with an identity override,
+    because draccus MERGES dict CLI overrides so an empty map cannot clear it). Anything unreadable/unrecognized (hub repo ids, exotic key
+    sets like pi05's base_0_rgb) falls back to "map" — today's behavior — with a
+    note the form surfaces so a wrong guess is visible before the robot moves.
+    """
+    rmap = {str(k): str(v) for k, v in (rename_map or {}).items()}
+    if not rmap:
+        return "map", "no yaml rename_map"
+    try:
+        feats = json.loads((Path(policy) / "config.json").read_text()).get("input_features", {})
+    except Exception:
+        return "map", "checkpoint config unreadable"
+    cams = {k for k in feats if ".images." in k}
+    if not cams:
+        return "map", "no image features in checkpoint"
+    short = "/".join(sorted(k.rsplit(".", 1)[-1] for k in cams))
+    if cams <= set(rmap.values()):
+        return "map", short
+    if cams <= set(rmap.keys()):
+        return "native", short
+    return "map", f"unknown keys ({short})"
+
+
 def _state(ctx: "Context") -> dict[str, Any]:
     """Per-session Run policy form memory.
 
@@ -148,6 +187,25 @@ class EvalScreen(ScreenState):
             minimum=1,
             step=1,
         )
+        self._steps = NumberField(
+            "Action steps",
+            _state_int(state, "action_steps", 0),
+            minimum=0,
+            step=1,
+            zero_label="checkpoint default",
+        )
+        self._flow = NumberField(
+            "Flow steps",
+            _state_int(state, "flow_steps", 0),
+            minimum=0,
+            step=1,
+            zero_label="checkpoint default",
+        )
+        self._rename_map = cfg_get("rollout.rename_map", doc=ctx.doc) or {}
+        cam_mode = str(state.get("cam_mode", "auto"))
+        self._cam_mode = cam_mode if cam_mode in CAM_MODES else "auto"
+        self._ckpt_cache: tuple[str, dict] | None = None
+        self._refresh_ckpt_defaults()
         self._dur = NumberField(
             "Duration",
             _state_int(state, "duration", 0),
@@ -168,22 +226,63 @@ class EvalScreen(ScreenState):
             "task": self._task_text,
             "backend": self._backend,
             "exec_horizon": self._exec.value,
+            "action_steps": self._steps.value,
+            "flow_steps": self._flow.value,
+            "cam_mode": self._cam_mode,
             "duration": self._dur.value,
             "display": self._show,
         })
+
+    def _ckpt_info(self) -> dict:
+        """The current policy's parsed config.json ({} when unreadable), cached per
+        path — the form re-reads it only when the policy changes, not per frame."""
+        if self._ckpt_cache is not None and self._ckpt_cache[0] == self._policy:
+            return self._ckpt_cache[1]
+        try:
+            info = json.loads((Path(self._policy) / "config.json").read_text())
+        except Exception:
+            info = {}
+        if not isinstance(info, dict):
+            info = {}
+        self._ckpt_cache = (self._policy, info)
+        return info
+
+    def _refresh_ckpt_defaults(self) -> None:
+        """Show the checkpoint's OWN values inside the 0-sentinel labels, so
+        "checkpoint default" is never a surprise (a checkpoint may ship an atypical
+        n_action_steps, e.g. 1 where the usual value is 50)."""
+        n = self._ckpt_info().get("n_action_steps")
+        self._steps.zero_label = (
+            f"checkpoint default ({n})" if isinstance(n, int) else "checkpoint default"
+        )
+        k = self._ckpt_info().get("num_steps")
+        self._flow.zero_label = (
+            f"checkpoint default ({k})" if isinstance(k, int) else "checkpoint default"
+        )
 
     def _fields(self) -> list[str]:
         f = ["policy", "task", "backend"]
         if self._backend == "rtc":
             f.append("exec")
-        return f + ["duration", "display", "start"]
+        else:
+            f.append("steps")  # sync-only: rtc paces via exec-horizon, not n_action_steps
+        # "flow" shows for BOTH backends and ALL checkpoints: a policy that never
+        # reads num_steps ignores the override (inert) — no model-type gating.
+        return f + ["flow", "cameras", "duration", "display", "start"]
+
+    def _cam_resolved(self) -> tuple[str, str]:
+        """The concrete --cam-slots value + display note for the current mode/policy."""
+        if self._cam_mode == "auto":
+            return detect_cam_slots(self._policy, self._rename_map)
+        return self._cam_mode, "forced"
 
     def _cur(self) -> str:
         fs = self._fields()
         return fs[min(self._fpos, len(fs) - 1)]
 
     def _num(self, key: str) -> "NumberField | None":
-        return {"exec": self._exec, "duration": self._dur}.get(key)
+        return {"exec": self._exec, "steps": self._steps, "flow": self._flow,
+                "duration": self._dur}.get(key)
 
     # ── input ─────────────────────────────────────────────────────────────────
     def handle_key(self, key: "Key") -> Any:
@@ -203,8 +302,12 @@ class EvalScreen(ScreenState):
                 self._backend = "sync" if self._backend == "rtc" else "rtc"
                 self._fpos = min(self._fpos, len(self._fields()) - 1)
                 self._remember()
-            elif cur in ("exec", "duration"):
+            elif cur in ("exec", "steps", "flow", "duration"):
                 self._num(cur).step_by(delta); self._num(cur).sync_editor(); self._fresh = True
+                self._remember()
+            elif cur == "cameras":
+                i = CAM_MODES.index(self._cam_mode)
+                self._cam_mode = CAM_MODES[(i + delta) % len(CAM_MODES)]
                 self._remember()
             elif cur == "display":
                 self._show = not self._show
@@ -219,14 +322,18 @@ class EvalScreen(ScreenState):
                 self._backend = "sync" if self._backend == "rtc" else "rtc"
                 self._remember()
                 self._fpos = min(self._fpos, len(self._fields()) - 1); return Nothing
+            if cur == "cameras":
+                i = CAM_MODES.index(self._cam_mode)
+                self._cam_mode = CAM_MODES[(i + 1) % len(CAM_MODES)]
+                self._remember(); return Nothing
             if cur == "display":
                 self._show = not self._show; self._remember(); return Nothing
-            if cur in ("exec", "duration"):
+            if cur in ("exec", "steps", "flow", "duration"):
                 self._commit_num(cur); return Nothing
             if cur == "start":
                 return Invoke(self._start)
             return Nothing
-        if cur in ("exec", "duration") and (is_char(key) or name == "Backspace"):
+        if cur in ("exec", "steps", "flow", "duration") and (is_char(key) or name == "Backspace"):
             ed = self._num(cur).editor
             if self._fresh and is_char(key):
                 ed.clear()
@@ -281,6 +388,7 @@ class EvalScreen(ScreenState):
             self._policy = chosen
         self._fallback_note = None
         self._err = ""
+        self._refresh_ckpt_defaults()  # new checkpoint -> new 0-sentinel labels
         self._remember()
 
     async def _start(self) -> None:
@@ -299,10 +407,13 @@ class EvalScreen(ScreenState):
         ):
             return
         self._remember()
+        cam_slots, _note = self._cam_resolved()  # eval.sh takes only the concrete value
         argv = [
             "bash", str(EVAL_SCRIPT),
             "--policy", self._policy, "--task", self._task_text, "--backend", self._backend,
-            "--exec-horizon", str(self._exec.value), "--duration", str(self._dur.value),
+            "--exec-horizon", str(self._exec.value), "--action-steps", str(self._steps.value),
+            "--flow-steps", str(self._flow.value),
+            "--cam-slots", cam_slots, "--duration", str(self._dur.value),
             "--display", "on" if self._show else "off", "--gpu", self.ctx.gpu_name, *self._extra,
         ]
         await app.suspend(argv, pause=True)
@@ -322,7 +433,7 @@ class EvalScreen(ScreenState):
         body_rows = (Layout().direction(Direction.Vertical).constraints([
             Constraint.length(len(self._fields())),
             Constraint.length(1),
-            Constraint.length(9 if self._fallback_note else 8),
+            Constraint.length(11 if self._fallback_note else 10),  # +2: Cameras + Flow summary rows
             Constraint.fill(1),
         ]).split(rows[3]))
         frame.render_widget(self._body(body_rows[0].width), body_rows[0])
@@ -351,10 +462,15 @@ class EvalScreen(ScreenState):
             return _clip_end(t, width)
         if field == "backend":
             return theme.choice(self._backend)
-        if field in ("exec", "duration"):
+        if field in ("exec", "steps", "flow", "duration"):
             nf = self._num(field)
             disp = (nf.editor.value + "█") if field == self._cur() else nf.display()
             return _clip_end(disp, width)
+        if field == "cameras":
+            mode, note = self._cam_resolved()
+            if self._cam_mode == "auto":
+                return _clip_end(f"{theme.choice('auto')} · {mode} · {note}", width)
+            return _clip_end(f"{theme.choice(mode)} · {note}", width)
         if field == "display":
             return theme.choice("on") if self._show else theme.choice("off")
         return ""
@@ -370,7 +486,13 @@ class EvalScreen(ScreenState):
         if field == "backend":
             if self._backend == "rtc":
                 return f"rtc · action horizon {self._exec.display()}"
-            return "sync · one policy forward per control tick"
+            return f"sync · action steps {self._steps.display()}"
+        if field == "flow":
+            return self._flow.display()
+        if field == "cameras":
+            mode, note = self._cam_resolved()
+            origin = "auto-detected" if self._cam_mode == "auto" else "forced"
+            return f"{mode} · {note} · {origin}"
         if field == "duration":
             return self._dur.display()
         if field == "display":
@@ -386,6 +508,12 @@ class EvalScreen(ScreenState):
                     else "Sync: one policy forward per control tick")
         if field == "exec":
             return self._exec.hint() + " · prediction window for RTC"
+        if field == "steps":
+            return self._steps.hint() + " · open-loop actions per forward (0 = checkpoint)"
+        if field == "flow":
+            return self._flow.hint() + " · FM integration steps (0 = checkpoint)"
+        if field == "cameras":
+            return "camera slots the policy expects; auto reads the checkpoint"
         if field == "duration":
             return self._dur.hint() + " · 0 = saved default"
         if field == "display":
@@ -400,6 +528,7 @@ class EvalScreen(ScreenState):
         fs = self._fields()
         cur = self._cur()
         labels = {"policy": "Policy", "task": "Task", "backend": "Backend", "exec": "Action horizon",
+                  "steps": "Action steps", "flow": "Flow steps", "cameras": "Cameras",
                   "duration": "Duration", "display": "Display", "start": "Start"}
         lines = []
         for field in fs:
@@ -459,6 +588,8 @@ class EvalScreen(ScreenState):
             ("Policy", self._summary_value("policy"), theme.STATUS_VALUE_STYLE),
             ("Task", self._summary_value("task"), theme.TEXT_STYLE),
             ("Backend", self._summary_value("backend"), theme.TEXT_STYLE),
+            ("Flow", self._summary_value("flow"), theme.TEXT_STYLE),
+            ("Cameras", self._summary_value("cameras"), theme.TEXT_STYLE),
             ("Duration", self._summary_value("duration"), theme.TEXT_STYLE),
             ("Display", self._summary_value("display"), theme.TEXT_STYLE),
             ("Device", _device_note(self._policy, self.ctx.gpu_name), theme.TEXT_STYLE),
@@ -514,10 +645,15 @@ def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001
         print(f"✗ {err}")
         return 1
     show = str(ctx.cfg["DISPLAY_DATA"]).lower() in ("1", "true", "yes", "on")
+    # Same auto camera-slots resolution as the form's default mode; action-steps has no
+    # env knob, so headless always passes 0 (the script omits the token = checkpoint
+    # default), exactly like an untouched form.
+    cam_slots, _note = detect_cam_slots(policy, cfg_get("rollout.rename_map", doc=ctx.doc) or {})
     argv = [
         "bash", str(EVAL_SCRIPT),
         "--policy", policy, "--backend", ctx.cfg["INFERENCE"],
         "--exec-horizon", str(ctx.cfg["EXECUTION_HORIZON"]),
+        "--action-steps", "0", "--flow-steps", "0", "--cam-slots", cam_slots,
         "--duration", "0", "--display", "on" if show else "off",
         "--gpu", ctx.gpu_name, *extra,
     ]
@@ -529,4 +665,4 @@ if TYPE_CHECKING:
     from ..framework.app import App
 
 
-__all__ = ["EvalScreen", "resolve_eval_policy", "run_headless", "HEADLESS_HOOK"]
+__all__ = ["EvalScreen", "detect_cam_slots", "resolve_eval_policy", "run_headless", "HEADLESS_HOOK"]

@@ -19,6 +19,9 @@
 #       [--device=cuda                              when --gpu is non-empty]
 #       [--inference.rtc.execution_horizon=<eh>     rtc backend only]
 #       [--duration=<n>                             when n>0]
+#       [--rename_map={k: k, ...}                   when --cam-slots native]
+#       [--policy.n_action_steps=<n>                when --action-steps n>0]
+#       [--policy.num_steps=<n>                     when --flow-steps n>0]
 #       [passthrough...]
 #
 #   * --config_path is the SPACE (two-token) form, NOT --config_path=...
@@ -39,6 +42,26 @@
 #     still passed (--exec-horizon) for sync, just not emitted.
 #   * --duration maps to --duration=<n>, but ONLY when n>0 (0 = use the config
 #     default).
+#   * --cam-slots map|native picks which camera keys the policy sees. `map` (default)
+#     keeps the slice's rename_map untouched — today's behavior, for checkpoints
+#     trained on renamed slots (camera1/2/3). `native` emits an IDENTITY rename_map
+#     built from the slice map's KEYS (robot-side names), for checkpoints trained on
+#     the raw robot keys (front/wrist/top). An identity map
+#     — NOT an empty one — because draccus MERGES dict CLI overrides into the config
+#     value (`--rename_map={}` is a silent no-op); re-pointing every key to itself is
+#     the only CLI-side way to neutralize the slice map. `auto` is resolved by the
+#     TUI (it reads the checkpoint's config.json input_features), NOT here: the
+#     script stays non-interactive and never inspects the checkpoint.
+#   * --action-steps <n> maps to --policy.n_action_steps=<n>, ONLY when n>0
+#     (0 = use the checkpoint's own value). Sync backend pacing: how many actions of
+#     the predicted chunk execute open-loop before the next policy forward. rtc
+#     ignores n_action_steps (it consumes via execution_horizon), so the TUI only
+#     surfaces this knob for sync — but the flag is backend-independent here.
+#   * --flow-steps <n> maps to --policy.num_steps=<n>, ONLY when n>0 (0 = the
+#     checkpoint's own value; smolvla's standard is 10). Flow-matching Euler
+#     integration steps per chunk — applies to sync AND rtc (rtc guides through the
+#     integrator). A policy that never reads num_steps simply ignores the override
+#     (inert), so there is no model-type gating anywhere.
 #   * deliberately NO --use_torch_compile: it was rejected for SmolVLA eval (per-shape
 #     recompiles are a training opt, not an eval one), so it stays absent here.
 #
@@ -46,6 +69,7 @@
 #   scripts/eval.sh --policy ~/run/checkpoints/last/pretrained_model --display on
 #   scripts/eval.sh --policy lerobot/smolvla_base --backend rtc --exec-horizon 22
 #   scripts/eval.sh --policy /p --backend sync --gpu CUDA --duration 60
+#   scripts/eval.sh --policy /p --cam-slots native --action-steps 10  # native-key ckpt
 #   scripts/eval.sh --dry-run --policy /p --backend rtc --gpu CUDA --exec-horizon 22
 #   scripts/eval.sh --policy /p --display on --policy.foo=bar   # trailing flags pass through
 #   DRY=1 scripts/eval.sh --policy /p --backend sync            # env-var dry-run (tests / CI)
@@ -89,6 +113,9 @@ eh="$(cfg_get rollout.inference.rtc.execution_horizon)"; eh="${eh:-20}"
 display="$(norm_bool "$(cfg_get rollout.display_data)")"  # true|false
 duration="0"           # 0/blank -> omit --duration (use the config default)
 gpu=""                 # GPU name; non-empty -> emit --device=cuda
+cam_slots="map"        # map -> keep the slice rename_map; native -> identity override
+steps="0"              # 0/blank -> omit --policy.n_action_steps (checkpoint default)
+flow="0"               # 0/blank -> omit --policy.num_steps (checkpoint default)
 dry="${DRY:-0}"        # DRY=1 in the env is an alias for --dry-run
 extra=()               # passthrough flags appended after the built argv
 
@@ -113,12 +140,55 @@ while [[ $# -gt 0 ]]; do
       display="$(norm_bool "$2")"; shift 2 ;;
     --gpu)
       gpu="$2"; shift 2 ;;
+    --cam-slots)
+      cam_slots="$2"; shift 2 ;;
+    --action-steps)
+      steps="$2"; shift 2 ;;
+    --flow-steps)
+      flow="$2"; shift 2 ;;
     --dry-run)
       dry=1; shift ;;
     *)
       extra+=("$1"); shift ;;   # tolerate + forward trailing passthrough flags
   esac
 done
+
+# The TUI resolves its "auto" mode BEFORE fronting this script; here only the two
+# concrete values are legal (fail fast on a typo rather than silently keeping map).
+case "$cam_slots" in
+  map|native) ;;
+  *) die_usage "--cam-slots must be 'map' or 'native' (got '$cam_slots'); 'auto' is TUI-side" ;;
+esac
+
+# rename_identity_token
+#   Print the single --rename_map=… token that neutralizes the slice's rename_map:
+#   an IDENTITY map over the slice map's KEYS (the robot-side camera names), in yaml
+#   flow style. Draccus MERGES dict CLI overrides into the config value, so every
+#   key must be re-pointed to itself — an empty {} would be a no-op. Reads
+#   lekiwi.yaml (fallback example) like cfg_get; absent/empty map -> no output, and
+#   the caller skips the token (native then degrades to today's behavior).
+rename_identity_token() {
+  "$PY" - "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+root = Path(sys.argv[1]).resolve()
+cfg = root / "lekiwi.yaml"
+if not cfg.exists():
+    cfg = root / "lekiwi.example.yaml"
+if not cfg.exists():
+    sys.exit(0)
+doc = yaml.safe_load(cfg.read_text()) or {}
+rollout = doc.get("rollout")
+rmap = rollout.get("rename_map") if isinstance(rollout, dict) else None
+if not isinstance(rmap, dict) or not rmap:
+    sys.exit(0)                      # nothing to neutralize -> no token
+body = ", ".join(f"{k}: {k}" for k in rmap)
+print("--rename_map={" + body + "}")
+PY
+}
 
 # ── assemble argv (the sole source; pinned by the golden test) ────────────────
 # cfg_slice writes the slice and echoes its absolute path; the $() strips the
@@ -161,6 +231,24 @@ fi
 #      -gt from tripping set -e on an empty value.
 if [[ -n "$duration" && "$duration" -gt 0 ]]; then
   argv+=("--duration=${duration}")
+fi
+#   5) the identity rename_map only for --cam-slots native (one token even with
+#      spaces inside the braces). Skipped when the yaml has no map to neutralize.
+if [[ "$cam_slots" == "native" ]]; then
+  identity_token="$(rename_identity_token)"
+  if [[ -n "$identity_token" ]]; then
+    argv+=("$identity_token")
+  fi
+fi
+#   6) --policy.n_action_steps only when --action-steps n>0 (0 = the checkpoint's
+#      own value). Same -n guard as --duration.
+if [[ -n "$steps" && "$steps" -gt 0 ]]; then
+  argv+=("--policy.n_action_steps=${steps}")
+fi
+#   7) --policy.num_steps only when --flow-steps n>0 (0 = the checkpoint's own
+#      value). Same -n guard as --duration.
+if [[ -n "$flow" && "$flow" -gt 0 ]]; then
+  argv+=("--policy.num_steps=${flow}")
 fi
 # Append any passthrough flags last (so a user --device= wins, draccus last-wins).
 # Empty in the TUI path, so the launch test still matches.
