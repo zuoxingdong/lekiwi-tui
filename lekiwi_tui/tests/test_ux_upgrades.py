@@ -8,7 +8,6 @@ import json
 import time
 import types
 
-import pytest
 
 from lekiwi_tui.framework.stream import StreamController
 from lekiwi_tui.hostprobe import HostProbe, get_probe, session_remaining
@@ -148,7 +147,6 @@ def test_record_hud_forwards_keys_and_blocks_local_stop_letters():
     forwarded: list[str] = []
     scr.stream.phase = "running"
     scr.stream.forward_key = lambda k: forwarded.append(k.name)  # type: ignore[assignment]
-    from lekiwi_tui.framework.screen import Nothing as _N  # noqa: N811
 
     # "s" and "q" are base-backward / lerobot-quit: they must FORWARD, not stop/pop.
     for name in ("s", "q", "Left", "Esc"):
