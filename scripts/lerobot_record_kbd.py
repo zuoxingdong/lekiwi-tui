@@ -56,32 +56,40 @@ class _SharedBaseKeyListener(KeyListener):
 # keyboard.Listener at connect() time, so this is picked up). Guard the import like the
 # teleop/rollout shims: a headless run (no DISPLAY) raises ImportError acquiring an X
 # connection — skip the patch and let lerobot's own PYNPUT_AVAILABLE path degrade as stock.
+#
+# lerobot 0.6 note: upstream's new pynput_can_capture() gate returns False on Wayland and
+# KeyboardTeleop.connect() then never constructs keyboard.Listener, bypassing this patch.
+# Upstream's Wayland fallback is press-only by design (no key-release in cbreak) and does
+# not serve hold-to-move base control, so force the gate open where the class patch is in
+# place (same try block; see lerobot_teleop_kbd.py for the full rationale).
 try:
     import pynput.keyboard  # noqa: E402
 
     pynput.keyboard.Listener = _SharedBaseKeyListener
+
+    import lerobot.teleoperators.keyboard.teleop_keyboard as _teleop_keyboard  # noqa: E402
+
+    if hasattr(_teleop_keyboard, "pynput_can_capture"):  # 0.6+; absent on 0.5.x
+        _teleop_keyboard.pynput_can_capture = lambda: True
 except ImportError:
     pass
 
 import lerobot.scripts.lerobot_record as rec  # noqa: E402
 
-# (1) EPISODE CONTROL — patch the name as bound in the record module's namespace (it did
-# `from lerobot.common.control_utils import init_keyboard_listener` at import, so patching
-# control_utils now would be too late). record() looks this up as a module global at call
-# time, so this swap takes effect for the run. share=True so it joins the base's shared
-# stdin reader (see the module docstring) rather than opening a second one.
+# (1) EPISODE CONTROL — patch the name as bound in the record module's namespace
+# (`from lerobot.utils.keyboard_input import init_keyboard_listener` on 0.6, so patching
+# the source module now would be too late). record() looks this up as a module global at
+# call time, so this swap takes effect for the run.
 #
-# Unlike the base (#2) and the rollout shim, episode control replaces the whole
-# init_keyboard_listener FUNCTION rather than relying on the class patch. Two reasons:
-#   1. Immune to a future is_headless() Wayland fix. lerobot only builds the pynput
-#      Listener AFTER `if is_headless(): return None, events`. A class-patch works
-#      today (is_headless() is False on Wayland), but the day lerobot teaches
-#      is_headless() to detect Wayland, record would take that early return and the
-#      patched Listener class would never be constructed — silently stranding the
-#      episode keys again. Replacing the whole function bypasses is_headless() entirely.
-#   2. Drops control_utils' per-key debug prints. lerobot's on_press prints
-#      "Right arrow key pressed. Exiting loop..." etc. on every mapped key, which would
-#      smear the record loop's tqdm bars. make_stdin_listener has no such prints.
+# Since lerobot 0.6 upstream DOES ship its own Wayland fallback for these episode keys
+# (TerminalKeyListener, cbreak reads on the controlling TTY), and standalone
+# `lerobot-record` works fine with it. This shim still replaces the function for ONE
+# reason: coexistence with the base listener (#2). Both consumers want fd 0 — the base
+# rides the kitty-protocol stdin reader on Ghostty, and upstream's episode listener would
+# open a SECOND reader on the same fd; the two threads then steal bytes from each other
+# (arrows land in the base reader and vice versa). share=True subscribes the episode keys
+# to the SAME single stdin reader as the base instead. The events contract is identical
+# to upstream's (exit_early / rerecord_episode / stop_recording).
 rec.init_keyboard_listener = lambda: make_stdin_listener(share=True)
 
 if __name__ == "__main__":

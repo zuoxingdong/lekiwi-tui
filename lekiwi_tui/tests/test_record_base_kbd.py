@@ -140,6 +140,14 @@ def test_record_base_and_episode_share_one_reader(monkeypatch):
 
     monkeypatch.setattr(pynput.keyboard, "Listener", _SharedBaseKeyListener)
 
+    # Mimic the shim's second patch (lerobot 0.6+): connect() gates on
+    # pynput_can_capture(), which is False in a headless/Wayland test env and would
+    # skip Listener construction entirely — force it open exactly like the shim does.
+    import lerobot.teleoperators.keyboard.teleop_keyboard as teleop_keyboard
+
+    if hasattr(teleop_keyboard, "pynput_can_capture"):
+        monkeypatch.setattr(teleop_keyboard, "pynput_can_capture", lambda: True)
+
     # (2) base navigation — connect the KeyboardTeleop FIRST (record's order: line 454 < 458).
     base = KeyboardTeleop(KeyboardTeleopConfig())
     base.connect()

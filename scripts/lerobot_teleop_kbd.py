@@ -34,10 +34,23 @@ from lekiwi_tui.kbd_listener import KeyListener  # noqa: E402
 # time, so this is picked up). Guard the import like the rollout shim: a headless run (no
 # DISPLAY) raises ImportError acquiring an X connection — skip the patch and let lerobot's
 # own PYNPUT_AVAILABLE path degrade exactly as stock.
+#
+# lerobot 0.6 note: upstream added a pynput_can_capture() gate — on Wayland it returns
+# False and KeyboardTeleop.connect() bails out with listener = None WITHOUT constructing
+# keyboard.Listener, which would silently bypass the class patch. Upstream's own Wayland
+# fallback (utils/keyboard_input.py TerminalKeyListener) is deliberately press-only and
+# does NOT serve hold-to-move teleop, so forcing the gate open and using our
+# release-capable KeyListener is still the only working base control on Wayland. Only
+# forced when the class patch is actually in place (same try block).
 try:
     import pynput.keyboard  # noqa: E402
 
     pynput.keyboard.Listener = KeyListener
+
+    import lerobot.teleoperators.keyboard.teleop_keyboard as _teleop_keyboard  # noqa: E402
+
+    if hasattr(_teleop_keyboard, "pynput_can_capture"):  # 0.6+; absent on 0.5.x
+        _teleop_keyboard.pynput_can_capture = lambda: True
 except ImportError:
     pass
 
