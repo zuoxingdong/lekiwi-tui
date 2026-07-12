@@ -1,155 +1,79 @@
-# LeKiwi TUI
+# lerobot_robot_lekiwi_pincopen
 
-A standalone immediate-mode TUI for the LeKiwi robot workflow. It runs real
-`lerobot` commands through the local `scripts/*.sh` launchers and uses
-`pyratatui` for the terminal UI. The first screen is the control panel: live
-host/robot status chips above the robot workflow actions, with digit shortcuts
-for the daily-driver rows.
+My LeKiwi runs STS3250 servos on the four big arm joints and a
+[PincOpen](https://huggingface.co/blog/zuoxingdong/mobile-manipulation-lekiwi-pincopen)
+gripper. This plugin lets a **stock [LeRobot](https://github.com/huggingface/lerobot)
+install (0.5.x / 0.6.x) drive that hardware**, zero source edits.
 
-![LeKiwi TUI workflow](assets/lekiwi-tui-dry-run.gif)
+I wrote up the hardware build in
+[Mobile Manipulation with LeKiwi + PincOpen](https://huggingface.co/blog/zuoxingdong/mobile-manipulation-lekiwi-pincopen).
+This package is that integration as installable code.
 
-## Features
+**vs stock `lekiwi`:**
 
-- Start and stop the LeKiwi Pi host; a live status chip shows the host and the
-  remaining session time from any screen, and a running session can be left in
-  the background (`q`) while you record or teleoperate in the same terminal
-- Teleoperate, record, replay, and view episodes
-- Record HUD: in-page log with episode progress, phase, and a loop-rate gauge,
-  plus a dataset panel (episodes, length, size, resume plan) before you start
-- Train and run SmolVLA policies
-- Sync to Pi mirrors the laptop checkouts and re-runs the editable installs
-  automatically when dependencies changed, with a provenance line saying
-  exactly which version/branch ships
-- Emergency stop: press `K` twice from any screen to kill the remote host
-- Preview hardware commands before execution
-- Edit robot, task, and launcher settings from the terminal
-
-## Requirements
-
-- Linux terminal environment
-- Python 3.10+
-- LeRobot installed in the active Python/conda environment
-- A configured LeKiwi robot for real hardware actions
-- The default robot type `lekiwi_pincopen` expects the
-  [`lerobot_robot_lekiwi_pincopen`](https://github.com/zuoxingdong/lerobot_robot_lekiwi_pincopen)
-  plugin on the Pi — Set up Pi and Sync to Pi install and ship it automatically
-  (set `ROBOT_TYPE` to `lekiwi` in Settings to drive a stock LeKiwi instead)
-- Optional: membership in the `input` group enables base wasd keys in the
-  record HUD view (the terminal view needs no system changes)
+- arm joints 1-4 on **STS3250** (wrist_roll and gripper stay STS3215)
+- **PincOpen gripper**: fixed EPROM calibration, skipped during interactive calibration
+- **tuned servo params** written on every connect, all exposed as config fields:
+  tuning is a yaml/CLI edit (`--robot.heavy_p_coefficient=10`), never a code change
 
 ## Install
 
-Create a private local config first:
+```bash
+pip install -e .
+```
+
+## Use
+
+LeRobot auto-discovers the plugin by its package name (the official
+[third-party conventions](https://huggingface.co/docs/lerobot/integrate_hardware)):
 
 ```bash
-cp lekiwi.example.yaml lekiwi.yaml
-$EDITOR lekiwi.yaml
+# calibrate (gripper is skipped, its EPROM calibration is applied)
+lerobot-calibrate --robot.type=lekiwi_pincopen --robot.id=my_lekiwi
+
+# host (stock lekiwi_host skips plugin discovery, hence the wrapper; same CLI, same yaml)
+python -m lerobot_robot_lekiwi_pincopen.lekiwi_host --config_path=host.yaml
 ```
 
-Install from this checkout inside the Python/conda environment that already has
-`lerobot` installed:
+The client side (teleop/record/eval) needs nothing from this package:
+`lekiwi_client` never touches motors.
+
+Calibration files live under
+`~/.cache/huggingface/lerobot/calibration/robots/lekiwi_pincopen/`.
+Coming from stock `lekiwi`: copy that folder once.
+
+## Tuning
+
+| Field | Default |
+|---|---|
+| `arm_p_coefficient` | 14 |
+| `heavy_p_coefficient` | 10 |
+| `heavy_acceleration` | 200 |
+| `gripper_acceleration` | 200 |
+| `gripper_overload_torque` | 65 (percent) |
+| `gripper_protective_torque` | 5 (percent) |
+| `gripper_protection_time` | 7 (x10 ms) |
+
+**P=10 on the big joints is the load-bearing fix.** Stock writes P=16, which gave me
+jitter and servo overload shutdowns on this hardware.
+
+## Tests
 
 ```bash
-python -m pip install -e .
+pip install -e .[dev]
+python -m pytest tests
 ```
 
-The editable install is the supported install model. The CLI resolves this
-checkout as the workspace root and runs the local launcher scripts from here.
-
-If the checkout moves, reinstall it or set:
-
-```bash
-export LEKIWI_ROOT=/path/to/lekiwi-tui
-```
-
-## Run
-
-Open the menu or jump straight to an action:
-
-```bash
-lekiwi                 # menu
-lekiwi teleop          # direct action
-lekiwi --dry-run       # preview commands
-```
-
-The shim still works and self-activates the configured conda env:
-
-```bash
-./lekiwi.sh
-```
-
-## Keys
-
-- Move: arrows or `j`/`k`
-- Jump and run a menu action: `1`-`8` (setup actions have no shortcut)
-- Adjust fields: left/right or `h`/`l`
-- Edit/pick/start: Enter
-- Back: `q` (a running host stays up; stop it with `s` or the Stop host page)
-- Help: `?`
-- Toggle preview mode from the menu: `d`
-- Emergency host stop: `K` twice within 2 seconds, from any screen
-
-## Config
-
-- Publish `lekiwi.example.yaml`.
-- Keep `lekiwi.yaml` private; it is ignored by Git.
-- Launch env vars override `lekiwi.yaml`.
-- `lekiwi.yaml` controls robot host/IP, serial ports, dataset paths, policy paths,
-  cameras, and shared task text.
-
-## Safety
-
-Default mode is real execution. Use `--dry-run` or menu `d` to preview command
-argvs before running hardware actions.
-
-Remote SSH values are validated before use, and remote repo paths are quoted
-before being embedded in remote shell commands. This prevents malformed config
-from turning into surprising SSH behavior.
-
-## How It Works
-
-```mermaid
-flowchart TD
-    user[Operator] --> cli[lekiwi CLI / TUI]
-    cli --> cfg[lekiwi.yaml<br/>private local config]
-    cli --> screen[ScreenState<br/>forms, pickers, modals]
-    screen --> runner[runner<br/>stream or suspend]
-    runner --> scripts[scripts/*.sh<br/>single argv source]
-    scripts --> mode{preview mode?}
-    mode -->|yes| preview[print final argv]
-    mode -->|no| command[lerobot / ssh / rsync]
-    command --> robot[LeKiwi robot / Pi / local GPU]
-```
-
-Python owns interaction and screen state. The launcher scripts own final
-`lerobot`, `ssh`, and `rsync` command construction, so every action is also
-inspectable from the shell with `--dry-run`.
-
-## Development
-
-```bash
-python -m pip install -e .[dev]
-python -m ruff check .
-python -m pytest lekiwi_tui/tests
-```
-
-CI runs the same lean gate: editable install, import check, Ruff, and pytest.
-
-## Launcher Scripts
-
-The TUI fronts non-interactive shell launchers in `scripts/`. See
-[scripts/README.md](scripts/README.md) for the launcher contract and standalone
-dry-run examples.
+No hardware needed, everything stops short of `bus.connect()`.
 
 ## Related
 
-- [lerobot_robot_lekiwi_pincopen](https://github.com/zuoxingdong/lerobot_robot_lekiwi_pincopen)
-  — the LeRobot robot plugin this TUI drives by default (STS3250 arms + PincOpen
-  gripper + servo tuning)
-- [Mobile Manipulation with LeKiwi + PincOpen](https://huggingface.co/blog/zuoxingdong/mobile-manipulation-lekiwi-pincopen)
-  — the hardware integration story behind that robot
+- [Mobile Manipulation with LeKiwi + PincOpen](https://huggingface.co/blog/zuoxingdong/mobile-manipulation-lekiwi-pincopen):
+  the hardware story
+- [lekiwi-tui](https://github.com/zuoxingdong/lekiwi-tui): my terminal control center,
+  ships and drives this plugin automatically
 
-## Acknowledgements
+## License
 
-LeKiwi TUI builds on [LeRobot](https://github.com/huggingface/lerobot) and uses
-[pyratatui](https://github.com/pyratatui/pyratatui) for the terminal UI.
+Apache-2.0. `calibrate()`/`configure()` derive from LeRobot (Apache-2.0,
+The HuggingFace Inc. team); see the file headers.
