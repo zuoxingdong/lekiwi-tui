@@ -31,8 +31,9 @@ for the daily-driver rows.
 - LeRobot installed in the active Python/conda environment
 - A configured LeKiwi robot for real hardware actions
 - The default robot type `lekiwi_pincopen` expects the
-  `lerobot_robot_lekiwi_pincopen` plugin on the Pi (set `ROBOT_TYPE` to
-  `lekiwi` in Settings to drive a stock LeKiwi instead)
+  [`lerobot_robot_lekiwi_pincopen`](https://github.com/zuoxingdong/lerobot_robot_lekiwi_pincopen)
+  plugin on the Pi — Set up Pi and Sync to Pi install and ship it automatically
+  (set `ROBOT_TYPE` to `lekiwi` in Settings to drive a stock LeKiwi instead)
 - Optional: membership in the `input` group enables base wasd keys in the
   record HUD view (the terminal view needs no system changes)
 
@@ -139,6 +140,14 @@ CI runs the same lean gate: editable install, import check, Ruff, and pytest.
 The TUI fronts non-interactive shell launchers in `scripts/`. See
 [scripts/README.md](scripts/README.md) for the launcher contract and standalone
 dry-run examples.
+
+## Related
+
+- [lerobot_robot_lekiwi_pincopen](https://github.com/zuoxingdong/lerobot_robot_lekiwi_pincopen)
+  — the LeRobot robot plugin this TUI drives by default (STS3250 arms + PincOpen
+  gripper + servo tuning)
+- [Mobile Manipulation with LeKiwi + PincOpen](https://huggingface.co/blog/zuoxingdong/mobile-manipulation-lekiwi-pincopen)
+  — the hardware integration story behind that robot
 
 ## Acknowledgements
 
