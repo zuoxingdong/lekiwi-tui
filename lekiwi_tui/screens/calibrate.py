@@ -170,6 +170,7 @@ class CalibrateScreen(ScreenState):
             "--host", cfg["LEKIWI_HOST"],
             "--conda-env", cfg["CONDA_ENV"],
             "--robot-id", cfg["ROBOT_ID"],
+            "--robot-type", cfg["ROBOT_TYPE"],
         ]
 
     # ── view (rebuilt fresh each frame) ───────────────────────────────────────

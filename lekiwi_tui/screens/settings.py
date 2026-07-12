@@ -210,7 +210,7 @@ class SettingsScreen(ScreenState):
         try:
             new_cfg.save(self._cfg_path)
         except OSError:
-            self.message = f"✗ could not write {_collapse_home(str(self._cfg_path))}"; self._msg_ok = False
+            self.message = f"✗ could not write {_collapse_home(str(self._cfg_path))} — check file permissions"; self._msg_ok = False
             return
         self.ctx.cfg.values.update(self._work)
         self.dirty = False

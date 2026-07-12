@@ -166,3 +166,131 @@ def test_calibrate_follower_rejects_passthrough_flags():
 
     assert proc.returncode == 2
     assert "follower calibration does not accept passthrough flags" in proc.stderr
+
+
+# ── ROBOT_TYPE: the follower type flows from config into both launchers ────────
+
+
+def test_host_emit_launch_defaults_to_pincopen_plugin_module():
+    proc = _run([
+        "bash", "scripts/host.sh", "emit-launch",
+        "--conda-env", "lekiwi", "--robot-id", "lekiwi", "--connection-time", "600",
+    ])
+    assert proc.returncode == 0, proc.stderr
+    assert "python -m lerobot_robot_lekiwi_pincopen.lekiwi_host" in proc.stdout
+
+
+def test_host_emit_launch_robot_type_lekiwi_uses_stock_module():
+    proc = _run([
+        "bash", "scripts/host.sh", "emit-launch",
+        "--conda-env", "lekiwi", "--robot-id", "lekiwi", "--robot-type", "lekiwi",
+        "--connection-time", "600",
+    ])
+    assert proc.returncode == 0, proc.stderr
+    assert "python -m lerobot.robots.lekiwi.lekiwi_host" in proc.stdout
+
+
+def test_host_emit_launch_rejects_unknown_robot_type():
+    # A case-map whitelist, not string splicing: an arbitrary type must never reach
+    # the remote `python -m` line.
+    proc = _run([
+        "bash", "scripts/host.sh", "emit-launch",
+        "--conda-env", "lekiwi", "--robot-id", "lekiwi", "--robot-type", "evil.module",
+        "--connection-time", "600",
+    ])
+    assert proc.returncode == 2
+    assert "unknown robot type" in proc.stderr
+
+
+def test_calibrate_follower_remote_carries_robot_type():
+    default = _run([
+        "bash", "scripts/calibrate.sh", "emit-follower-remote",
+        "--conda-env", "lekiwi", "--robot-id", "lekiwi",
+    ])
+    stock = _run([
+        "bash", "scripts/calibrate.sh", "emit-follower-remote",
+        "--conda-env", "lekiwi", "--robot-id", "lekiwi", "--robot-type", "lekiwi",
+    ])
+    assert default.returncode == 0 and stock.returncode == 0
+    assert "--robot.type=lekiwi_pincopen " in default.stdout
+    assert "--robot.type=lekiwi " in stock.stdout
+
+
+def test_build_host_ssh_argv_rejects_unsafe_robot_type():
+    with pytest.raises(RemoteValueError):
+        build_host_ssh_argv(
+            "lekiwi", "lekiwi", "600",
+            conda_env="lekiwi", robot_type="bad type",
+        )
+
+
+# ── LOCAL_REPO/LOCAL_PLUGIN config + provenance + provision env plumbing ────────
+
+
+def test_sync_dry_run_honors_local_repo_env_override():
+    proc = _run(
+        ["bash", "scripts/sync.sh", "--dry-run"],
+        env={"LOCAL_REPO": "/tmp/elsewhere/lerobot", "LOCAL_PLUGIN": "/tmp/elsewhere/plugin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "/tmp/elsewhere/lerobot/" in proc.stdout
+    assert "/tmp/elsewhere/plugin/" in proc.stdout
+
+
+def test_provision_env_passes_paths_and_python_knobs(monkeypatch):
+    from lekiwi_tui.screens.provision import provision_env
+
+    cfg = {
+        "LEKIWI_HOST": "lekiwi",
+        "CONDA_ENV": "lekiwi",
+        "PI_REPO": "lekiwi/lerobot",
+        "LOCAL_REPO": "../lerobot",
+        "LOCAL_PLUGIN": "",
+    }
+    env = provision_env(cfg, py_ver="3.13", recreate=True)
+    assert env["PY_VER"] == "3.13"
+    assert env["RECREATE_ENV"] == "1"
+    assert env["LOCAL_REPO"].startswith("/") and env["LOCAL_REPO"].endswith("/lerobot")
+    assert "LOCAL_PLUGIN" not in env  # empty = keep the script's sibling default
+
+
+def test_shipping_summary_reads_version_and_ref():
+    from lekiwi_tui.screens.provision import shipping_summary
+
+    line = shipping_summary({"LOCAL_REPO": "", "LOCAL_PLUGIN": ""})
+    assert line.startswith("ships lerobot ")
+    assert "+ plugin " in line
+
+
+def test_ship_plugin_rejects_missing_local_dir():
+    from lekiwi_tui.screens.host import ship_plugin
+
+    assert ship_plugin("lekiwi", repo="lekiwi/lerobot", local="/nonexistent/plugin") is False
+
+
+def test_sync_install_flag_is_consumed_not_passed_to_rsync():
+    # --install forces the editable installs; it must never leak into the rsync argv
+    # (where an unknown flag would abort the transfer).
+    proc = _run(["bash", "scripts/sync.sh", "--dry-run", "--install"])
+    assert proc.returncode == 0, proc.stderr
+    assert "--install" not in proc.stdout
+    assert "rsync" in proc.stdout
+
+
+def test_sync_screen_argv_and_env_plumbing():
+    from lekiwi_tui.screens.sync import build_sync_argv, sync_env
+
+    assert build_sync_argv()[-1].endswith("sync.sh")
+    assert build_sync_argv(install=True)[-1] == "--install"
+
+    cfg = {
+        "LEKIWI_HOST": "lekiwi",
+        "PI_REPO": "lekiwi/lerobot",
+        "CONDA_ENV": "lekiwi",
+        "LOCAL_REPO": "../lerobot",
+        "LOCAL_PLUGIN": "",
+    }
+    env = sync_env(cfg)
+    assert env["CONDA_ENV"] == "lekiwi"
+    assert env["LOCAL_REPO"].startswith("/") and env["LOCAL_REPO"].endswith("/lerobot")
+    assert "LOCAL_PLUGIN" not in env  # empty = script's sibling default

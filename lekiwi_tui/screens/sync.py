@@ -41,16 +41,20 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
-from .. import ROOT
+from .. import CFG_FILE, ROOT
+from ..config import Config, resolve_workspace_path
 from ..framework import runner, theme
-from ..framework.events import ENTER, ESC, Key
+from ..framework.events import DOWN, ENTER, LEFT, RIGHT, UP, ESC, Key
+from ..framework.modals import PromptModalState
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
 from ..framework.stream import StreamController
-from .chrome import chip_spans, keycap_hint_line, option_line
+from .chrome import LABEL_W_ACTION, LABEL_W_FIELD, chip_spans, keycap_hint_line, option_line, runtime_chips
+from .provision import checkout_provenance, local_checkout, pyproject_version
 from ..remote import RemoteValueError, validate_ssh_host
 
 if TYPE_CHECKING:
@@ -66,24 +70,34 @@ SYNC_SCRIPT = ROOT / "scripts" / "sync.sh"
 RULE = "─" * 54
 
 
-def build_sync_argv(*, script: Any = SYNC_SCRIPT) -> list[str]:
-    """`bash sync.sh`. Run via bash (not the exec bit) so it works regardless of the
-    file's mode. The script reads host/repo from lekiwi.yaml's `_launcher` (env var >
-    yaml > default), so the TUI passes no flags — the no-arg invocation is the contract
-    the SyncScreen + headless path share."""
-    return ["bash", str(script)]
+def build_sync_argv(*, script: Any = SYNC_SCRIPT, install: bool = False) -> list[str]:
+    """`bash sync.sh [--install]`. Run via bash (not the exec bit) so it works regardless
+    of the file's mode. The script reads host/repo from lekiwi.yaml's `_launcher` (env
+    var > yaml > default), so the TUI passes no destination flags. --install forces the
+    editable installs on the Pi even when the dep fingerprints are unchanged (the
+    screen's ‹ force › toggle)."""
+    return ["bash", str(script), *(["--install"] if install else [])]
 
 
 def sync_env(cfg) -> dict[str, str]:  # noqa: ANN001
-    """sync.sh reads LEKIWI_HOST / PI_REPO from the environment (env var > yaml >
-    default); drive them from the TUI config so the script targets the same Pi + repo
-    the rest of the TUI uses, even if the user changed them in Settings this session
-    (the in-memory cfg can lead the yaml until Save)."""
-    return {
+    """sync.sh reads its knobs from the environment (env var > yaml > default); drive
+    them from the TUI config so the script targets the same Pi + env + checkouts the
+    rest of the TUI uses, even if the user changed them in Settings this session
+    (the in-memory cfg can lead the yaml until Save). LOCAL_* pass resolved (absolute)
+    and only when configured — empty keeps the script's sibling defaults."""
+    env = {
         **os.environ,
         "LEKIWI_HOST": validate_ssh_host(cfg["LEKIWI_HOST"]),
         "PI_REPO": cfg["PI_REPO"],
+        "CONDA_ENV": cfg["CONDA_ENV"],
     }
+    local_repo = resolve_workspace_path(str(cfg["LOCAL_REPO"]))
+    if local_repo:
+        env["LOCAL_REPO"] = local_repo
+    local_plugin = resolve_workspace_path(str(cfg["LOCAL_PLUGIN"]))
+    if local_plugin:
+        env["LOCAL_PLUGIN"] = local_plugin
+    return env
 
 
 class SyncScreen(ScreenState):
@@ -95,18 +109,39 @@ class SyncScreen(ScreenState):
 
     title = "sync"
 
+    #: Idle-page rows, in paint order. repo/plugin edit in a PromptModal (persisted to
+    #: lekiwi.yaml `_launcher`, same storage Settings writes); install toggles per-run;
+    #: sync launches. Focus starts on "sync" so a bare ⏎ still syncs immediately.
+    FIELDS = ["repo", "plugin", "install", "sync"]
+
     def __init__(self, app: "App", ctx: "Context", *, extra: list[str] | None = None) -> None:
         # Do NOT use ``app`` here; it can be None during root construction.
         self.app = app
         self.ctx = ctx
         # Stored for constructor parity with the other screens; deliberately NOT forwarded
-        # into the argv — build_sync_argv is no-arg by contract (see _argv).
+        # into the argv — build_sync_argv takes only the install toggle (see _argv).
         self._extra = list(extra or [])
         self._msg = ""
+        self._fpos = self.FIELDS.index("sync")
+        self._force = False        # ‹ force ›: run sync.sh --install this run (not persisted)
+        self._refresh_provenance()
         # The shared streaming engine: spawns rsync under a PTY, pumps its output into an
         # in-page log on the asyncio loop, routes Stop keys. Phase: idle | running | ended.
         self.stream = StreamController()
         self._area = None                          # last drawn area (for the PTY winsize)
+
+    # ── provenance (recomputed on entry + after a path edit; 2 quick git calls) ─
+    def _refresh_provenance(self) -> None:
+        cfg = self.ctx.cfg
+        self._repo_dir = local_checkout(cfg, "LOCAL_REPO", "lerobot")
+        self._plugin_dir = local_checkout(cfg, "LOCAL_PLUGIN", "lerobot_robot_lekiwi_pincopen")
+        try:
+            self._repo_prov = checkout_provenance(self._repo_dir)
+            self._plugin_prov = (
+                pyproject_version(self._plugin_dir) if self._plugin_dir.is_dir() else "✗ not found"
+            )
+        except Exception:  # best-effort display; never block the screen
+            self._repo_prov = self._plugin_prov = "?"
 
     # ── input (pure → returns an Action) ──────────────────────────────────────
     def handle_key(self, key: "Key") -> Any:
@@ -120,10 +155,48 @@ class SyncScreen(ScreenState):
         name = key.name
         if name in (ESC, "q"):
             return Pop()
+        if name in (UP, "k"):
+            self._fpos = (self._fpos - 1) % len(self.FIELDS)
+            self._msg = ""
+            return Nothing
+        if name in (DOWN, "j"):
+            self._fpos = (self._fpos + 1) % len(self.FIELDS)
+            self._msg = ""
+            return Nothing
+        cur = self.FIELDS[self._fpos]
+        if name in (LEFT, "h", RIGHT, "l") and cur == "install":
+            self._force = not self._force
+            return Nothing
         if name == ENTER:
-            # Invoke (not a bare Suspend) so _start runs the async stream flow on the loop.
+            if cur in ("repo", "plugin"):
+                # Invoke so the PromptModal flow runs on the App loop.
+                return Invoke(self._edit_path)
+            if cur == "install":
+                self._force = not self._force
+                return Nothing
+            # cur == "sync": Invoke (not a bare Suspend) so _start streams on the loop.
             return Invoke(self._start)
         return Nothing
+
+    # ── path editing (PromptModal → persist to lekiwi.yaml, the Settings storage) ─
+    async def _edit_path(self) -> None:
+        cur = self.FIELDS[self._fpos]
+        key = "LOCAL_REPO" if cur == "repo" else "LOCAL_PLUGIN"
+        ans = await self.app.run_modal(PromptModalState(
+            key, value=str(self.ctx.cfg[key]),
+            hint="path (absolute, ~, or relative to lekiwi-tui) · empty = sibling default · ⏎ apply · esc cancel"))
+        if ans is None:                      # esc = cancel (blank ⏎ applies: back to auto)
+            return
+        ans = ans.strip()
+        if ans == str(self.ctx.cfg[key]):
+            return
+        self.ctx.cfg.values[key] = ans
+        try:
+            Config(values=dict(self.ctx.cfg.values), env_set=set(self.ctx.cfg.env_set)).save(CFG_FILE)
+            self._msg = f"✓ {key} saved to lekiwi.yaml"
+        except OSError:
+            self._msg = f"✗ could not write lekiwi.yaml ({key} kept for this session)"
+        self._refresh_provenance()
 
     def _handle_running(self, key: "Key") -> Any:
         # s / Ctrl+C stop via the controller; q / Esc also stop (leaving while it runs
@@ -161,20 +234,20 @@ class SyncScreen(ScreenState):
         try:
             env = sync_env(cfg)
         except RemoteValueError as exc:
-            self._msg = f"✗ invalid remote setting: {exc}"
+            self._msg = f"✗ invalid remote setting: {exc} — fix it in Settings"
             return
         self._msg = ""
         winsize = (self._area.height, self._area.width) if self._area else (40, 110)
         await self.stream.start(
             self._argv(), env=env, winsize=winsize,
-            running_status=f"copying source to {cfg['LEKIWI_HOST']}…")
+            running_status=f"syncing to {cfg['LEKIWI_HOST']}…")
 
     def _argv(self) -> list[str]:
-        """The argv to stream: just `bash sync.sh`. No flags / no self._extra — the
-        script reads host/repo from the env (sync_env) + yaml, and the no-arg invocation is
-        the contract build_sync_argv documents (do NOT append self._extra here). Factored
-        out as the test seam: a subclass overrides it with a harmless local streamer."""
-        return build_sync_argv()
+        """The argv to stream: `bash sync.sh` plus the per-run ‹ force › toggle. No
+        destination flags / no self._extra — the script reads host/repo/checkouts from
+        the env (sync_env) + yaml (do NOT append self._extra here). Factored out as the
+        test seam: a subclass overrides it with a harmless local streamer."""
+        return build_sync_argv(install=self._force)
 
     # ── view (rebuilt fresh each frame) ───────────────────────────────────────
     def draw(self, frame: Any, area: Any) -> None:
@@ -190,15 +263,20 @@ class SyncScreen(ScreenState):
             Layout()
             .direction(Direction.Vertical)
             .constraints([
-                Constraint.length(1),   # header
-                Constraint.length(1),   # heavy rule
-                Constraint.length(4),   # info block
-                Constraint.length(1),   # gap
-                Constraint.length(1),   # sync-now row
-                Constraint.length(1),   # result msg
-                Constraint.fill(1),     # spacer
-                Constraint.length(1),   # light rule
-                Constraint.length(1),   # hint
+                Constraint.length(1),   # 0 header
+                Constraint.length(1),   # 1 heavy rule
+                Constraint.length(1),   # 2 runtime chips
+                Constraint.length(1),   # 3 info line
+                Constraint.length(1),   # 4 gap
+                Constraint.length(4),   # 5 repo + provenance, plugin + provenance
+                Constraint.length(1),   # 6 dest line
+                Constraint.length(1),   # 7 install toggle
+                Constraint.length(1),   # 8 gap
+                Constraint.length(1),   # 9 sync-now row
+                Constraint.length(1),   # 10 result msg
+                Constraint.fill(1),     # 11 spacer
+                Constraint.length(1),   # 12 light rule
+                Constraint.length(1),   # 13 hint
             ])
             .split(area)
         )
@@ -206,17 +284,23 @@ class SyncScreen(ScreenState):
         frame.render_widget(
             Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1]
         )
-        frame.render_widget(self._info(), rows[2])
-        frame.render_widget(self._sync_row(), rows[4])
+        frame.render_widget(runtime_chips(self.ctx), rows[2])
+        frame.render_widget(self._info(), rows[3])
+        self._source_rows(frame, rows[5])
+        frame.render_widget(self._dest_line(), rows[6])
+        frame.render_widget(self._install_row(rows[7].width), rows[7])
+        frame.render_widget(self._sync_row(), rows[9])
         if self._msg:
             frame.render_widget(
                 Paragraph(Text([Line([Span(self._msg, self._msg_style())])])).style(theme.BASE_STYLE),
-                rows[5],
+                rows[10],
             )
         frame.render_widget(
-            Paragraph.from_string(theme.rule(rows[7].width, light=True)).style(theme.RULE_LIGHT_STYLE), rows[7]
+            Paragraph.from_string(theme.rule(rows[12].width, light=True)).style(theme.RULE_LIGHT_STYLE), rows[12]
         )
-        self._hint(frame, rows[8], [("⏎", "sync"), ("q", "back")])
+        self._hint(frame, rows[13], [
+            ("↑↓/jk", "move"), ("⏎", "edit/toggle/sync"), ("q", "back"),
+        ])
 
     def _draw_stream(self, frame: Any, area: Any) -> None:
         rows = (
@@ -270,25 +354,73 @@ class SyncScreen(ScreenState):
         )
 
     def _info(self) -> Paragraph:
-        host = self.ctx.cfg["LEKIWI_HOST"]
-        repo = self.ctx.cfg["PI_REPO"]
         return Paragraph(Text([
-            Line([Span("copy the local LeRobot source to the Pi; editable install uses it.",
-                       theme.MUTED_STYLE)]),
-            Line(chip_spans([("target", f"{host}:{repo}", theme.CHIP_VALUE_STYLE)])),
-            Line([Span("does not rebuild the environment or reinstall dependencies", theme.TEXT_STYLE)]),
-            Line([Span("(use Set up Pi for first-time setup or dependency changes)",
-                       theme.MUTED_STYLE)]),
+            Line([Span(
+                "mirror laptop → Pi; the editable installs re-run automatically when deps change",
+                theme.MUTED_STYLE,
+            )]),
         ])).style(theme.BASE_STYLE)
 
-    def _sync_row(self) -> Paragraph:
-        # A single always-active action; rendered like the selected/start row of the other
-        # screens (accent ▌ gutter + bold accent label) since it is the only thing to do here.
+    @staticmethod
+    def _collapse(path: "Path") -> str:
+        home = str(Path.home())
+        s = str(path)
+        return "~" + s[len(home):] if s.startswith(home) else s
+
+    def _path_display(self, key: str, resolved: "Path") -> str:
+        raw = str(self.ctx.cfg[key]).strip()
+        return raw if raw else f"{self._collapse(resolved)}  (auto)"
+
+    def _source_rows(self, frame: Any, area: Any) -> None:
+        """The two editable source rows, each with a muted provenance sub-line (what
+        version/branch that path currently holds — a wrong checkout is caught by eye)."""
+        cur = self.FIELDS[self._fpos]
+        lines = [
+            option_line(
+                "lerobot",
+                self._path_display("LOCAL_REPO", self._repo_dir),
+                "",
+                focused=cur == "repo",
+                label_width=LABEL_W_FIELD,
+                width=area.width,
+            ),
+            Line([Span(f"           └ {self._repo_prov}", theme.MUTED_STYLE)]),
+            option_line(
+                "plugin",
+                self._path_display("LOCAL_PLUGIN", self._plugin_dir),
+                "",
+                focused=cur == "plugin",
+                label_width=LABEL_W_FIELD,
+                width=area.width,
+            ),
+            Line([Span(f"           └ {self._plugin_prov}", theme.MUTED_STYLE)]),
+        ]
+        frame.render_widget(Paragraph(Text(lines)).style(theme.BASE_STYLE), area)
+
+    def _dest_line(self) -> Paragraph:
+        host = self.ctx.cfg["LEKIWI_HOST"]
+        repo = self.ctx.cfg["PI_REPO"]
+        return Paragraph(Text([Line(chip_spans([
+            ("dest", f"{host}:{repo}  (+ plugin)", theme.CHIP_VALUE_STYLE),
+        ]))])).style(theme.BASE_STYLE)
+
+    def _install_row(self, width: int) -> Paragraph:
         return Paragraph(Text([option_line(
-            f"{theme.play_mark()} Sync source",
-            "copy local source to Pi",
-            focused=True,
-            label_width=20,
+            "install",
+            theme.choice("force" if self._force else "auto"),
+            "auto = reinstall only when deps changed · force = reinstall this run",
+            focused=self.FIELDS[self._fpos] == "install",
+            label_width=LABEL_W_FIELD,
+            width=width,
+        )])).style(theme.BASE_STYLE)
+
+    def _sync_row(self) -> Paragraph:
+        return Paragraph(Text([option_line(
+            f"{theme.play_mark()} Sync now",
+            "mirror + install check over SSH",
+            focused=self.FIELDS[self._fpos] == "sync",
+            label_width=LABEL_W_ACTION,
+            label_unfocused_style=theme.TEXT_STYLE,
         )])).style(theme.BASE_STYLE)
 
     def _msg_style(self):

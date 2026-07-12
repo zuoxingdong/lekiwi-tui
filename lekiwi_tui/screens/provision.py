@@ -25,7 +25,7 @@ with synthetic ``Key`` (no ``Terminal``).
 Stage notes (pi_provision.sh):
   system   apt deps + dialout/video groups        [sudo, one-time]
   conda    Miniforge + the python env + uv        [no sudo]
-  lerobot  rsync clone -> Pi + uv install + smoke [no sudo; re-run on source/version change]
+  lerobot  delegate to sync.sh --install + smoke  [no sudo; first install / env rebuild]
 
 PI_HOST / PI_ENV / PI_REPO are passed from the TUI config (LEKIWI_HOST / CONDA_ENV /
 PI_REPO) so both sides stay consistent.
@@ -38,12 +38,15 @@ from typing import TYPE_CHECKING, Any
 
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
+from pathlib import Path
+
 from .. import ROOT
+from ..config import resolve_workspace_path
 from ..framework import runner, theme
 from ..framework.events import DOWN, ENTER, ESC, LEFT, RIGHT, UP, Key
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
 from ..remote import RemoteValueError, validate_remote_name, validate_ssh_host
-from .chrome import keycap_hint_line, option_line, runtime_chips
+from .chrome import LABEL_W_FIELD, keycap_hint_line, option_line, runtime_chips
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -62,7 +65,7 @@ RULE = "─" * 54
 STAGES: list[tuple[str, str, str]] = [
     ("system", "system packages + device permissions", "requires sudo; usually one-time"),
     ("conda", "Miniforge + Python environment + uv", ""),
-    ("lerobot", "sync source + install + verify", "re-run after source or dependency changes"),
+    ("lerobot", "sync.sh --install + smoke-test", "first install / after an env rebuild; day-to-day changes need only Sync"),
 ]
 _STAGE_IDS = [s[0] for s in STAGES]
 
@@ -78,19 +81,84 @@ def build_provision_argv(
     return ["bash", str(script), *stages]
 
 
-def provision_env(cfg) -> dict[str, str]:  # noqa: ANN001
-    """pi_provision.sh reads PI_HOST / PI_ENV / PI_REPO from the environment; drive them
-    from the TUI config so the script targets the same Pi + env the rest of the TUI uses,
-    and so the user's PI_REPO choice (home-relative, any Pi username) reaches the script.
-
-    Ported VERBATIM from the Textual original.
+def provision_env(cfg, *, py_ver="", recreate=False) -> dict[str, str]:  # noqa: ANN001
+    """pi_provision.sh reads its knobs from the environment; drive them from the TUI
+    config so the script targets the same Pi + env the rest of the TUI uses. LOCAL_REPO
+    / LOCAL_PLUGIN (which laptop checkouts get shipped) pass through resolved to
+    absolute paths when configured — empty keeps the script's sibling defaults.
+    py_ver / recreate come from the screen's form fields (empty/False = script default).
     """
-    return {
+    env = {
         **os.environ,
         "PI_HOST": validate_ssh_host(cfg["LEKIWI_HOST"]),
         "PI_ENV": validate_remote_name(cfg["CONDA_ENV"], "conda env"),
         "PI_REPO": cfg["PI_REPO"],
     }
+    local_repo = resolve_workspace_path(str(cfg["LOCAL_REPO"]))
+    if local_repo:
+        env["LOCAL_REPO"] = local_repo
+    local_plugin = resolve_workspace_path(str(cfg["LOCAL_PLUGIN"]))
+    if local_plugin:
+        env["LOCAL_PLUGIN"] = local_plugin
+    if py_ver:
+        env["PY_VER"] = validate_remote_name(str(py_ver), "python version")
+    if recreate:
+        env["RECREATE_ENV"] = "1"
+    return env
+
+
+def local_checkout(cfg, key: str, fallback: str) -> "Path":  # noqa: ANN001
+    """The laptop dir a LOCAL_REPO / LOCAL_PLUGIN config value points at (resolved;
+    empty = the sibling-of-this-checkout default the scripts also use)."""
+    return Path(resolve_workspace_path(str(cfg[key])) or str(ROOT.parent / fallback))
+
+
+def pyproject_version(project_dir: "Path") -> str:
+    """The `version = "…"` of a checkout's pyproject.toml, or '?' when unreadable."""
+    try:
+        for line in (project_dir / "pyproject.toml").read_text().splitlines():
+            if line.startswith("version"):
+                return line.split('"')[1]
+    except (OSError, IndexError):
+        pass
+    return "?"
+
+
+def checkout_provenance(project_dir: "Path") -> str:
+    """`<version> · <branch> @ <sha>` for a checkout — the at-a-glance answer to "what
+    exactly would land on the robot?". '✗ not found' when the dir is missing; the git
+    fields degrade to '?' for non-repos (a plain export still shows its version)."""
+    import subprocess
+
+    if not project_dir.is_dir():
+        return "✗ not found"
+
+    def _git(*args: str) -> str:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(project_dir), *args],
+                capture_output=True, text=True, check=False, timeout=5,
+            )
+            return out.stdout.strip() or "?"
+        except (OSError, subprocess.TimeoutExpired):
+            return "?"
+
+    return (
+        f"{pyproject_version(project_dir)} · "
+        f"{_git('rev-parse', '--abbrev-ref', 'HEAD')} @ {_git('rev-parse', '--short', 'HEAD')}"
+    )
+
+
+def shipping_summary(cfg) -> str:  # noqa: ANN001
+    """One muted line saying exactly WHAT a run would ship: lerobot version + branch +
+    commit from the configured LOCAL_REPO (sibling default when empty) plus the plugin
+    version. Wrong checkout on the robot is the failure this catches by eye."""
+    repo = local_checkout(cfg, "LOCAL_REPO", "lerobot")
+    plugin = local_checkout(cfg, "LOCAL_PLUGIN", "lerobot_robot_lekiwi_pincopen")
+    return (
+        f"ships lerobot {checkout_provenance(repo)} "
+        f"+ plugin {pyproject_version(plugin)}"
+    )
 
 
 class ProvisionScreen(ScreenState):
@@ -106,7 +174,10 @@ class ProvisionScreen(ScreenState):
 
     title = "set up Pi"
 
-    FIELDS = [*_STAGE_IDS, "run"]
+    FIELDS = [*_STAGE_IDS, "python", "recreate", "run"]
+
+    #: Pi env python versions the conda stage may build (lerobot 0.6 needs >=3.12).
+    PY_CHOICES = ["3.12", "3.13"]
 
     def __init__(
         self, app: "App", ctx: "Context", *, extra: list[str] | None = None
@@ -117,8 +188,15 @@ class ProvisionScreen(ScreenState):
         # All stages selected by default (the one-time full bring-up). Mirrors the
         # Textual on_mount: {s: True for s in _STAGE_IDS}.
         self._on: dict[str, bool] = {s: True for s in _STAGE_IDS}
+        self._py_idx = 0          # index into PY_CHOICES (3.12 = the script default)
+        self._recreate = False    # RECREATE_ENV=1: rebuild the env on a python mismatch
         self._fpos = 0
         self._msg = ""
+        # Computed once per screen entry (2 git calls); says what Run would ship.
+        try:
+            self._shipping = shipping_summary(ctx.cfg)
+        except Exception:  # provenance is best-effort; never block the screen
+            self._shipping = ""
 
     # ── navigation (pure → returns an Action) ──────────────────────────────────
     def handle_key(self, key: "Key") -> Any:
@@ -132,8 +210,9 @@ class ProvisionScreen(ScreenState):
             self._move(1)
             return Nothing
         if name in (LEFT, "h", RIGHT, "l"):
-            # Both directions toggle (the original action_adjust ignores the sign).
-            self._adjust()
+            # Stages/recreate toggle on both directions (the original action_adjust
+            # ignored the sign); the python enum cycles WITH the sign.
+            self._adjust(1 if name in (RIGHT, "l") else -1)
             return Nothing
         if name == ENTER:
             return self._activate()
@@ -143,10 +222,16 @@ class ProvisionScreen(ScreenState):
         self._fpos = (self._fpos + delta) % len(self.FIELDS)
         self._msg = ""
 
-    def _adjust(self) -> None:
+    def _adjust(self, delta: int = 1) -> None:
         cur = self.FIELDS[self._fpos]
         if cur in self._on:
             self._on[cur] = not self._on[cur]
+            self._msg = ""
+        elif cur == "python":
+            self._py_idx = (self._py_idx + delta) % len(self.PY_CHOICES)
+            self._msg = ""
+        elif cur == "recreate":
+            self._recreate = not self._recreate
             self._msg = ""
 
     def _activate(self) -> Any:
@@ -157,9 +242,8 @@ class ProvisionScreen(ScreenState):
         flow must read the child's exit code back to build :attr:`_msg` (a ``Suspend``
         Action would discard it)."""
         cur = self.FIELDS[self._fpos]
-        if cur in self._on:
-            self._on[cur] = not self._on[cur]
-            self._msg = ""
+        if cur in self._on or cur in ("python", "recreate"):
+            self._adjust()
             return Nothing
         return Invoke(self._run)
 
@@ -185,9 +269,13 @@ class ProvisionScreen(ScreenState):
             self._msg = f"✗ {PROVISION_SCRIPT} not found"
             return
         try:
-            env = provision_env(self.ctx.cfg)
+            env = provision_env(
+                self.ctx.cfg,
+                py_ver=self.PY_CHOICES[self._py_idx],
+                recreate=self._recreate,
+            )
         except RemoteValueError as exc:
-            self._msg = f"✗ invalid remote setting: {exc}"
+            self._msg = f"✗ invalid remote setting: {exc} — fix it in Settings"
             return
         rc = await self.app.suspend(build_provision_argv(stages), env=env, pause=True)
         self._msg = (
@@ -203,17 +291,20 @@ class ProvisionScreen(ScreenState):
             Layout()
             .direction(Direction.Vertical)
             .constraints([
-                Constraint.length(1),                 # header
-                Constraint.length(1),                 # heavy rule
-                Constraint.length(1),                 # runtime chips
-                Constraint.length(2),                 # info (2 lines)
-                Constraint.length(1),                 # gap
-                Constraint.length(len(_STAGE_IDS)),   # stage rows
-                Constraint.length(1),                 # gap
-                Constraint.length(1),                 # run row
-                Constraint.length(1),                 # msg
-                Constraint.fill(1),                    # spacer
-                Constraint.length(1),                 # hint
+                Constraint.length(1),                 # 0 header
+                Constraint.length(1),                 # 1 heavy rule
+                Constraint.length(1),                 # 2 runtime chips
+                Constraint.length(2),                 # 3 info (2 lines)
+                Constraint.length(1),                 # 4 gap
+                Constraint.length(len(_STAGE_IDS)),   # 5 stage rows
+                Constraint.length(1),                 # 6 gap
+                Constraint.length(2),                 # 7 python + recreate rows
+                Constraint.length(1),                 # 8 gap
+                Constraint.length(1),                 # 9 shipping provenance
+                Constraint.length(1),                 # 10 run row
+                Constraint.length(1),                 # 11 msg
+                Constraint.fill(1),                    # 12 spacer
+                Constraint.length(1),                 # 13 hint
             ])
             .split(area)
         )
@@ -231,14 +322,21 @@ class ProvisionScreen(ScreenState):
         frame.render_widget(runtime_chips(self.ctx), rows[2])
         frame.render_widget(self._info(), rows[3])
         self._stage_rows(frame, rows[5])
-        self._run_row(frame, rows[7])
+        self._option_rows(frame, rows[7])
+        if self._shipping:
+            frame.render_widget(
+                Paragraph(Text([Line([Span(self._shipping, theme.MUTED_STYLE)])]))
+                .style(theme.BASE_STYLE),
+                rows[9],
+            )
+        self._run_row(frame, rows[10])
         if self._msg:
             frame.render_widget(
                 Paragraph(Text([Line([Span(self._msg, theme.MUTED_STYLE)])]))
                 .style(theme.BASE_STYLE),
-                rows[8],
+                rows[11],
             )
-        self._hint(frame, rows[10])
+        self._hint(frame, rows[13])
 
     def _info(self) -> Paragraph:
         host = self.ctx.cfg["LEKIWI_HOST"]
@@ -267,12 +365,36 @@ class ProvisionScreen(ScreenState):
                 val,
                 what,
                 focused=focused,
-                label_width=9,
+                label_width=LABEL_W_FIELD,
                 width=area.width,
             ))
         frame.render_widget(
             Paragraph(Text(lines)).style(theme.BASE_STYLE), area
         )
+
+    def _option_rows(self, frame: Any, area: Any) -> None:
+        """The two conda-stage knobs, rendered like the stage rows: python version
+        (‹ 3.12 ›, cycles) and recreate-env (‹ yes/no ›, rebuilds on python mismatch)."""
+        cur = self.FIELDS[self._fpos]
+        lines = [
+            option_line(
+                "python",
+                theme.choice(self.PY_CHOICES[self._py_idx]),
+                "Pi env python (conda stage)",
+                focused=cur == "python",
+                label_width=LABEL_W_FIELD,
+                width=area.width,
+            ),
+            option_line(
+                "recreate",
+                theme.choice("yes" if self._recreate else "no"),
+                "rebuild the env if its python does not match",
+                focused=cur == "recreate",
+                label_width=LABEL_W_FIELD,
+                width=area.width,
+            ),
+        ]
+        frame.render_widget(Paragraph(Text(lines)).style(theme.BASE_STYLE), area)
 
     def _run_row(self, frame: Any, area: Any) -> None:
         """The Run row: ``▶ Run  (chosen · stages)`` (or ``select a stage`` when empty),
@@ -323,6 +445,7 @@ __all__ = [
     "ProvisionScreen",
     "build_provision_argv",
     "provision_env",
+    "shipping_summary",
     "run_headless",
     "STAGES",
     "PROVISION_SCRIPT",
