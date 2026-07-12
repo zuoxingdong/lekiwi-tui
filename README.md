@@ -2,18 +2,25 @@
 
 A standalone immediate-mode TUI for the LeKiwi robot workflow. It runs real
 `lerobot` commands through the local `scripts/*.sh` launchers and uses
-`pyratatui` for the terminal UI. The first screen is the control panel: host,
-env, GPU, and execution-mode status chips above the robot workflow actions.
+`pyratatui` for the terminal UI. The first screen is the control panel: live
+host/robot status chips above the robot workflow actions, with digit shortcuts
+for the daily-driver rows.
 
-![LeKiwi TUI control center](assets/lekiwi-tui-hero.png)
-
-![LeKiwi TUI dry-run workflow](assets/lekiwi-tui-dry-run.gif)
+![LeKiwi TUI workflow](assets/lekiwi-tui-dry-run.gif)
 
 ## Features
 
-- Start and stop the LeKiwi Pi host
+- Start and stop the LeKiwi Pi host; a live status chip shows the host and the
+  remaining session time from any screen, and a running session can be left in
+  the background (`q`) while you record or teleoperate in the same terminal
 - Teleoperate, record, replay, and view episodes
+- Record HUD: in-page log with episode progress, phase, and a loop-rate gauge,
+  plus a dataset panel (episodes, length, size, resume plan) before you start
 - Train and run SmolVLA policies
+- Sync to Pi mirrors the laptop checkouts and re-runs the editable installs
+  automatically when dependencies changed, with a provenance line saying
+  exactly which version/branch ships
+- Emergency stop: press `K` twice from any screen to kill the remote host
 - Preview hardware commands before execution
 - Edit robot, task, and launcher settings from the terminal
 
@@ -23,6 +30,11 @@ env, GPU, and execution-mode status chips above the robot workflow actions.
 - Python 3.10+
 - LeRobot installed in the active Python/conda environment
 - A configured LeKiwi robot for real hardware actions
+- The default robot type `lekiwi_pincopen` expects the
+  `lerobot_robot_lekiwi_pincopen` plugin on the Pi (set `ROBOT_TYPE` to
+  `lekiwi` in Settings to drive a stock LeKiwi instead)
+- Optional: membership in the `input` group enables base wasd keys in the
+  record HUD view (the terminal view needs no system changes)
 
 ## Install
 
@@ -68,11 +80,13 @@ The shim still works and self-activates the configured conda env:
 ## Keys
 
 - Move: arrows or `j`/`k`
+- Jump and run a menu action: `1`-`8` (setup actions have no shortcut)
 - Adjust fields: left/right or `h`/`l`
 - Edit/pick/start: Enter
-- Back: `q`
+- Back: `q` (a running host stays up; stop it with `s` or the Stop host page)
 - Help: `?`
 - Toggle preview mode from the menu: `d`
+- Emergency host stop: `K` twice within 2 seconds, from any screen
 
 ## Config
 

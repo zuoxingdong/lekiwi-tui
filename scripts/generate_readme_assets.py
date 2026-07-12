@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate README hero PNG and short workflow GIF.
+"""Generate the README workflow GIF (one asset; its first frame is the hero).
 
 These are faithful static renders of the current terminal style: plain dark terminal,
 runtime chips, colorful action icons, keycap footer hints, and focused-row highlighting.
@@ -17,7 +17,6 @@ from lekiwi_tui.app_registry import ACTIONS
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets"
-HERO = ASSETS / "lekiwi-tui-hero.png"
 GIF = ASSETS / "lekiwi-tui-dry-run.gif"
 
 FONT_REG = "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf"
@@ -48,6 +47,7 @@ HIGHLIGHT_BG = "#0e354a"
 PUBLIC_HOST = "robot-pi"
 PUBLIC_ENV = "lerobot"
 PUBLIC_GPU = "CUDA"
+PUBLIC_ROBOT = "lekiwi_pincopen"
 PUBLIC_POLICY = "models/lekiwi-policy/checkpoints/latest/pretrained_model"
 PUBLIC_TASK = "Pick up the object and place it in the tray"
 
@@ -105,6 +105,22 @@ class Canvas:
         x = PAD_X
         x = self.chip(x, y, "host", PUBLIC_HOST)
         x = self.chip(x, y, "env", PUBLIC_ENV)
+
+        # the LIVE robot chip: type + green dot + remaining session time
+        label = " robot "
+        dot = "● "
+        val = f"{PUBLIC_ROBOT} "
+        left = "27:41 "
+        label_w = int(self.d.textlength(label, font=FONT))
+        val_w = int(self.d.textlength(val, font=BOLD))
+        dot_w = int(self.d.textlength(dot, font=BOLD))
+        left_w = int(self.d.textlength(left, font=FONT))
+        self.rect((x, y, x + label_w + val_w + dot_w + left_w, y + LINE_H - 2), PANEL)
+        self.text((x + 2, y + 1), "robot", MUTED)
+        self.text((x + label_w, y + 1), val, SAND, bold=True)
+        self.text((x + label_w + val_w, y + 1), dot, SUCCESS, bold=True)
+        self.text((x + label_w + val_w + dot_w, y + 1), "27:41", MUTED)
+        x += label_w + val_w + dot_w + left_w + 10
 
         label = " GPU "
         dot = "● "
@@ -172,6 +188,10 @@ class Canvas:
         return best
 
 
+# Digit badges cover the daily-driver rows only (menu.py _JUMPABLE rule).
+JUMPABLE = [a.id for a in ACTIONS if a.section != "SETUP"]
+
+
 def section(c: Canvas, y: int, label: str) -> None:
     c.text((PAD_X, y), label, PURPLE, bold=True)
     c.line((PAD_X + 72, y + 13, PAD_X + 470, y + 13), HAIRLINE)
@@ -184,12 +204,14 @@ def action_row(c: Canvas, y: int, action_id: str, *, selected: bool = False) -> 
         c.rect((x0 - 10, y - 1, x1, y + LINE_H - 1), HIGHLIGHT_BG)
         c.rect((x0 - 10, y - 1, x0 - 5, y + LINE_H - 1), ACCENT)
         c.text((x0, y), "▌", ACCENT, bold=True)
-    icon_x = PAD_X + 23
+    if action_id in JUMPABLE:
+        c.text((PAD_X + 16, y), str(JUMPABLE.index(action_id) + 1), ACCENT, bold=selected)
+    icon_x = PAD_X + 38
     c.emoji((icon_x, y + 1), action.icon)
     label_color = ACCENT if selected else TEXT
     hint_color = TEXT if selected else MUTED
-    c.text((PAD_X + 62, y), f"{action.label:<13}", label_color, bold=selected)
-    c.text((PAD_X + 212, y), action.hint, hint_color)
+    c.text((PAD_X + 77, y), f"{action.label:<13}", label_color, bold=selected)
+    c.text((PAD_X + 227, y), action.hint, hint_color)
 
 
 def footer(c: Canvas, y: int, *, eval_page: bool = False) -> None:
@@ -197,7 +219,7 @@ def footer(c: Canvas, y: int, *, eval_page: bool = False) -> None:
     pairs = (
         [("↑↓/jk", "move"), ("←→/hl", "change"), ("↵", "edit/run"), ("s", "run"), ("q", "back")]
         if eval_page
-        else [("↑↓/jk", "move"), ("↵", "select"), ("1-9", "jump"), ("d", "preview"), ("q", "quit")]
+        else [("↑↓/jk", "move"), ("↵", "select"), (f"1-{len(JUMPABLE)}", "jump"), ("d", "preview"), ("q", "quit")]
     )
     x = PAD_X
     for key, label in pairs:
@@ -286,7 +308,7 @@ def draw_eval(*, mode: str = "PREVIEW", selected: str = "policy") -> Image.Image
         ("Duration", "saved default", TEXT),
         ("Display", "off · lower CPU", TEXT),
         ("Device", "CUDA available; CPU fallback if needed", TEXT),
-        ("Host", "required; start Pi host in another terminal", SAND),
+        ("Host", "required; Start host from the menu (q keeps it running)", SAND),
         ("Mode", "PREVIEW · wrapper prints argv" if mode == "PREVIEW" else "REAL · controls robot", WARNING if mode == "PREVIEW" else SUCCESS),
     ]
     y += 30
@@ -299,6 +321,29 @@ def draw_eval(*, mode: str = "PREVIEW", selected: str = "policy") -> Image.Image
             bold=color in (SAND, WARNING, SUCCESS),
         )
         y += 24
+    footer(c, H - 46, eval_page=True)
+    return c.img
+
+
+def draw_record() -> Image.Image:
+    c = Canvas()
+    c.header("record")
+    c.runtime_chips(52, mode="REAL")
+    # destination + dataset panel (the chips idiom): what is on disk, what Start will do
+    x = c.chip(PAD_X, 96, "repo", "local/lekiwi-demo")
+    c.text((x + 6, 97), "~/robots/datasets/lekiwi-demo", MUTED)
+    x = PAD_X
+    x = c.chip(x, 122, "episodes", "60")
+    x = c.chip(x, 122, "length", "24.7 min")
+    x = c.chip(x, 122, "size", "1.4 GB")
+    x = c.chip(x, 122, "updated", "16:53")
+    c.text((PAD_X, 150), "resume on — will append after episode 60", SUCCESS)
+    c.text((PAD_X, 174), "● host live — ready to record", SUCCESS, bold=True)
+    form_row(c, 214, "Dataset", "lekiwi-demo", "saves under datasets/<name>")
+    form_row(c, 240, "Task", "Pick up the cube and place it in the basket.", "enter to edit")
+    form_row(c, 266, "Episodes", "10", "←→ ±1 · enter to type")
+    form_row(c, 292, "View", "‹ hud ›", "in-page log + episode HUD", selected=True)
+    form_row(c, 328, "▶ Start", "validate dataset and launch capture")
     footer(c, H - 46, eval_page=True)
     return c.img
 
@@ -333,10 +378,9 @@ def draw_preview() -> Image.Image:
 
 def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
-    hero = draw_menu("record", mode="REAL")
-    hero.save(HERO)
     frames = [
         draw_menu("record", mode="REAL"),
+        draw_record(),
         draw_menu("eval", mode="PREVIEW"),
         draw_eval(mode="PREVIEW", selected="policy"),
         draw_eval(mode="PREVIEW", selected="start"),
@@ -346,11 +390,10 @@ def main() -> None:
         GIF,
         save_all=True,
         append_images=frames[1:],
-        duration=[900, 900, 1100, 1100, 1400],
+        duration=[1100, 1300, 900, 1100, 1100, 1400],
         loop=0,
         optimize=True,
     )
-    print(HERO)
     print(GIF)
 
 
