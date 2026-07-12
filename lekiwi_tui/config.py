@@ -59,11 +59,14 @@ _DEFAULTS: dict[str, str] = {
     "LEADER_ID": "lekiwi_leader",
     "LEKIWI_HOST": "lekiwi",
     "ROBOT_ID": "lekiwi",
+    "ROBOT_TYPE": "lekiwi_pincopen",
     "CONNECTION_TIME": "600",
     "CONDA_ENV": "lekiwi",
     "PI_REPO": "lekiwi/lerobot",
+    "LOCAL_REPO": "",
+    "LOCAL_PLUGIN": "",
     "POLICY_PATH": "",
-    "POLICY_ROOT": str(ROOT / "models"),
+    "POLICY_ROOT": str(ROOT.parent.parent / "models"),  # <workspace>/models; checkout at <workspace>/projects/lekiwi-tui
     "INFERENCE": "sync",
     "EXECUTION_HORIZON": "20",
     "DISPLAY_DATA": "off",
@@ -79,9 +82,12 @@ CONFIG_SPEC: list[Field] = [
     Field("LEADER_ID", "text", "leader arm calibration id", _DEFAULTS["LEADER_ID"]),
     Field("LEKIWI_HOST", "text", "SSH host name or IP for the Pi", _DEFAULTS["LEKIWI_HOST"]),
     Field("ROBOT_ID", "text", "robot id used by the Pi host", _DEFAULTS["ROBOT_ID"]),
+    Field("ROBOT_TYPE", "enum:lekiwi_pincopen,lekiwi", "follower robot; lekiwi_pincopen is the STS3250+PincOpen plugin, lekiwi is stock", _DEFAULTS["ROBOT_TYPE"]),
     Field("CONNECTION_TIME", "int", "default host session length in seconds", _DEFAULTS["CONNECTION_TIME"]),
     Field("CONDA_ENV", "text", "Pi conda env for host and setup commands", _DEFAULTS["CONDA_ENV"]),
     Field("PI_REPO", "text", "LeRobot checkout path on the Pi, relative to Pi home", _DEFAULTS["PI_REPO"]),
+    Field("LOCAL_REPO", "path", "laptop lerobot checkout shipped to the Pi; empty = sibling of this checkout", _DEFAULTS["LOCAL_REPO"]),
+    Field("LOCAL_PLUGIN", "path", "laptop lerobot_robot_lekiwi_pincopen dir shipped to the Pi; empty = sibling", _DEFAULTS["LOCAL_PLUGIN"]),
     Field("POLICY_PATH", "path", "default policy checkpoint; empty selects newest under POLICY_ROOT", _DEFAULTS["POLICY_PATH"]),
     Field("POLICY_ROOT", "path", "folder scanned for policy checkpoints", _DEFAULTS["POLICY_ROOT"]),
     Field("INFERENCE", "enum:sync,rtc", "policy runner: sync per tick, rtc for smoother slow policies", _DEFAULTS["INFERENCE"]),
@@ -96,6 +102,21 @@ _SPEC_BY_KEY: dict[str, Field] = {f.key: f for f in CONFIG_SPEC}
 def is_config_key(key: str) -> bool:
     """Whitelist check (bash config_is_key) — only these keys are read from `_launcher`."""
     return key in _SPEC_BY_KEY
+
+
+def resolve_workspace_path(value: str) -> str:
+    """Resolve a LOCAL_REPO / LOCAL_PLUGIN style config value to an absolute path.
+
+    Empty stays empty (the consumer's "auto: sibling of this checkout" default); a
+    relative value resolves against ROOT (the workspace dir the app cd's into), so
+    lekiwi.yaml can carry portable entries like '../lerobot' that mean the same thing
+    no matter where a launcher script is invoked from. sync.sh applies the same rule
+    in bash — keep the two in step."""
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    p = Path(value).expanduser()
+    return str(p if p.is_absolute() else (ROOT / p).resolve())
 
 
 def resolve_editor() -> str:

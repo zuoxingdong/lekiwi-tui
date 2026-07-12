@@ -20,11 +20,14 @@ _launcher:
   LEADER_ID: 'lekiwi_leader'
   LEKIWI_HOST: 'lekiwi.local'
   ROBOT_ID: 'lekiwi'
+  ROBOT_TYPE: 'lekiwi_pincopen'
   CONNECTION_TIME: '600'
   CONDA_ENV: 'lekiwi'
   PI_REPO: 'lekiwi/lerobot'
+  LOCAL_REPO: ''                  # laptop lerobot checkout shipped to the Pi; empty = sibling of this checkout
+  LOCAL_PLUGIN: ''  # laptop PincOpen plugin dir; empty = sibling
   POLICY_PATH: ''
-  POLICY_ROOT: '../models'
+  POLICY_ROOT: '../../models'
   INFERENCE: 'sync'
   EXECUTION_HORIZON: '20'
   DISPLAY_DATA: 'off'
@@ -71,7 +74,7 @@ _leader_arm: &leader_arm
 # Local dataset location. The root is resolved from this checkout directory.
 _dataset: &dataset
   repo_id: local/lekiwi-example
-  root: ../datasets/lekiwi-example
+  root: ../../datasets/lekiwi-example  # ../../ = the workspace data root (checkout lives under <workspace>/projects/)
 
 # Language instruction shared by record and rollout/eval.
 _task: &task "Pick up the object and place it in the target container."
