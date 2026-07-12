@@ -8,9 +8,11 @@ suspends into the live lerobot-record loop. Fronts scripts/record.sh (the sole a
 """
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,14 +21,15 @@ from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
 from .. import CFG_FILE, ROOT
 from ..config import cfg_get, dump_yaml_rt, load_yaml, load_yaml_rt
-from ..datasets import args_have_resume, dataset_episodes, dataset_present, record_root
+from ..datasets import args_have_resume, dataset_episodes, dataset_present, dataset_stats, dataset_stats_parts, record_root
 from ..framework import runner, theme
 from ..framework.events import BACKTAB, DOWN, ENTER, ESC, LEFT, RIGHT, TAB, UP, Key, is_char
 from ..framework.modals import ConfirmModalState, PromptModalState
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
+from ..framework.stream import StreamController
 from ..framework.widgets import NumberField
 from ..preflight import confirm_preflight, record_issues
-from .chrome import keycap_hint_line, option_line, runtime_chips
+from .chrome import chip_spans, clip_middle, keycap_hint_line, option_line, runtime_chips
 
 if TYPE_CHECKING:
     from ..context import Context
@@ -61,6 +64,7 @@ _HINTS = {
     "display": "show live Rerun view (off lowers CPU)",
     "streaming": "encode video while recording for faster saves",
     "resume": "append to an existing dataset",
+    "view": "hud = in-page log + episode HUD · terminal = raw lerobot output (full TTY)",
 }
 
 # The existing-dataset gate's choice labels (fuller copy from the Textual original). The
@@ -74,7 +78,7 @@ _CANCEL = "Cancel   keep the dataset unchanged"
 def dataset_defaults(doc: dict | None = None) -> dict:
     """Per-run record defaults from the yaml `record` block (ported verbatim)."""
     repo_id = str(cfg_get("record.dataset.repo_id", doc=doc) or "local/lekiwi_dataset")
-    root = str(cfg_get("record.dataset.root", doc=doc) or "../datasets/lekiwi_dataset")
+    root = str(cfg_get("record.dataset.root", doc=doc) or "../../datasets/lekiwi_dataset")
     ns = repo_id.rsplit("/", 1)[0] if "/" in repo_id else "local"
     parent = str(Path(root).parent) if str(Path(root).parent) != "." else ""
 
@@ -174,10 +178,24 @@ def persist_record_defaults(*, repo_id: str, root: str, task: str, episodes: int
 _NUM_KEYS = {"episodes", "ep_time", "reset_time", "fps", "img_threads"}
 _TOGGLE_KEYS = {"display", "streaming", "resume"}
 _FIELDS = ["name", "task", "episodes", "ep_time", "reset_time", "fps", "img_threads",
-           "display", "streaming", "resume", "start"]
+           "display", "streaming", "resume", "view", "start"]
 _LABELS = {"name": "Dataset", "task": "Task", "episodes": "Episodes", "ep_time": "Episode time",
            "reset_time": "Reset time", "fps": "FPS", "img_threads": "Image writers",
-           "display": "Display", "streaming": "Streaming", "resume": "Resume", "start": "Start"}
+           "display": "Display", "streaming": "Streaming", "resume": "Resume",
+           "view": "View", "start": "Start"}
+
+# ── record HUD (view=hud) ─────────────────────────────────────────────────────
+# lerobot-record's spoken/log markers (lerobot_record.py log_say calls); the line_hook
+# tracks them to drive the episode HUD.
+_EP_MARKER = re.compile(r"Recording episode (\d+)")
+_HEALTH_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:it/s|fps|Hz)")
+
+
+def evdev_readable() -> bool:
+    """True when /dev/input is readable (user in the `input` group) — the base wasd
+    hold-to-move backend the kbd shim falls back to under a PTY, where the kitty
+    stdin protocol is unavailable. Decides the View toggle's default."""
+    return any(os.access(p, os.R_OK) for p in glob.glob("/dev/input/event*"))
 
 
 class RecordScreen(ScreenState):
@@ -200,6 +218,15 @@ class RecordScreen(ScreenState):
             "img_threads": NumberField("Image writers", d["img_threads"], minimum=1, step=1),
         }
         self._toggle = {"display": d["display"], "streaming": d["streaming"], "resume": d["resume"]}
+        # View: hud streams lerobot-record in-page (episode HUD + forwarded keys);
+        # terminal suspends into the raw CLI (full TTY — the kitty stdin base backend
+        # only works there). Default follows what the base keys can actually use.
+        self._view = "hud" if evdev_readable() else "terminal"
+        self.stream = StreamController()
+        self._ep_cur: int | None = None       # absolute episode index (resume-aware)
+        self._ep_started: float | None = None
+        self._phase_note = ""
+        self._area = None
         self._fpos = 0
         self._msg = ""
         self._fresh = True
@@ -213,6 +240,25 @@ class RecordScreen(ScreenState):
     # ── input ─────────────────────────────────────────────────────────────────
     def handle_key(self, key: "Key") -> Any:
         name = key.name
+        if self.stream.running:
+            # HUD mode: the child owns the keyboard THROUGH us. Ctrl+C aborts (stream
+            # escalation); EVERYTHING else forwards as terminal bytes — including "s"
+            # and "q", which are base-backward and lerobot's own quit key, so no local
+            # stop-key shortcuts here (deliberate divergence from handle_stop_key).
+            if name == "c" and key.ctrl:
+                self.stream.stop()
+                return Nothing
+            self.stream.forward_key(key)
+            return Nothing
+        if self.stream.ended:
+            if name == ENTER:                   # back to the form for another session
+                self.stream.reset()
+                self._ep_cur = None
+                self._phase_note = ""
+                return Nothing
+            if name in (ESC, "q"):
+                return Pop()
+            return Nothing
         if name in (ESC, "q"):
             return Pop()
         if name in (UP, "k", BACKTAB):
@@ -226,6 +272,8 @@ class RecordScreen(ScreenState):
                 self._num[cur].step_by(delta); self._num[cur].sync_editor(); self._fresh = True
             elif cur in _TOGGLE_KEYS:
                 self._toggle[cur] = not self._toggle[cur]
+            elif cur == "view":
+                self._view = "terminal" if self._view == "hud" else "hud"
             self._msg = ""; return Nothing
         if name == ENTER:
             if cur == "name":
@@ -234,6 +282,8 @@ class RecordScreen(ScreenState):
                 return Invoke(self._edit_task)
             if cur in _TOGGLE_KEYS:
                 self._toggle[cur] = not self._toggle[cur]; return Nothing
+            if cur == "view":
+                self._view = "terminal" if self._view == "hud" else "hud"; return Nothing
             if cur in _NUM_KEYS:
                 self._commit_num(cur); return Nothing
             if cur == "start":
@@ -351,15 +401,55 @@ class RecordScreen(ScreenState):
             "--resume", "true" if resume else "false",
             *self._extra,
         ]
+        if self._view == "hud" and not runner.DRY_RUN:
+            if not evdev_readable():
+                app.notify(
+                    "hud view: base wasd will be INACTIVE — no /dev/input access. "
+                    "Fix: sudo usermod -aG input $USER + relogin, or set View to terminal.",
+                    "warn")
+            # In-page recording: stream record.sh under a PTY, watch its markers for
+            # the episode HUD, and forward keys (episode arrows/ESC ride the pty; the
+            # base wasd uses the shim's evdev backend below the terminal). DRY_RUN
+            # stays on suspend so runner.safe_argv can append --dry-run (R8).
+            self._ep_cur = None
+            self._ep_started = None
+            self._phase_note = "starting…"
+            self.stream.health_pattern = _HEALTH_RE
+            self.stream.line_hook = self._on_record_line
+            rows, cols = (self._area.height, self._area.width) if self._area else (40, 110)
+            await self.stream.start(
+                argv, winsize=(rows, cols),
+                running_status=f"recording · {repo_id}")
+            return
         await app.suspend(argv)
+
+    # ── HUD state fed by the stream's line hook (runs on the event loop) ─────────
+    def _on_record_line(self, ln: str) -> None:
+        m = _EP_MARKER.search(ln)
+        if m:
+            self._ep_cur = int(m.group(1))
+            self._ep_started = time.monotonic()
+            self._phase_note = "recording"
+            return
+        if "Reset the environment" in ln:
+            self._ep_started = time.monotonic()
+            self._phase_note = "reset — prepare the scene"
+        elif "Re-record episode" in ln:
+            self._phase_note = "re-recording"
+        elif "Stop recording" in ln:
+            self._phase_note = "stopping"
 
     # ── view ────────────────────────────────────────────────────────────────────
     def draw(self, frame: Any, area: Any) -> None:
+        self._area = area
         frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
+        if self.stream.phase != "idle":
+            self._draw_hud(frame, area)
+            return
         repo_id, root = self._resolve()
         rows = (Layout().direction(Direction.Vertical).constraints(
             [Constraint.length(1), Constraint.length(1), Constraint.length(1),
-             Constraint.length(2), Constraint.fill(1), Constraint.length(1),
+             Constraint.length(4), Constraint.fill(1), Constraint.length(1),
              Constraint.length(1)]).split(area))
         frame.render_widget(Paragraph(Text([Line([
             Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE), Span("  record", theme.SUBTITLE_STYLE)])]
@@ -367,14 +457,142 @@ class RecordScreen(ScreenState):
         frame.render_widget(Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
         frame.render_widget(runtime_chips(self.ctx), rows[2])
         frame.render_widget(Paragraph(Text([
-            Line([Span(f"→ {root}  ·  {repo_id}", theme.MUTED_STYLE)]),
-            Line([Span("⚠ start the Pi host before recording.", theme.STATUS_VALUE_STYLE)]),
+            self._dest_line(root, repo_id, rows[3].width),
+            self._dataset_chips(root),
+            self._resume_line(root),
+            self._host_line(),
         ])).style(theme.BASE_STYLE), rows[3])
         frame.render_widget(self._body(rows[4].width), rows[4])
         if self._msg:
             frame.render_widget(Paragraph(Text([Line([Span(self._msg, theme.ERR_STYLE)])])
                                           ).style(theme.BASE_STYLE), rows[5])
         frame.render_widget(self._hint(), rows[6])
+
+    # ── the recording HUD (stream running/ended) ─────────────────────────────────
+    def _health_spans(self) -> list[Span]:
+        """The loop gauge from the stream's health matcher, colored against the run's
+        fps target (≥80% green, else amber). Empty until the child prints a rate."""
+        h = self.stream.health
+        if not h:
+            return []
+        try:
+            rate = float(re.match(r"\d+(?:\.\d+)?", h).group(0))
+            ok = rate >= 0.8 * self._num["fps"].value
+        except (AttributeError, ValueError):
+            ok = True
+        return [Span("   ", theme.BASE_STYLE),
+                Span(h, theme.OK_STYLE if ok else theme.WARN_STYLE)]
+
+    def _hud_episode_line(self) -> Line:
+        total = self._num["episodes"].value
+        if self._ep_cur is None:
+            return Line([Span(f"  waiting for the first episode… ({total} planned)",
+                              theme.MUTED_STYLE)])
+        spans = [Span(f"  episode {self._ep_cur}", theme.TEXT_STYLE),
+                 Span(f" · {self._phase_note}", theme.MUTED_STYLE)]
+        if self._ep_started is not None and self._phase_note in ("recording", "reset — prepare the scene"):
+            budget = (self._num["ep_time"] if self._phase_note == "recording"
+                      else self._num["reset_time"]).value
+            elapsed = time.monotonic() - self._ep_started
+            if budget > 0:
+                filled, empty = theme.progress_segments(min(1.0, elapsed / budget), 24)
+                spans += [Span("  ", theme.BASE_STYLE),
+                          Span(filled, theme.OK_STYLE), Span(empty, theme.MUTED_STYLE),
+                          Span(f" {int(elapsed)}/{budget}s", theme.MUTED_STYLE)]
+        return Line(spans)
+
+    def _draw_hud(self, frame: Any, area: Any) -> None:
+        repo_id, root = self._resolve()
+        rows = (Layout().direction(Direction.Vertical).constraints(
+            [Constraint.length(1), Constraint.length(1), Constraint.length(1),
+             Constraint.length(1), Constraint.length(1), Constraint.length(1),
+             Constraint.fill(1), Constraint.length(1)]).split(area))
+        frame.render_widget(Paragraph(Text([Line([
+            Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE),
+            Span("  record", theme.SUBTITLE_STYLE),
+            Span(f"   {repo_id}", theme.MUTED_STYLE)])])).style(theme.BASE_STYLE), rows[0])
+        frame.render_widget(Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
+        frame.render_widget(runtime_chips(self.ctx), rows[2])
+        status = self.stream.status
+        st_style = theme.OK_STYLE if status.startswith("✓") else (
+            theme.WARN_STYLE if self.stream.ended else theme.STATUS_VALUE_STYLE)
+        base_dead = not evdev_readable()
+        base_spans = ([Span("   base keys INACTIVE (no /dev/input)", theme.WARN_STYLE)]
+                      if base_dead and self.stream.running else [])
+        frame.render_widget(Paragraph(Text([Line(
+            [Span(f"  {status}", st_style), *self._health_spans(), *base_spans]
+        )])).style(theme.BASE_STYLE), rows[3])
+        frame.render_widget(Paragraph(Text([self._hud_episode_line()])).style(theme.BASE_STYLE), rows[4])
+        if self.stream.running:
+            info_line = Line([Span(f"  task: {self._ds_task or '(no task set)'}", theme.MUTED_STYLE)])
+        else:
+            stats = dataset_stats(root)
+            info_line = Line([Span(f"  {stats}" if stats else "  (no dataset on disk)", theme.TEXT_STYLE)])
+        frame.render_widget(Paragraph(Text([info_line])).style(theme.BASE_STYLE), rows[5])
+        self.stream.draw_log(frame, rows[6], title="lerobot-record")
+        if self.stream.running:
+            hint = [("→", "next episode"), ("←", "re-record"), ("ESC", "stop"),
+                    (("wasd/zx", "base (evdev)") if not base_dead else ("wasd", "base OFF")),
+                    ("Ctrl+C", "abort")]
+        else:
+            hint = [("⏎", "back to form"), ("q", "back")]
+        frame.render_widget(keycap_hint_line(hint), rows[7])
+
+    def _dest_line(self, root: str, repo_id: str, width: int) -> Line:
+        """Destination as chips + the RESOLVED absolute path (normalized + ~-collapsed,
+        middle-clipped to fit): a stale ../ in the yaml once split a dataset invisibly;
+        the real path makes any such drift jump out before an episode lands wrong."""
+        resolved = str(_workspace_path(root).resolve())
+        home = os.path.expanduser("~")
+        if resolved.startswith(home):
+            resolved = "~" + resolved[len(home):]
+        spans = chip_spans([("repo", repo_id, theme.CHIP_VALUE_STYLE)])
+        used = sum(len(sp.content) for sp in spans) + 2
+        spans.append(Span(clip_middle(resolved, max(24, width - used)), theme.MUTED_STYLE))
+        return Line(spans)
+
+    def _dataset_chips(self, root: str) -> Line:
+        """What is on disk at the target root right now, as the app's chip idiom (the
+        stats are TTL-cached, so calling from draw is fine)."""
+        parts = dataset_stats_parts(_workspace_path(root))
+        if not parts:
+            return Line([Span(" ", theme.BASE_STYLE),
+                         Span("○ new dataset — the first episode creates it", theme.MUTED_STYLE)])
+        return Line(chip_spans([
+            ("episodes", parts["episodes"], theme.CHIP_VALUE_STYLE),
+            ("length", f"{parts['minutes']} min", theme.CHIP_TEXT_STYLE),
+            ("size", parts["size"], theme.CHIP_TEXT_STYLE),
+            ("updated", parts["updated"], theme.CHIP_TEXT_STYLE),
+        ]))
+
+    def _host_line(self) -> Line:
+        """LIVE host readiness (the probe the robot chip polls), replacing the old
+        static "start the Pi host" warning that showed even when it was running."""
+        from ..hostprobe import get_probe
+
+        probe = get_probe(self.ctx)
+        alive = probe.alive if probe is not None else None
+        if alive is True:
+            return Line([Span(f" {theme.status_dot()} host live — ready to record", theme.OK_STYLE)])
+        if alive is False:
+            return Line([Span(" ⚠ host not reachable — Start host first (menu 1)", theme.STATUS_VALUE_STYLE)])
+        return Line([Span(" host status: checking…", theme.MUTED_STYLE)])
+
+    def _resume_line(self, root: str) -> Line:
+        """Say EXACTLY what Start will do about existing data, before the user commits:
+        append (episode number), the Resume/Delete/Cancel gate, or a fresh start."""
+        resume = self._toggle["resume"] or args_have_resume(self._extra)
+        exists = dataset_present(root)
+        if exists and resume:
+            return Line([Span(f"  resume on — will append after episode {dataset_episodes(root)}",
+                              theme.OK_STYLE)])
+        if exists and not resume:
+            return Line([Span("  ⚠ dataset exists and resume is off — Start will ask: "
+                              "Resume / Delete / Cancel", theme.STATUS_VALUE_STYLE)])
+        if resume and not exists:
+            return Line([Span("  resume on, but nothing to resume — starts a new dataset",
+                              theme.MUTED_STYLE)])
+        return Line([Span("  starts a fresh dataset", theme.MUTED_STYLE)])
 
     def _value(self, field: str) -> str:
         # NOTE: "task" is NOT handled here — it is special-cased in _body (multiline,
@@ -388,6 +606,8 @@ class RecordScreen(ScreenState):
             return nf.display()
         if field in _TOGGLE_KEYS:
             return theme.choice("on") if self._toggle[field] else theme.choice("off")
+        if field == "view":
+            return theme.choice(self._view)
         return ""
 
     @staticmethod

@@ -4,6 +4,7 @@ dataset_episodes / args_have_resume. Behavior ported verbatim from lekiwi.sh.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -68,3 +69,66 @@ def args_have_resume(extra: Sequence[str]) -> bool:
     """True if --resume or --resume=… is already in the passthrough args. Bash
     args_have_resume (425)."""
     return any(a == "--resume" or a.startswith("--resume=") for a in extra)
+
+
+# ── dataset stats (record screen panel) ───────────────────────────────────────
+_STATS_CACHE: dict[str, tuple[float, "dict | None"]] = {}
+_STATS_TTL = 5.0
+
+
+def dataset_stats_parts(root: str | Path) -> "dict | None":
+    """One informative line about the dataset at *root* for the record panel:
+    "34 episodes · 21.3 min · 812 MB · updated 14:02" — or "" when nothing exists yet.
+
+    Called from ``draw`` every frame, so results are cached ~5s per root (the disk walk
+    over a video dataset is NOT per-frame material). Best-effort: any unreadable piece
+    degrades to '?' rather than raising."""
+    import time as _time
+
+    key = str(root)
+    now = _time.monotonic()
+    hit = _STATS_CACHE.get(key)
+    if hit and (now - hit[0]) < _STATS_TTL:
+        return hit[1]
+
+    parts = None
+    p = Path(root)
+    if dataset_present(p):
+        eps = dataset_episodes(p)
+        minutes = "?"
+        try:
+            info = json.loads((p / "meta" / "info.json").read_text())
+            frames, fps = info.get("total_frames"), info.get("fps")
+            if isinstance(frames, (int, float)) and isinstance(fps, (int, float)) and fps:
+                minutes = f"{frames / fps / 60:.1f}"
+        except Exception:
+            pass
+        size_b = 0
+        newest = 0.0
+        try:
+            for dirpath, _dirs, files in os.walk(p):
+                for f in files:
+                    try:
+                        st = os.stat(os.path.join(dirpath, f))
+                    except OSError:
+                        continue
+                    size_b += st.st_size
+                    newest = max(newest, st.st_mtime)
+        except OSError:
+            pass
+        size = (f"{size_b / 1e9:.1f} GB" if size_b >= 1e9
+                else f"{size_b / 1e6:.0f} MB" if size_b else "?")
+        updated = (_time.strftime("%H:%M", _time.localtime(newest)) if newest else "?")
+        parts = {"episodes": eps, "minutes": minutes, "size": size, "updated": updated}
+    _STATS_CACHE[key] = (now, parts)
+    return parts
+
+
+def dataset_stats(root: str | Path) -> str:
+    """The one-line rendering of :func:`dataset_stats_parts` ("" when no dataset):
+    "34 episodes · 21.3 min · 812 MB · updated 14:02"."""
+    parts = dataset_stats_parts(root)
+    if not parts:
+        return ""
+    return (f"{parts['episodes']} episodes · {parts['minutes']} min · "
+            f"{parts['size']} · updated {parts['updated']}")
