@@ -104,6 +104,7 @@ class App:
         fps: float = 30.0,
         toast_seconds: float = 4.0,
         draw_overlays: Callable[["App", Any, Any], None] | None = None,
+        global_key: "Callable[[App, Any], Any] | None" = None,
     ) -> None:
         self._stack: list["ScreenState"] = []
         self._toasts: list[Toast] = []
@@ -111,6 +112,11 @@ class App:
         self._fps = fps
         self._toast_seconds = toast_seconds
         self._draw_overlays = draw_overlays
+        # Optional app-wide key hook, consulted BEFORE the top screen (like the `?`
+        # help intercept, and like it NOT active inside modal loops). Returns an
+        # awaitable to run and swallow the key, or None to pass the key through.
+        # The lekiwi shell uses this for the double-K panic stop.
+        self._global_key = global_key
         self._running = False
         # The live terminal, set for the duration of run(); None outside it. Held so
         # suspend() can restore/re-enter and run_modal can draw+poll on the SAME one.
@@ -272,6 +278,11 @@ class App:
 
                         await self.run_modal(HelpModalState(screen))
                         continue
+                    if self._global_key is not None:
+                        handled = self._global_key(self, key)
+                        if handled is not None:
+                            await handled
+                            continue
                     action = screen.handle_key(key)
                     await self._interpret(action)
             finally:

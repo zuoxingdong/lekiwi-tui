@@ -36,7 +36,9 @@ def _make_app(ctx, root):
     the App↔root↔dispatcher construction cycle.
     """
     disp = Dispatcher(ctx)
-    app = App(root, run_action=disp.run_action, fps=30.0)
+    from .panic import make_global_key
+
+    app = App(root, run_action=disp.run_action, fps=30.0, global_key=make_global_key(ctx))
     disp.bind(app)
     # Give the root its app handle now that the App exists (unused during __init__).
     try:
