@@ -28,7 +28,7 @@ train, evaluate, keep the Pi in sync. Runs real `lerobot` commands through the
 - The default robot type `lekiwi_pincopen` needs the
   [lerobot_robot_lekiwi_pincopen](https://github.com/zuoxingdong/lerobot_robot_lekiwi_pincopen)
   plugin on the Pi. Set up Pi / Sync to Pi install and ship it automatically.
-  Driving a stock LeKiwi instead: set `ROBOT_TYPE` to `lekiwi` in Settings.
+  Driving an original (unmodified) LeKiwi instead: set `ROBOT_TYPE` to `lekiwi` in Settings.
 - Optional: `input` group membership enables base wasd keys in the record HUD
   view. The terminal view needs no system changes.
 
