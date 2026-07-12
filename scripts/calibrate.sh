@@ -36,11 +36,11 @@
 #       Local SO101 leader calibration. Unknown trailing flags pass through into
 #       the lerobot-calibrate argv (e.g. --teleop.foo=bar), like the other launchers.
 #
-#   calibrate.sh --target follower --host H --conda-env E --robot-id R
+#   calibrate.sh --target follower --host H --conda-env E --robot-id R [--robot-type T]
 #       `ssh -t` the Pi for the interactive follower calibration. (No passthrough:
 #       the remote bash is fixed, so the follower target takes no extra.)
 #
-#   calibrate.sh emit-follower-remote --conda-env E --robot-id R
+#   calibrate.sh emit-follower-remote --conda-env E --robot-id R [--robot-type T]
 #       Print ONLY the remote follower bash. Like host.sh emit-kill, this keeps the
 #       script the single source of that bash; the byte-equality test asserts it
 #       against an independent golden (test_calibrate.py _golden_follower_remote).
@@ -71,20 +71,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-# emit_follower_remote <conda_env> <robot_id>
-#   Print the remote FOLLOWER bash. This is its single source; the byte-equality test
+# emit_follower_remote <conda_env> <robot_id> <robot_type>
+#   Print the remote FOLLOWER bash. robot_type picks the follower --robot.type:
+#   lekiwi_pincopen (the default) is the PincOpen robot plugin (lerobot_robot_lekiwi_pincopen,
+#   installed on the Pi by pi_provision.sh); lerobot-calibrate's plugin discovery
+#   registers it, and its calibrate() skips the gripper (fixed EPROM calibration)
+#   unlike stock lekiwi. The TUI passes the ROBOT_TYPE config value here.
+#   This is its single source; the byte-equality test
 #   pins it to test_calibrate.py's _golden_follower_remote. printf reproduces the exact
 #   bytes (the gate depends on them): three lines, each
 #   ending in a newline (so the string ends with a trailing newline). The remote-side
 #   $(...) mamba hook is LITERAL here (it is evaluated on the Pi, not by this printf),
 #   so it sits inside the single-quoted format and is emitted as-is. conda_env fills
-#   the first two %s (the activate target + the error message), robot_id the third.
+#   the first two %s (the activate target + the error message), robot_type then
+#   robot_id the last two.
 emit_follower_remote() {
-  local conda_env="$1" robot_id="$2"
+  local conda_env="$1" robot_id="$2" robot_type="$3"
   printf 'eval "$(~/miniforge3/bin/mamba shell hook --shell bash)" || exit 1
 mamba activate %s || { echo '\''✗ could not activate %s'\'' >&2; exit 1; }
-lerobot-calibrate --robot.type=lekiwi --robot.id=%s
-' "$conda_env" "$conda_env" "$robot_id"
+lerobot-calibrate --robot.type=%s --robot.id=%s
+' "$conda_env" "$conda_env" "$robot_type" "$robot_id"
 }
 
 # ── subcommand split ──────────────────────────────────────────────────────────
@@ -95,11 +101,13 @@ if [[ "${1:-}" == "emit-follower-remote" ]]; then
   shift
   conda_env=""
   robot_id=""
+  robot_type="lekiwi_pincopen"     # default: the PincOpen plugin robot
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --conda-env) conda_env="$2"; shift 2 ;;
-      --robot-id)  robot_id="$2"; shift 2 ;;
-      --dry-run)   shift ;;          # accepted + ignored (always emits)
+      --conda-env)  conda_env="$2"; shift 2 ;;
+      --robot-id)   robot_id="$2"; shift 2 ;;
+      --robot-type) robot_type="$2"; shift 2 ;;
+      --dry-run)    shift ;;          # accepted + ignored (always emits)
       *)
         echo "calibrate.sh: unknown flag '$1' for emit-follower-remote" >&2
         exit 2 ;;
@@ -108,7 +116,8 @@ if [[ "${1:-}" == "emit-follower-remote" ]]; then
   : "${DRY:-0}"   # DRY=1 is likewise a no-op; referenced so set -u stays happy
   validate_remote_name "$conda_env" "conda env"
   validate_remote_name "$robot_id" "robot id"
-  emit_follower_remote "$conda_env" "$robot_id"
+  validate_remote_name "$robot_type" "robot type"
+  emit_follower_remote "$conda_env" "$robot_id" "$robot_type"
   exit 0
 fi
 
@@ -123,6 +132,7 @@ leader_id=""
 host=""
 conda_env=""
 robot_id=""
+robot_type="lekiwi_pincopen"     # follower --robot.type; the TUI passes ROBOT_TYPE
 dry="${DRY:-0}"        # DRY=1 in the env is an alias for --dry-run
 extra=()               # leader passthrough flags appended after the built argv
 
@@ -134,6 +144,7 @@ while [[ $# -gt 0 ]]; do
     --host)         host="$2"; shift 2 ;;
     --conda-env)    conda_env="$2"; shift 2 ;;
     --robot-id)     robot_id="$2"; shift 2 ;;
+    --robot-type)   robot_type="$2"; shift 2 ;;
     --dry-run)      dry=1; shift ;;
     *)
       extra+=("$1"); shift ;;   # tolerate + forward trailing passthrough flags (leader)
@@ -158,6 +169,7 @@ case "$target" in
     validate_ssh_host "$host" "LEKIWI_HOST"
     validate_remote_name "$conda_env" "conda env"
     validate_remote_name "$robot_id" "robot id"
+    validate_remote_name "$robot_type" "robot type"
     [[ ${#extra[@]} -eq 0 ]] || die_usage "follower calibration does not accept passthrough flags"
     # `ssh -t` the Pi for the interactive follower calibration — the follower ssh argv
     # golden pins these tokens, with the emit-follower-remote bash as the single last
@@ -166,7 +178,7 @@ case "$target" in
     # $(...) command-sub would EAT it, making the exec'd ssh token one byte short of
     # the golden. The `printf x` sentinel + `${remote%x}` strip preserves it, so both
     # exec AND --dry-run carry the exact \n-terminated token the golden expects.
-    remote="$(emit_follower_remote "$conda_env" "$robot_id"; printf x)"
+    remote="$(emit_follower_remote "$conda_env" "$robot_id" "$robot_type"; printf x)"
     remote="${remote%x}"
     argv=(
       ssh
@@ -179,8 +191,8 @@ case "$target" in
   ""|*)
     echo "calibrate.sh: --target must be leader or follower (got '${target}')" >&2
     echo "usage: calibrate.sh --target leader  --leader-port P --leader-id I [extra…]" >&2
-    echo "       calibrate.sh --target follower --host H --conda-env E --robot-id R" >&2
-    echo "       calibrate.sh emit-follower-remote --conda-env E --robot-id R" >&2
+    echo "       calibrate.sh --target follower --host H --conda-env E --robot-id R [--robot-type T]" >&2
+    echo "       calibrate.sh emit-follower-remote --conda-env E --robot-id R [--robot-type T]" >&2
     exit 2 ;;
 esac
 

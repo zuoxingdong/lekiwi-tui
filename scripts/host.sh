@@ -33,10 +33,13 @@
 # SUBCOMMANDS
 # ----------------------------------------------------------------------------
 #   host.sh emit-launch --conda-env E --robot-id R --connection-time S \
-#                       [--cfg-flag F] [--loop-flag F]
+#                       [--robot-type T] [--cfg-flag F] [--loop-flag F]
 #       Print the remote LAUNCH bash (== screens/host.py remote_script). --cfg-flag
 #       / --loop-flag default to empty (the host then uses its built-in defaults);
 #       empty values reproduce bash's collapsed inner spacing on the launch line.
+#       --robot-type picks the host module (whitelist, default lekiwi_pincopen):
+#         lekiwi_pincopen → python -m lerobot_robot_lekiwi_pincopen.lekiwi_host  (plugin)
+#         lekiwi          → python -m lerobot.robots.lekiwi.lekiwi_host   (stock)
 #
 #   host.sh emit-kill --robot-id R
 #       Print the remote KILL bash: pgrep the lekiwi_host for this robot id,
@@ -66,18 +69,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-# emit_launch <conda_env> <robot_id> <connection_time> <cfg_flag> <loop_flag>
+# emit_launch <conda_env> <robot_id> <connection_time> <cfg_flag> <loop_flag> <host_module>
 #   Print the remote LAUNCH bash, byte-for-byte equal to screens/host.py
 #   remote_script(). printf reproduces the exact bytes: the leading newline, the
 #   8-space indent on every line, the `\`-newline line continuations on the
 #   lekiwi_host launch line, and the trailing newline + 4 spaces with NO final
 #   newline. The remote-side vars ($PID/$WPID/$RC/$GRACE/$i and the $(...) mamba
 #   hook) are LITERAL here — they are evaluated on the Pi, not by this printf — so
-#   they sit inside the single-quoted format and are emitted as-is. Only the five
+#   they sit inside the single-quoted format and are emitted as-is. Only the six
 #   %s positions are substituted on the local side. cfg_flag/loop_flag splice raw
 #   (empty when not shipped), reproducing bash's collapsed inner spacing exactly.
+#   host_module comes from the --robot-type whitelist below; the default is the
+#   PincOpen plugin wrapper (python -m lerobot_robot_lekiwi_pincopen.lekiwi_host: STS3250
+#   arms + gripper tuning, same CLI as the stock host; the wrapper module is
+#   deliberately also named lekiwi_host so emit-kill's pgrep patterns keep matching
+#   whichever module runs).
 emit_launch() {
-  local conda_env="$1" robot_id="$2" connection_time="$3" cfg_flag="$4" loop_flag="$5"
+  local conda_env="$1" robot_id="$2" connection_time="$3" cfg_flag="$4" loop_flag="$5" host_module="$6"
   printf '
         GRACE=5
         cleanup() {
@@ -96,7 +104,7 @@ emit_launch() {
         eval "$(~/miniforge3/bin/mamba shell hook --shell bash)" || exit 1
         mamba activate %s || { echo '\''✗ could not activate %s'\'' >&2; exit 1; }
 
-        ( trap - INT TERM; exec python -m lerobot.robots.lekiwi.lekiwi_host %s %s \
+        ( trap - INT TERM; exec python -m %s %s %s \
             --robot.id=%s \
             --host.connection_time_s=%s ) &
         PID=$!
@@ -113,7 +121,7 @@ emit_launch() {
         wait "$PID"; RC=$?
         kill "$WPID" 2>/dev/null || true
         exit $RC
-    ' "$conda_env" "$conda_env" "$cfg_flag" "$loop_flag" "$robot_id" "$connection_time" "$connection_time"
+    ' "$conda_env" "$conda_env" "$host_module" "$cfg_flag" "$loop_flag" "$robot_id" "$connection_time" "$connection_time"
 }
 
 # emit_kill <robot_id>
@@ -143,6 +151,7 @@ sub="${1:-}"
 # launch knobs (empty cfg/loop flags = not shipped -> host uses built-in defaults)
 conda_env=""
 robot_id=""
+robot_type="lekiwi_pincopen"   # the follower to launch; the TUI passes ROBOT_TYPE
 connection_time=""
 cfg_flag=""
 loop_flag=""
@@ -151,6 +160,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --conda-env)        conda_env="$2"; shift 2 ;;
     --robot-id)         robot_id="$2"; shift 2 ;;
+    --robot-type)       robot_type="$2"; shift 2 ;;
     --connection-time)  connection_time="$2"; shift 2 ;;
     --cfg-flag)         cfg_flag="$2"; shift 2 ;;
     --loop-flag)        loop_flag="$2"; shift 2 ;;
@@ -162,6 +172,18 @@ while [[ $# -gt 0 ]]; do
 done
 : "${DRY:-0}"   # DRY=1 is likewise a no-op; referenced so set -u stays happy
 
+# robot type -> host module WHITELIST. A case map (not string splicing) so an
+# arbitrary --robot-type can never smuggle tokens into the remote python -m line.
+host_module_for() {
+  case "$1" in
+    lekiwi_pincopen) printf '%s\n' "lerobot_robot_lekiwi_pincopen.lekiwi_host" ;;  # PincOpen plugin
+    lekiwi)          printf '%s\n' "lerobot.robots.lekiwi.lekiwi_host" ;;   # stock lerobot
+    *)
+      echo "host.sh: unknown robot type '$1' (expected lekiwi_pincopen | lekiwi)" >&2
+      exit 2 ;;
+  esac
+}
+
 case "$sub" in
   emit-launch)
     validate_remote_name "$conda_env" "conda env"
@@ -169,12 +191,13 @@ case "$sub" in
     validate_positive_int "$connection_time" "connection time"
     validate_optional_cli_flag "$cfg_flag" "config flag"
     validate_optional_cli_flag "$loop_flag" "loop flag"
-    emit_launch "$conda_env" "$robot_id" "$connection_time" "$cfg_flag" "$loop_flag" ;;
+    host_module="$(host_module_for "$robot_type")"
+    emit_launch "$conda_env" "$robot_id" "$connection_time" "$cfg_flag" "$loop_flag" "$host_module" ;;
   emit-kill)
     validate_remote_name "$robot_id" "robot id"
     emit_kill "$robot_id" ;;
   ""|-h|--help|help)
-    echo "usage: host.sh emit-launch --conda-env E --robot-id R --connection-time S [--cfg-flag F] [--loop-flag F]" >&2
+    echo "usage: host.sh emit-launch --conda-env E --robot-id R --connection-time S [--robot-type T] [--cfg-flag F] [--loop-flag F]" >&2
     echo "       host.sh emit-kill --robot-id R" >&2
     [[ "$sub" == "" ]] && exit 2 || exit 0 ;;
   *)
