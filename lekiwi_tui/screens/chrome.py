@@ -14,6 +14,12 @@ from pyratatui import Line, Paragraph, Span, Style, Text
 from ..framework import runner, theme
 
 
+# Shared option_line label widths, so field/action columns align ACROSS screens
+# instead of each screen picking its own number (they had drifted: 9/20/42).
+LABEL_W_FIELD = 9    # short knob rows: python / recreate / install / lerobot / plugin …
+LABEL_W_ACTION = 20  # action rows: "▶ Sync now" / "▶ Run setup" style
+
+
 def ellipsis() -> str:
     return "..." if theme.ASCII_MODE else "…"
 
@@ -66,6 +72,32 @@ def _cfg(ctx: Any, key: str, default: str = "") -> str:
         return default
 
 
+def robot_chip_spans(ctx: Any) -> list[Span]:
+    """The `robot` chip: type + LIVE host state. `●` (green) when the Pi host answers
+    on its ZMQ command port, `○` (muted) when it does not, nothing until the first
+    probe lands. While a launched session is running, the remaining time trails the
+    dot (`● 23:41`). The probe is throttled + threaded (hostprobe.py) — calling this
+    every frame is free."""
+    from ..hostprobe import get_probe, session_remaining
+
+    robot = _cfg(ctx, "ROBOT_TYPE")
+    if not robot:
+        return []
+    spans = [Span(" robot ", theme.CHIP_STYLE), Span(f"{robot} ", theme.CHIP_VALUE_STYLE)]
+    probe = get_probe(ctx)
+    if probe is not None:
+        probe.poll()
+        if probe.alive is True:
+            spans.append(Span(f"{theme.status_dot()} ", theme.CHIP_OK_STYLE))
+            left = session_remaining(ctx)
+            if left is not None:
+                spans.append(Span(f"{left // 60}:{left % 60:02d} ", theme.CHIP_TEXT_STYLE))
+        elif probe.alive is False:
+            spans.append(Span("○ " if not theme.ASCII_MODE else "o ", theme.CHIP_MUTED_STYLE))
+    spans.append(Span(" ", theme.BASE_STYLE))
+    return spans
+
+
 def runtime_chips(ctx: Any) -> Paragraph:
     spans: list[Span] = []
     host = _cfg(ctx, "LEKIWI_HOST")
@@ -74,6 +106,8 @@ def runtime_chips(ctx: Any) -> Paragraph:
         spans.extend(chip_spans([("host", host, theme.CHIP_VALUE_STYLE)]))
     if env:
         spans.extend(chip_spans([("env", env, theme.CHIP_VALUE_STYLE)]))
+    # which follower the launchers drive + whether it is LIVE right now
+    spans.extend(robot_chip_spans(ctx))
 
     spans.append(Span(" GPU ", theme.CHIP_STYLE))
     if getattr(ctx, "gpu_name", ""):

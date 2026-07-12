@@ -6,7 +6,8 @@ The canonical EXEMPLAR every other screen copies: it takes ``(app, ctx)``, subcl
 
 Look + keys mirror the original: a "◆ LEKIWI" header, an accent rule, a compact status
 line, a sectioned action list (HOST / COLLECT / LEARN / SETUP), a footer hint, and
-highlighted selected rows. ↑↓ + j/k move, digit 1-9 jumps to and runs that action,
+highlighted selected rows. ↑↓ + j/k move, a digit jumps to and runs that action
+(daily-driver rows only — the SETUP section has no digit, it is not worth a slip),
 ⏎ runs the highlighted action, q quits. Navigation skips the section labels: the
 selection index runs over the real ACTIONS only.
 """
@@ -26,6 +27,11 @@ if TYPE_CHECKING:
     from ..framework.app import App
 
 SECTION_RULE_WIDTH = 46
+
+
+# Digit shortcuts cover the daily-driver rows only (HOST/COLLECT/LEARN, 1-8 today);
+# SETUP rows are deliberate, low-frequency actions — no jump, no badge.
+_JUMPABLE = [a for a in ACTIONS if a.section != "SETUP"]
 
 
 class MenuScreen(ScreenState):
@@ -50,9 +56,9 @@ class MenuScreen(ScreenState):
             return Nothing
         if len(name) == 1 and name.isdigit() and name != "0":
             d = int(name)
-            if 1 <= d <= n:
-                self._sel = d - 1
-                return RunAction(ACTIONS[d - 1].id)
+            if 1 <= d <= len(_JUMPABLE):
+                self._sel = ACTIONS.index(_JUMPABLE[d - 1])
+                return RunAction(_JUMPABLE[d - 1].id)
             return Nothing
         if name == ENTER:
             return RunAction(ACTIONS[self._sel].id)
@@ -118,6 +124,10 @@ class MenuScreen(ScreenState):
         spans: list[Span] = []
         spans.extend(self._chip("host", str(cfg["LEKIWI_HOST"]), theme.CHIP_VALUE_STYLE))
         spans.extend(self._chip("env", str(cfg["LAPTOP_ENV"]), theme.CHIP_VALUE_STYLE))
+        # live robot chip (type + host ●/○ + session countdown) — shared with chrome
+        from .chrome import robot_chip_spans
+
+        spans.extend(robot_chip_spans(self.ctx))
         spans.extend(self._gpu_chip())
         spans.extend(
             self._chip(
@@ -165,9 +175,14 @@ class MenuScreen(ScreenState):
         ])
 
     def _row(self, action, *, selected: bool) -> Line:
+        # The digit shortcut, rendered as a visible per-row badge. SETUP rows are not
+        # jumpable and get blank padding so the columns stay aligned.
+        idx = _JUMPABLE.index(action) + 1 if action in _JUMPABLE else 0
+        badge = f"{idx} " if 1 <= idx <= 9 else "  "
         if selected:
             return Line([
                 Span(theme.selector(True), theme.HIGHLIGHT_LABEL_STYLE),
+                Span(badge, theme.HIGHLIGHT_TEXT_STYLE),
                 Span(f"{theme.action_icon(action.icon)}  ", theme.HIGHLIGHT_ICON_STYLE),
                 Span(f"{action.label:<12}", theme.HIGHLIGHT_LABEL_STYLE),
                 Span("   ", theme.HIGHLIGHT_STYLE),
@@ -176,6 +191,7 @@ class MenuScreen(ScreenState):
             ], theme.HIGHLIGHT_STYLE)
         return Line([
             Span(theme.selector(False), theme.BASE_STYLE),
+            Span(badge, theme.KEYCAP_STYLE),
             Span(f"{theme.action_icon(action.icon)}  ", theme.BASE_STYLE),
             Span(f"{action.label:<12}", theme.TEXT_STYLE),
             Span("   ", theme.BASE_STYLE),
@@ -185,7 +201,7 @@ class MenuScreen(ScreenState):
     def _hint_line(self) -> Paragraph:
         spans: list[Span] = []
         for k, label in [("↑↓/jk", "move"), ("⏎", "select"),
-                         ("1-9", "jump"), ("d", "preview"), ("q", "quit")]:
+                         (f"1-{len(_JUMPABLE)}", "jump"), ("d", "preview"), ("q", "quit")]:
             spans.append(Span(f" {theme.key_label(k)} ", theme.KEYCAP_STYLE))
             spans.append(Span(f" {label}  ", theme.HINT_STYLE))
         return Paragraph(Text([Line(spans)])).style(theme.BASE_STYLE)
