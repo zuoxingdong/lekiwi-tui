@@ -147,6 +147,9 @@ class HostKillScreen(ScreenState):
             self.app.notify(f"Could not build host stop command: {exc}", "error")
             return
         winsize = (self._area.height, self._area.width) if self._area else _FALLBACK_WINSIZE
+        # Retire the announced session window: the robot chip stops counting down; the
+        # live ●/○ keeps tracking reality through the probe regardless of the kill's rc.
+        self.ctx.ui_state.pop("host_session", None)
         await self.stream.start(argv, winsize=winsize,
                                 running_status=f"stopping the host on {host}…")
 
