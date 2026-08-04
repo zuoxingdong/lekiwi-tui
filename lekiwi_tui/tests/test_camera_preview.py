@@ -90,8 +90,8 @@ def test_the_stream_argv_carries_geometry_and_rotation():
     payload = argv[-1]
     assert 'cv2.VideoCapture("/dev/video4")' in payload
     assert "cv2.rotate(frame, rot[180])" in payload
-    assert "(320, 240)" in payload and "period = 1.0 / 5" in payload
-    assert "IMWRITE_JPEG_QUALITY), 50" in payload
+    assert "(640, 480)" in payload and "period = 1.0 / 5" in payload
+    assert "IMWRITE_JPEG_QUALITY), 60" in payload
 
 
 @pytest.mark.parametrize(("flag", "value", "message"), [
@@ -274,9 +274,12 @@ def test_p_says_so_when_no_camera_has_a_device(monkeypatch):
     assert "no cameras" in app.toasts[0][0]
 
 
-def test_the_hint_line_advertises_both_keys():
+def test_the_hint_line_names_the_preview_key_in_words_too():
+    """The keycap row is the first thing dropped on a narrow terminal (observed at ~120
+    columns), so the sentence has to carry the key as well."""
     source = Path(ROOT / "lekiwi_tui" / "screens" / "robot_config.py").read_text()
-    assert '("f", "detect cameras")' in source and '("p", "preview cameras")' in source
+    assert "p previews the robot cameras" in source
+    assert '("p", "preview")' in source
 
 
 # ── the keyboard must stay with the TUI ────────────────────────────────────────
@@ -336,3 +339,88 @@ def test_the_grid_keeps_the_frame_from_being_stretched():
     # never larger than the pane it was given
     cols, rows = fit_grid(40, 10)
     assert cols <= 40 and rows <= 10
+
+
+# ── which renderer ────────────────────────────────────────────────────────────
+
+
+def test_kitty_is_detected_from_the_environment_not_by_querying():
+    """A capability QUERY writes an escape and reads the reply on the fd the TUI reads keys
+    from, mid-run, in raw mode. Env detection cannot deadlock or eat a keystroke."""
+    from lekiwi_tui.screens.camera_preview import PROTOCOL_ENV, kitty_capable
+
+    assert kitty_capable({"GHOSTTY_RESOURCES_DIR": "/x"})
+    assert kitty_capable({"KITTY_WINDOW_ID": "1"})
+    assert kitty_capable({"TERM": "xterm-ghostty"})
+    assert not kitty_capable({"TERM": "xterm-256color"})
+    # an explicit override wins both ways, for a terminal that lies either direction
+    assert not kitty_capable({"TERM": "xterm-ghostty", PROTOCOL_ENV: "halfblocks"})
+    assert kitty_capable({"TERM": "xterm-256color", PROTOCOL_ENV: "kitty"})
+
+
+def test_the_capture_is_sized_for_a_graphics_protocol():
+    """640x480 at q60 is ~35 KB, so 5 fps is ~175 KB/s — an order below the load that used
+    to freeze the Pi, and only spent while the host is stopped."""
+    from lekiwi_tui.screens.camera_preview import HEIGHT, QUALITY, WIDTH
+
+    assert (WIDTH, HEIGHT) == (640, 480) and QUALITY == 60
+
+
+# ── failure shows what the robot actually has ─────────────────────────────────
+
+
+def test_a_missing_node_reports_the_remote_message_and_asks_what_exists(monkeypatch):
+    """The case this replaces the old `f` key with: the yaml says /dev/video4, that node is
+    gone, and the answer you need is which nodes exist now."""
+    ctx = make_ctx(gpu_name="")
+    ctx.doc = _doc(wrist={"index_or_path": "/dev/video4"})
+
+    class _Failing:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"\xe2\x9c\x97 could not open /dev/video4 (is the host stopped?)\n")
+
+        def terminate(self): pass
+
+        def wait(self, timeout=None): return 0  # noqa: ANN001
+
+        def kill(self): pass
+
+    screen = CameraPreviewScreen(None, ctx, spawn=_Failing)
+    fetched = []
+    monkeypatch.setattr(screen, "_fetch_listing", lambda: fetched.append(True))
+    screen.on_enter()
+    screen._stream._thread.join(timeout=2)
+
+    lines = screen._failure_lines()
+    text = "\n".join("".join(sp.content for sp in ln.spans) for ln in lines)
+    assert "/dev/video4" in text and "could not open" in text
+    assert fetched, "a failure is exactly when the device list is worth fetching"
+
+
+def test_a_healthy_stream_never_fetches_the_listing(monkeypatch):
+    screen, _ = _screen(monkeypatch)
+    monkeypatch.setattr(screen, "_fetch_listing",
+                        lambda: pytest.fail("must not ask while frames are arriving"))
+    screen.on_enter()
+    screen._stream._thread.join(timeout=2)
+    assert screen._failure_lines() is None
+
+
+def test_the_hint_row_keeps_keycaps_when_labels_do_not_fit():
+    """padded_line drops the right side wholesale on overflow, which is how `p` disappeared
+    on a ~120-column terminal. Labels must go before keycaps do."""
+    from lekiwi_tui.screens.chrome import hint_slot_row
+
+    keys = (("e", "edit"), ("r", "reload"), ("p", "preview"), ("q", "back"))
+    hint = "read-only — e edits lekiwi.yaml, r reloads, p previews the robot cameras"
+
+    def rendered(width):
+        return "".join(sp.content for sp in hint_slot_row(hint, width, keys).spans)
+
+    wide = rendered(160)
+    assert "preview" in wide and " p " in wide
+
+    tight = rendered(96)          # labels no longer fit
+    assert " p " in tight, "the keycap survives"
+    assert "preview" not in tight.split("cameras")[-1], "its label does not"

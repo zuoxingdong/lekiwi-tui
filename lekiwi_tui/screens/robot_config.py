@@ -13,7 +13,9 @@ Keys follow the bash ``do_robot_config`` case: ``e`` suspends the app and runs
 ``$EDITOR lekiwi.yaml``, then re-reads from disk and repaints; ``r`` does the same reload
 without editing; ``q`` / ``Esc`` pop back. No motion keys — this is a static panel. ``f``
 is the one addition: it lists the ROBOT's cameras over ssh, because the device nodes shown
-here are Pi-side and renumber themselves (see :func:`build_find_cameras_argv`).
+here are Pi-side and renumber themselves. When a configured node has gone, the preview
+shows what the robot HAS instead (:func:`build_find_cameras_argv`), so one key answers both
+"is this the right lens" and "where did it go".
 
 Immediate-mode notes
 --------------------
@@ -146,8 +148,6 @@ class RobotConfigScreen(ScreenState):
             return Invoke(self._edit)
         if name == "r":
             return Invoke(self._reload)
-        if name == "f":
-            return Invoke(self._detect_cameras)
         if name == "p":
             return self._preview_cameras()
         return Nothing
@@ -172,33 +172,6 @@ class RobotConfigScreen(ScreenState):
             self.app.notify("no cameras with an index_or_path in lekiwi.yaml", "warn")
             return Nothing
         return Push(CameraPreviewScreen(self.app, self.ctx))
-
-    async def _detect_cameras(self) -> None:
-        """``f``: list the ROBOT's cameras, over ssh.
-
-        The `index_or_path` values on this screen are Pi-side device nodes, and a bare
-        /dev/videoN is not reboot/replug-stable — adding a camera renumbers the others.
-        Probing locally would enumerate the laptop's webcam and answer a question nobody
-        asked, so this runs `lerobot-find-cameras` on the robot.
-
-        Refused while the host session is up: that process has every camera open, so the
-        probe would report failures for exactly the devices that are working. `None`
-        (probe still in flight, or no host configured) is allowed through — a maybe is not
-        a reason to block, and the remote output will say what happened.
-        """
-        from ..hostprobe import host_alive
-
-        if host_alive(self.ctx) is True:
-            self.app.notify(
-                "host session is running and holds the cameras — stop it first, then f again",
-                "warn")
-            return
-        try:
-            argv = build_find_cameras_argv(self.ctx)
-        except SystemExit as exc:              # die_usage in the emitter / validators
-            self.app.notify(f"cannot probe cameras: {exc}", "error")
-            return
-        await self.app.suspend(argv)
 
     async def _edit(self) -> None:
         """``e``: suspend the app and open ``$EDITOR`` on lekiwi.yaml, then reload. The CLI
@@ -233,11 +206,12 @@ class RobotConfigScreen(ScreenState):
         frame.render_widget(
             Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
         frame.render_widget(self._body(), rows[2])
+        # p is named in the TEXT too, not only in the keycaps: the keycap row is the first
+        # thing dropped on a narrow terminal, and a key nobody can see does not exist.
         frame.render_widget(hint_slot_line(
-            "read-only view — e edits lekiwi.yaml, r reloads after editing",
+            "read-only — e edits lekiwi.yaml, r reloads, p previews the robot cameras",
             rows[3].width,
-            keys=(("e", f"edit in {resolve_editor()}"), ("r", "reload"),
-                  ("f", "detect cameras"), ("p", "preview cameras"), ("q", "back"))),
+            keys=(("e", "edit"), ("r", "reload"), ("p", "preview"), ("q", "back"))),
             rows[3])
 
     # ── body rendering (sections → lines, ported from the original's Text builders) ──

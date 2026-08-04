@@ -125,6 +125,7 @@ class CameraStream:
     frame_count: int = 0
     started_at: float = 0.0
     error: str = ""
+    remote_error: str = ""                # first line the remote wrote to stderr
     _proc: Any = None
     _thread: threading.Thread | None = None
     _stop: threading.Event = field(default_factory=threading.Event)
@@ -139,6 +140,20 @@ class CameraStream:
             return
         self._thread = threading.Thread(target=self._read, daemon=True)
         self._thread.start()
+        if getattr(self._proc, "stderr", None) is not None:
+            threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def _read_stderr(self) -> None:
+        """Keep the remote's first complaint. 'could not open /dev/video4' is the whole
+        answer when a node has renumbered, and it is worth more than a blank screen."""
+        try:
+            for raw in self._proc.stderr:
+                line = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+                if line and not self.remote_error:
+                    self.remote_error = line
+                    break
+        except Exception:
+            pass
 
     def _read(self) -> None:
         stdout = getattr(self._proc, "stdout", None)
@@ -151,7 +166,9 @@ class CameraStream:
                 self.latest = payload
                 self.frame_count += 1
         if not self._stop.is_set() and self.frame_count == 0:
-            self.error = self.error or "no frames arrived — is the host stopped?"
+            # give the stderr reader a moment: its message is more specific than ours
+            self._stop.wait(0.4)
+            self.error = self.error or self.remote_error or "no frames arrived — is the host stopped?"
 
     def fps(self, *, now: float) -> float:
         elapsed = now - self.started_at

@@ -25,6 +25,11 @@ from typing import TYPE_CHECKING, Any
 
 from pyratatui import Color, Constraint, Direction, Layout, Line, Paragraph, Span, Style, Text
 
+try:                                            # pyratatui >= 0.2.9 ships ratatui-image
+    from pyratatui import ImagePicker, ImageWidget
+except ImportError:                             # older build: the half-block path still works
+    ImagePicker = ImageWidget = None
+
 from .. import ROOT
 from ..camstream import CameraStream, decode_jpeg, half_blocks
 from ..framework import theme
@@ -39,12 +44,14 @@ if TYPE_CHECKING:
 #: The launcher that owns the remote capture bash (the SOLE argv source, as everywhere).
 FIND_CAMERAS_SCRIPT = ROOT / "scripts" / "find_cameras.sh"
 
-#: Preview geometry. Small on purpose: 320x240 at q50 is ~12 KB, so 5 fps is ~60 KB/s,
-#: which keeps the Pi's USB+WiFi load nowhere near the level that used to freeze it.
+#: Preview geometry. 640x480 at q60 is ~35 KB, so 5 fps is ~175 KB/s — still an order below
+#: the USB+WiFi load that used to freeze the Pi, and it is only spent while the host is
+#: stopped and a single camera streams. The old 320x240 was sized for half-blocks, where the
+#: cell grid (120x90 px) was the real ceiling; a graphics protocol shows the frame as-is.
 FPS = 5
-WIDTH = 320
-HEIGHT = 240
-QUALITY = 50
+WIDTH = 640
+HEIGHT = 480
+QUALITY = 60
 
 #: Cell budget for the image. Beyond this the span count starts to cost more than the
 #: extra detail is worth, and a camera is identifiable long before that.
@@ -56,6 +63,44 @@ MAX_ROWS = 56
 CELL_ASPECT = (WIDTH / HEIGHT) * 2
 
 _ROT_DEGREES = {"NO_ROTATION": 0, "ROTATE_90": 90, "ROTATE_180": 180, "ROTATE_270": 270}
+
+#: Force a renderer: `kitty` | `halfblocks`. Unset = decide from the environment.
+PROTOCOL_ENV = "LEKIWI_IMAGE_PROTOCOL"
+
+
+def kitty_capable(environ: Any = None) -> bool:
+    """Whether this terminal speaks the kitty graphics protocol, decided from env vars.
+
+    NOT by querying the terminal: a query writes an escape and reads the reply on the very
+    fd the TUI is reading keys from, mid-run, in raw mode. Env detection cannot deadlock or
+    swallow a keystroke, and the two terminals that matter here announce themselves.
+    """
+    import os
+
+    env = os.environ if environ is None else environ
+    forced = str(env.get(PROTOCOL_ENV, "")).strip().lower()
+    if forced in ("kitty", "halfblocks"):
+        return forced == "kitty"
+    if env.get("KITTY_WINDOW_ID") or env.get("GHOSTTY_RESOURCES_DIR"):
+        return True
+    term = f"{env.get('TERM', '')} {env.get('TERM_PROGRAM', '')}".lower()
+    return "kitty" in term or "ghostty" in term
+
+
+def make_picker() -> tuple[Any, str]:
+    """``(picker, label)`` — a kitty picker where supported, else half-blocks.
+
+    Returns ``(None, ...)`` if this pyratatui has no image support, which the screen then
+    renders with its own half-block path instead of failing.
+    """
+    if ImagePicker is None:
+        return None, "halfblocks (built-in)"
+    try:
+        if kitty_capable():
+            return ImagePicker.kitty(), "kitty graphics"
+        return ImagePicker.halfblocks(), "half-blocks"
+    except Exception:
+        return None, "halfblocks (built-in)"
 
 
 def rotation_degrees(value: Any) -> int:
@@ -137,6 +182,12 @@ class CameraPreviewScreen(ScreenState):
         self._cells: list[list[tuple[str, tuple[int, int, int], tuple[int, int, int]]]] = []
         self._cells_from = -1               # frame_count the cached cells were built from
         self._decode_failed = False
+        self._picker, self._protocol = make_picker()
+        self._image_state: Any = None
+        self._image_from = -1               # frame_count the loaded image was built from
+        self._frame_path: Any = None        # the file the protocol loads each frame from
+        self._listing = ""                  # sysfs device list, fetched only on failure
+        self._listing_started = False
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def on_enter(self) -> None:
@@ -146,6 +197,17 @@ class CameraPreviewScreen(ScreenState):
         if self._stream is not None:
             self._stream.stop()
             self._stream = None
+
+    def close(self) -> None:
+        """Drop the scratch frame file. Separate from on_exit, which also fires when a
+        screen is pushed OVER this one and the preview should survive."""
+        import contextlib
+        import os
+
+        if self._frame_path:
+            with contextlib.suppress(OSError):
+                os.unlink(self._frame_path)
+            self._frame_path = None
 
     def _restart(self) -> None:
         self.on_exit()
@@ -165,6 +227,7 @@ class CameraPreviewScreen(ScreenState):
         name = key.name
         if name in ("q", ESC):
             self.on_exit()
+            self.close()
             return Pop()
         if name in (TAB, RIGHT, "l") and self.cameras:
             self.index = (self.index + 1) % len(self.cameras)
@@ -178,6 +241,32 @@ class CameraPreviewScreen(ScreenState):
             self._restart()
             return Nothing
         return Nothing
+
+    # ── the device list, fetched only when the configured node lets us down ────
+    def _fetch_listing(self) -> None:
+        """Ask the robot what capture nodes it HAS, in a thread.
+
+        Only on failure, and only once: this is the answer to "the yaml says /dev/video4
+        and that is gone, so what is there now", which is precisely when a plain error
+        message is not enough. The payload needs no lerobot env on the Pi.
+        """
+        import threading
+
+        if self._listing_started:
+            return
+        self._listing_started = True
+
+        def run() -> None:
+            try:
+                from .robot_config import build_find_cameras_argv
+
+                out = subprocess.run(build_find_cameras_argv(self.ctx), capture_output=True,
+                                     text=True, timeout=20, check=False)
+                self._listing = (out.stdout or out.stderr or "").strip()
+            except Exception as exc:
+                self._listing = f"(could not list the robot's cameras: {exc})"
+
+        threading.Thread(target=run, daemon=True).start()
 
     # ── rendering ─────────────────────────────────────────────────────────────
     def _refresh_cells(self, cols: int, rows: int) -> None:
@@ -200,10 +289,58 @@ class CameraPreviewScreen(ScreenState):
                    for x in range(target_w)] for y in range(target_h)]
         self._cells = half_blocks(picked)
 
+    def _failure_lines(self) -> list[Line] | None:
+        """The screen when this camera did not come up: what the robot said, plus what it
+        actually has. Returns None while things are fine."""
+        stream = self._stream
+        if stream is None or not stream.error:
+            return None
+        self._fetch_listing()
+        camera = self.cameras[self.index] if self.cameras else {"device": "?"}
+        out = [Line([Span(f"✗ {camera['device']}: {stream.error}", theme.ERR_STYLE)]),
+               Line([])]
+        if not self._listing:
+            out.append(Line([Span("asking the robot which capture nodes it has…",
+                                  theme.FAINT_STYLE)]))
+        else:
+            out += [Line([Span(ln, theme.TEXT_STYLE if "/dev/" in ln else theme.MUTED_STYLE)])
+                    for ln in self._listing.splitlines()]
+            out += [Line([]),
+                    Line([Span("q back, then e to point lekiwi.yaml at the right node",
+                               theme.FAINT_STYLE)])]
+        return out
+
+    def _refresh_image(self) -> bool:
+        """Load the latest frame through the graphics protocol. True when there is an image
+        to render. The frame is written to a file because that is what the protocol loads,
+        and only when the counter moves — 5 loads a second, not one per redraw."""
+        import tempfile
+
+        stream = self._stream
+        if self._picker is None or stream is None or stream.latest is None:
+            return self._image_state is not None
+        if stream.frame_count == self._image_from:
+            return self._image_state is not None
+        if self._frame_path is None:
+            fd, path = tempfile.mkstemp(prefix="lekiwi-preview-", suffix=".jpg")
+            import os
+
+            os.close(fd)
+            self._frame_path = path
+        try:
+            with open(self._frame_path, "wb") as fh:
+                fh.write(stream.latest)
+            self._image_state = self._picker.load(self._frame_path)
+            self._image_from = stream.frame_count
+        except Exception:
+            self._picker = None           # fall back to half-blocks for the rest of the run
+            self._protocol = "half-blocks (image protocol failed)"
+            return False
+        return self._image_state is not None
+
     def _image_lines(self, cols: int, rows: int) -> list[Line]:
+        """The half-block fallback: only used when there is no image protocol."""
         self._refresh_cells(cols, rows)
-        if self._stream is not None and self._stream.error:
-            return [Line([Span(f"✗ {self._stream.error}", theme.ERR_STYLE)])]
         if self._decode_failed:
             return [Line([Span("frames arrive but cannot be decoded here — install opencv "
                                "or pillow in this env", theme.WARN_STYLE)])]
@@ -228,13 +365,20 @@ class CameraPreviewScreen(ScreenState):
             Paragraph.from_string(theme.rule(bands[1].width)).style(theme.RULE_HEAVY_STYLE),
             bands[1])
 
-        cols, rows = fit_grid(bands[2].width, bands[2].height)
-        frame.render_widget(Paragraph(Text(self._image_lines(cols, rows))), bands[2])
+        failed = self._failure_lines()
+        if failed is not None:
+            frame.render_widget(Paragraph(Text(failed)), bands[2])
+        elif self._refresh_image():
+            # the protocol keeps the frame's real resolution; the widget fits it to the area
+            frame.render_stateful_image(ImageWidget(), bands[2], self._image_state)
+        else:
+            cols, rows = fit_grid(bands[2].width, bands[2].height)
+            frame.render_widget(Paragraph(Text(self._image_lines(cols, rows))), bands[2])
 
         fps = self._stream.fps(now=time.monotonic()) if self._stream else 0.0
         which = f"{self.index + 1}/{len(self.cameras)}" if self.cameras else "0/0"
         frame.render_widget(hint_slot_line(
-            f"{which} · {fps:.1f} fps · {WIDTH}x{HEIGHT} on the Pi · host must be stopped",
+            f"{which} · {fps:.1f} fps · {WIDTH}x{HEIGHT} · {self._protocol} · host must be stopped",
             bands[3].width,
             keys=(("tab", "next camera"), ("r", "restart"), ("q", "back"))),
             bands[3])

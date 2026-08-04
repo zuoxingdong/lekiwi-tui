@@ -1,10 +1,10 @@
-"""Detect cameras ON THE ROBOT: the emitter's golden bash, its refusals, and the screen
-key that fronts it.
+"""Listing the ROBOT's camera nodes: the emitted bash and its refusals.
 
-The whole feature exists because the device nodes in lekiwi.yaml are Pi-side and renumber
-themselves, so the two things worth pinning are (a) the probe really is list-only, since a
-capture run writes files on the Pi for no reason, and (b) it refuses while the host session
-holds the cameras, since then it would report failures for the devices that work.
+The device nodes in lekiwi.yaml are Pi-side and renumber themselves, so the TUI has to be
+able to ask what exists. There is no key for it: the preview (`p`) shows this listing when a
+configured node fails, which is the only moment the answer is needed. The launcher keeps the
+payload for CLI use, and these tests pin it — including that the fast path opens no device
+and needs no lerobot env.
 """
 from __future__ import annotations
 
@@ -15,9 +15,7 @@ from pathlib import Path
 import pytest
 
 from lekiwi_tui import ROOT
-from lekiwi_tui.framework.events import Key
-from lekiwi_tui.framework.screen import Invoke, Nothing
-from lekiwi_tui.screens.robot_config import RobotConfigScreen, build_find_cameras_argv
+from lekiwi_tui.screens.robot_config import build_find_cameras_argv
 
 from conftest import make_ctx
 
@@ -107,62 +105,6 @@ def test_the_argv_is_ssh_plus_the_emitted_payload():
     assert "-t" not in argv, "nothing here reads keys; -t would only complicate the suspend"
     assert "/sys/class/video4linux" in argv[-1]
     assert "lerobot" not in argv[-1], "the key must not depend on the Pi's lerobot install"
-
-
-# ── the screen key ────────────────────────────────────────────────────────────
-
-
-class _App:
-    def __init__(self) -> None:
-        self.suspended: list[str] | None = None
-        self.toasts: list[tuple[str, str]] = []
-
-    async def suspend(self, argv, **kwargs):  # noqa: ANN001, ANN003
-        self.suspended = list(argv)
-        return 0
-
-    def notify(self, msg, level="info", **kwargs):  # noqa: ANN001, ANN003
-        self.toasts.append((msg, level))
-
-
-def _screen(monkeypatch, alive):
-    import lekiwi_tui.hostprobe as hostprobe
-
-    monkeypatch.setattr(hostprobe, "host_alive", lambda ctx: alive)
-    app = _App()
-    return app, RobotConfigScreen(app, make_ctx(gpu_name=""))
-
-
-def test_f_returns_a_flow_and_the_other_keys_still_work(monkeypatch):
-    _, screen = _screen(monkeypatch, False)
-    assert isinstance(screen.handle_key(Key(name="f")), Invoke)
-    assert screen.handle_key(Key(name="x")) is Nothing
-
-
-def test_it_refuses_while_the_host_holds_the_cameras(monkeypatch):
-    import asyncio
-
-    app, screen = _screen(monkeypatch, True)
-    asyncio.run(screen._detect_cameras())
-    assert app.suspended is None, "must not probe cameras the host has open"
-    assert app.toasts and "stop it first" in app.toasts[0][0] and app.toasts[0][1] == "warn"
-
-
-def test_it_probes_when_the_host_is_down_or_unknown(monkeypatch):
-    import asyncio
-
-    for alive in (False, None):   # None = probe in flight; a maybe must not block
-        app, screen = _screen(monkeypatch, alive)
-        asyncio.run(screen._detect_cameras())
-        assert app.suspended is not None and app.suspended[0] == "ssh"
-        assert "/sys/class/video4linux" in app.suspended[-1]
-        assert app.toasts == []
-
-
-def test_the_hint_line_advertises_the_key(monkeypatch):
-    _, screen = _screen(monkeypatch, False)
-    source = Path(ROOT / "lekiwi_tui" / "screens" / "robot_config.py").read_text()
-    assert '("f", "detect cameras")' in source
 
 
 # ── the Pi is often older than the laptop ─────────────────────────────────────
