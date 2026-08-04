@@ -155,6 +155,19 @@ argv+=(
   "--dataset.repo_id=${repo_id}"
   "--dataset.root=${root}"
 )
+# Keep the NAME we were given. lerobot appends a _YYYYmmdd_HHMMSS tag to repo_id at
+# dataset creation, so the name recorded in meta/info.json stops matching the one the
+# yaml, replay, train and the dataset editor all use (the data still lands in --root,
+# which is why this was easy to miss). --dataset.no_stamp opts out.
+#
+# Emitted only when the installed lerobot has the field, because it is newer than the
+# flag: passing it to an older one makes draccus reject the whole command. NO_STAMP
+# pins the decision for tests (on|off|auto, default auto = probe).
+case "${NO_STAMP:-auto}" in
+  on)  argv+=("--dataset.no_stamp=true") ;;
+  off) ;;
+  *)   lerobot_declares no_stamp configs/dataset.py && argv+=("--dataset.no_stamp=true") ;;
+esac
 # single_task + fps are FRESH-only (the existing dataset fixes them on resume).
 if ! is_true "$resume"; then
   argv+=(

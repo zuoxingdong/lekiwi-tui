@@ -128,6 +128,32 @@ launcher_get() {
   cfg_get "_launcher.$1"
 }
 
+# lerobot_declares <name> <module-relative-path>
+#   True when the INSTALLED lerobot's source at <path> mentions <name> — a feature
+#   probe for config fields whose absence would make draccus reject our own flag.
+#
+#   WHY textual, and WHY not the version: `import lerobot.configs.dataset` costs ~3s,
+#   which is too much to spend per launch on a yes/no question, and the version cannot
+#   answer it at all. A dev checkout mid-release reports the RELEASE version while
+#   still missing fields that release has (measured: a 0.6.1 tree with no `no_stamp`),
+#   so a version comparison would confidently emit a flag that then fails to parse.
+#   find_spec locates the package WITHOUT executing it (~0.02s).
+#
+#   False when lerobot is not importable at all: callers then omit the flag, which is
+#   the safe direction — the launch still runs, it just keeps lerobot's default.
+lerobot_declares() {
+  local name="${1:?name}" rel="${2:?module path}" pkg
+  pkg="$("$PY" - <<'PY' 2>/dev/null
+import importlib.util
+import pathlib
+spec = importlib.util.find_spec("lerobot")
+print(pathlib.Path(spec.origin).parent if spec and spec.origin else "")
+PY
+)"
+  [[ -n "$pkg" && -f "$pkg/$rel" ]] || return 1
+  grep -q -- "$name" "$pkg/$rel"
+}
+
 # shell_quote <value>
 #   Emit a shell-escaped token suitable for embedding inside a remote bash command.
 #   Callers still pass SSH/scp locally as argv arrays; this is only for the remote
