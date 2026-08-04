@@ -127,12 +127,49 @@ def train_issues(ctx: "Context", *, dataset_root: str, policy_root: str) -> list
     return issues
 
 
+def rollout_dataset_issues(doc: Any) -> list[PreflightIssue]:
+    """Whether the rollout block's strategy and dataset agree with each other.
+
+    lerobot only builds a dataset when the strategy is NOT `base`, and on that path it
+    rejects any dataset name whose basename does not start with `rollout_` — deliberately,
+    so deployment data cannot be mistaken for demonstrations. The catch is WHEN it
+    rejects: dataset setup runs after the robot is connected, so a one-word yaml mistake
+    costs a full startup and leaves the arm powered mid-session.
+
+    Three ways the pair can disagree, all cheap to see from the config alone:
+      * recording strategy, no dataset -> lerobot passes dataset=None and nothing is saved;
+      * recording strategy, name without the prefix -> the ValueError above;
+      * `base` with a dataset configured -> the dataset is silently ignored.
+    Resume skips the name check, exactly as lerobot does (it reuses an existing name).
+    """
+    from .config import cfg_get
+
+    strategy = str(cfg_get("rollout.strategy.type", doc=doc) or "base")
+    repo_id = str(cfg_get("rollout.dataset.repo_id", doc=doc) or "")
+    resume = str(cfg_get("rollout.resume", doc=doc) or "").strip().lower() in ("1", "true", "yes", "on")
+    records = strategy != "base"
+
+    if records and not repo_id:
+        return [PreflightIssue(
+            f"strategy '{strategy}' records episodes but the rollout block has no dataset: "
+            "lerobot will run with dataset=None and save nothing")]
+    if records and not resume and not repo_id.rsplit("/", 1)[-1].startswith("rollout_"):
+        return [PreflightIssue(
+            f"rollout dataset '{repo_id}' must be named rollout_<name>: lerobot rejects any "
+            "other name for a recording strategy, and only after the robot is connected")]
+    if not records and repo_id:
+        return [PreflightIssue(
+            f"strategy 'base' records nothing, so the configured dataset '{repo_id}' is ignored")]
+    return []
+
+
 def eval_issues(ctx: "Context", *, policy: str) -> list[PreflightIssue]:
     issues = robot_runtime_issues(ctx, check_leader=False)
     if not ctx.gpu_name:
         issues.append(PreflightIssue("no NVIDIA GPU detected; rollout may run slowly on CPU"))
     if policy and not Path(policy).expanduser().exists() and "/" not in policy:
         issues.append(PreflightIssue(f"policy looks like a model id, not a local checkpoint: {policy}"))
+    issues += rollout_dataset_issues(getattr(ctx, "doc", None))
     return issues
 
 
