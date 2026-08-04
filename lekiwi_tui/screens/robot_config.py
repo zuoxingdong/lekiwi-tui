@@ -43,7 +43,7 @@ from ..config import Config, cameras_summary, cfg_get, collapse_home, load_yaml,
 from ..framework import theme
 from ..framework.widgets import wrap_words
 from ..framework.events import ESC, Key
-from ..framework.screen import Invoke, Nothing, Pop, ScreenState
+from ..framework.screen import Invoke, Nothing, Pop, Push, ScreenState
 from .chrome import draw_slim_header, hint_slot_line, mode_chip_spans
 
 if TYPE_CHECKING:
@@ -146,7 +146,30 @@ class RobotConfigScreen(ScreenState):
             return Invoke(self._reload)
         if name == "f":
             return Invoke(self._detect_cameras)
+        if name == "p":
+            return self._preview_cameras()
         return Nothing
+
+    def _preview_cameras(self) -> Any:
+        """``p``: push the ~5 fps preview, so a lens can be identified by looking at it.
+
+        Same host guard as ``f`` and for the same reason: the capture needs the devices,
+        which the host session holds. The preview reads the configured `_cameras` block,
+        so it previews exactly what the yaml claims — which is what makes a wrong mapping
+        or a wrong rotation visible.
+        """
+        from ..hostprobe import host_alive
+        from .camera_preview import CameraPreviewScreen, configured_cameras
+
+        if host_alive(self.ctx) is True:
+            self.app.notify(
+                "host session is running and holds the cameras — stop it first, then p again",
+                "warn")
+            return Nothing
+        if not configured_cameras(self.ctx.doc):
+            self.app.notify("no cameras with an index_or_path in lekiwi.yaml", "warn")
+            return Nothing
+        return Push(CameraPreviewScreen(self.app, self.ctx))
 
     async def _detect_cameras(self) -> None:
         """``f``: list the ROBOT's cameras, over ssh.
@@ -212,7 +235,7 @@ class RobotConfigScreen(ScreenState):
             "read-only view — e edits lekiwi.yaml, r reloads after editing",
             rows[3].width,
             keys=(("e", f"edit in {resolve_editor()}"), ("r", "reload"),
-                  ("f", "detect cameras on the robot"), ("q", "back"))),
+                  ("f", "detect cameras"), ("p", "preview cameras"), ("q", "back"))),
             rows[3])
 
     # ── body rendering (sections → lines, ported from the original's Text builders) ──

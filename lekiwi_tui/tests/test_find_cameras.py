@@ -136,4 +136,4 @@ def test_it_probes_when_the_host_is_down_or_unknown(monkeypatch):
 def test_the_hint_line_advertises_the_key(monkeypatch):
     _, screen = _screen(monkeypatch, False)
     source = Path(ROOT / "lekiwi_tui" / "screens" / "robot_config.py").read_text()
-    assert '("f", "detect cameras on the robot")' in source
+    assert '("f", "detect cameras")' in source

@@ -1,0 +1,278 @@
+"""The ~5 fps camera preview: wire protocol, half-block geometry, the remote capture
+argv, and the screen's lifecycle.
+
+Everything here runs without a Pi and without an image decoder: `frames` is fed a byte
+stream, `half_blocks` is fed pixels, and the screen gets an injected `spawn`. The one
+un-fakeable piece (`decode_jpeg`) is deliberately tiny and reports None rather than raising.
+"""
+from __future__ import annotations
+
+import io
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from lekiwi_tui import ROOT
+from lekiwi_tui.camstream import CameraStream, frames, half_blocks
+from lekiwi_tui.framework.events import ESC, TAB, Key
+from lekiwi_tui.framework.screen import Nothing, Pop, Push
+from lekiwi_tui.screens.camera_preview import (
+    CameraPreviewScreen,
+    build_stream_argv,
+    configured_cameras,
+    rotation_degrees,
+)
+from lekiwi_tui.screens.robot_config import RobotConfigScreen
+
+from conftest import make_ctx
+
+FIND_SH = ROOT / "scripts" / "find_cameras.sh"
+
+
+def _wire(*payloads: bytes, junk: bytes = b"") -> io.BytesIO:
+    buf = bytearray(junk)
+    for p in payloads:
+        buf += b"FRAME %d\n" % len(p) + p
+    return io.BytesIO(bytes(buf))
+
+
+# ── wire protocol ─────────────────────────────────────────────────────────────
+
+
+def test_frames_yields_each_payload_exactly():
+    assert list(frames(_wire(b"abc", b"defgh"))) == [b"abc", b"defgh"]
+
+
+def test_frames_resynchronises_past_remote_noise():
+    """The remote shell can print a warning on the same fd; that must not desync us."""
+    noisy = _wire(b"xy", junk=b"Warning: setlocale failed\n")
+    assert list(frames(noisy)) == [b"xy"]
+
+
+def test_frames_stops_on_a_truncated_tail():
+    truncated = io.BytesIO(b"FRAME 10\nonly4")
+    assert list(frames(truncated)) == []
+
+
+def test_frames_refuses_an_absurd_length():
+    """A corrupted header must not make us allocate the machine away."""
+    assert list(frames(io.BytesIO(b"FRAME 999999999\n"), max_bytes=1024)) == []
+
+
+# ── half-block geometry ───────────────────────────────────────────────────────
+
+
+def test_two_pixel_rows_become_one_cell_row():
+    red, blue = (255, 0, 0), (0, 0, 255)
+    cells = half_blocks([[red, red], [blue, blue]])
+    assert len(cells) == 1
+    glyph, fg, bg = cells[0][0]
+    assert glyph == "▀" and fg == red and bg == blue, "upper pixel is fg, lower is bg"
+
+
+def test_an_odd_last_row_pairs_with_itself_rather_than_inventing_black():
+    grey = (128, 128, 128)
+    cells = half_blocks([[grey], [grey], [grey]])
+    assert len(cells) == 2
+    _, fg, bg = cells[1][0]
+    assert fg == bg == grey
+
+
+# ── the remote capture argv ───────────────────────────────────────────────────
+
+
+def test_the_stream_argv_carries_geometry_and_rotation():
+    argv = build_stream_argv(make_ctx(gpu_name=""),
+                            {"name": "wrist", "device": "/dev/video4", "rotation": 180})
+    assert argv[0] == "ssh" and "-t" not in argv, "a PTY would mangle the JPEG bytes"
+    payload = argv[-1]
+    assert 'cv2.VideoCapture("/dev/video4")' in payload
+    assert "cv2.rotate(frame, rot[180])" in payload
+    assert "(320, 240)" in payload and "period = 1.0 / 5" in payload
+    assert "IMWRITE_JPEG_QUALITY), 50" in payload
+
+
+@pytest.mark.parametrize(("flag", "value", "message"), [
+    ("--device", "$(whoami)", "must be a /dev path"),
+    ("--device", "/dev/../etc/shadow", "must not contain"),
+    ("--fps", "60", "30 or less"),
+    ("--rotation", "45", "must be 0, 90, 180 or 270"),
+    ("--quality", "200", "must be 1..100"),
+])
+def test_the_emitter_refuses_unsafe_stream_arguments(flag, value, message):
+    """The device is interpolated into remote python, so it is validated hard."""
+    args = ["bash", str(FIND_SH), "emit-stream", "--conda-env", "lekiwi",
+            "--device", "/dev/video0", flag, value]
+    out = subprocess.run(args, capture_output=True, text=True)
+    assert out.returncode == 2 and message in out.stderr
+
+
+def test_rotation_degrees_reads_both_yaml_and_numeric_forms():
+    assert rotation_degrees("ROTATE_180") == 180
+    assert rotation_degrees("NO_ROTATION") == 0
+    assert rotation_degrees(270) == 270
+    assert rotation_degrees("ROTATE_45") == 0     # unknown enum -> no rotation
+    assert rotation_degrees(None) == 0
+
+
+# ── the cameras it previews ───────────────────────────────────────────────────
+
+
+def _doc(**cams) -> dict:
+    return {"_cameras": cams}
+
+
+def test_configured_cameras_keeps_yaml_order_and_drops_deviceless_entries():
+    doc = _doc(front={"index_or_path": "/dev/video0"},
+               wrist={"index_or_path": "/dev/video4", "rotation": "ROTATE_180"},
+               broken={"width": 640})
+    cams = configured_cameras(doc)
+    assert [c["name"] for c in cams] == ["front", "wrist"]
+    assert cams[1]["rotation"] == 180
+
+
+# ── the stream object ─────────────────────────────────────────────────────────
+
+
+class _Proc:
+    def __init__(self, stream) -> None:
+        self.stdout = stream
+        self.killed = False
+
+    def terminate(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout=None) -> int:  # noqa: ANN001
+        return 0
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_the_stream_keeps_only_the_latest_frame():
+    proc = _Proc(_wire(b"one", b"two", b"three"))
+    stream = CameraStream(spawn=lambda: proc)
+    stream.start(now=0.0)
+    stream._thread.join(timeout=2)
+    assert stream.latest == b"three", "a preview that lags is worse than one that skips"
+    assert stream.frame_count == 3
+
+
+def test_leaving_kills_the_remote_capture():
+    """A preview that keeps a camera open after you walk away is a robot-side bug."""
+    proc = _Proc(_wire(b"x"))
+    stream = CameraStream(spawn=lambda: proc)
+    stream.start(now=0.0)
+    stream._thread.join(timeout=2)
+    stream.stop()
+    assert proc.killed
+
+
+def test_a_stream_that_never_yields_says_so():
+    stream = CameraStream(spawn=lambda: _Proc(io.BytesIO(b"")))
+    stream.start(now=0.0)
+    stream._thread.join(timeout=2)
+    assert "no frames" in stream.error and "host stopped" in stream.error
+
+
+# ── the screen ────────────────────────────────────────────────────────────────
+
+
+def _screen(monkeypatch, payloads=(b"jpeg-bytes",)) -> tuple[CameraPreviewScreen, list[_Proc]]:
+    ctx = make_ctx(gpu_name="")
+    ctx.doc = _doc(front={"index_or_path": "/dev/video0"},
+                   wrist={"index_or_path": "/dev/video4", "rotation": "ROTATE_180"})
+    spawned: list[_Proc] = []
+
+    def spawn():
+        proc = _Proc(_wire(*payloads))
+        spawned.append(proc)
+        return proc
+
+    screen = CameraPreviewScreen(None, ctx, spawn=spawn)
+    return screen, spawned
+
+
+def test_entering_starts_one_capture_and_tab_restarts_it_for_the_next_camera(monkeypatch):
+    screen, spawned = _screen(monkeypatch)
+    screen.on_enter()
+    assert len(spawned) == 1 and screen.index == 0
+
+    assert screen.handle_key(Key(name=TAB)) is Nothing
+    assert screen.index == 1 and len(spawned) == 2, "switching camera restarts the capture"
+    assert spawned[0].killed, "the previous camera is released"
+
+
+def test_leaving_the_screen_stops_the_capture(monkeypatch):
+    screen, spawned = _screen(monkeypatch)
+    screen.on_enter()
+    assert isinstance(screen.handle_key(Key(name=ESC)), Pop)
+    assert spawned[0].killed
+
+
+def test_undecodable_frames_are_reported_not_raised(monkeypatch):
+    """CI has no cv2/PIL, and neither does a bare install: it must degrade in words."""
+    screen, _ = _screen(monkeypatch)
+    screen.on_enter()
+    screen._stream._thread.join(timeout=2)
+    lines = screen._image_lines(cols=20, rows=10)
+    text = "".join(sp.content for ln in lines for sp in ln.spans)
+    assert "cannot be decoded" in text or "waiting for the first frame" in text
+
+
+# ── the way in ────────────────────────────────────────────────────────────────
+
+
+def test_p_pushes_the_preview_when_the_host_is_down(monkeypatch):
+    import lekiwi_tui.hostprobe as hostprobe
+
+    monkeypatch.setattr(hostprobe, "host_alive", lambda ctx: False)
+    ctx = make_ctx(gpu_name="")
+    screen = RobotConfigScreen(None, ctx)
+    screen.ctx.doc = _doc(front={"index_or_path": "/dev/video0"})
+    action = screen.handle_key(Key(name="p"))
+    assert isinstance(action, Push)
+    assert isinstance(action.screen, CameraPreviewScreen)
+
+
+def test_p_refuses_while_the_host_holds_the_cameras(monkeypatch):
+    import lekiwi_tui.hostprobe as hostprobe
+
+    monkeypatch.setattr(hostprobe, "host_alive", lambda ctx: True)
+
+    class _App:
+        def __init__(self) -> None:
+            self.toasts: list[tuple[str, str]] = []
+
+        def notify(self, msg, level="info", **kw):  # noqa: ANN001, ANN003
+            self.toasts.append((msg, level))
+
+    app = _App()
+    screen = RobotConfigScreen(app, make_ctx(gpu_name=""))
+    assert screen.handle_key(Key(name="p")) is Nothing
+    assert app.toasts and "stop it first" in app.toasts[0][0]
+
+
+def test_p_says_so_when_no_camera_has_a_device(monkeypatch):
+    import lekiwi_tui.hostprobe as hostprobe
+
+    monkeypatch.setattr(hostprobe, "host_alive", lambda ctx: False)
+
+    class _App:
+        def __init__(self) -> None:
+            self.toasts: list[tuple[str, str]] = []
+
+        def notify(self, msg, level="info", **kw):  # noqa: ANN001, ANN003
+            self.toasts.append((msg, level))
+
+    app = _App()
+    screen = RobotConfigScreen(app, make_ctx(gpu_name=""))
+    screen.ctx.doc = {"_cameras": {}}
+    assert screen.handle_key(Key(name="p")) is Nothing
+    assert "no cameras" in app.toasts[0][0]
+
+
+def test_the_hint_line_advertises_both_keys():
+    source = Path(ROOT / "lekiwi_tui" / "screens" / "robot_config.py").read_text()
+    assert '("f", "detect cameras")' in source and '("p", "preview cameras")' in source

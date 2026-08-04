@@ -1,0 +1,225 @@
+"""camera_preview.py — CameraPreviewScreen: see what a robot camera sees, ~5 fps.
+
+`f` in Robot config lists the Pi's camera nodes; a list cannot say WHICH LENS is which,
+which is the actual question after a replug renumbers them. This screen answers it by
+previewing one camera at a time as terminal half-blocks, and `tab` walks the configured
+cameras so front/wrist/top can be identified in a few seconds.
+
+Design notes
+------------
+* The frames come from a capture the Pi runs (see scripts/find_cameras.sh emit-stream),
+  NOT from the running host: the host's observation socket is PUSH, so subscribing would
+  steal every other frame from teleop/record. Consequently this needs the host stopped,
+  the same precondition `f` has, and the caller enforces it.
+* Nothing decodes or renders on the draw path unless a NEW frame arrived: the cell grid is
+  rebuilt only when the reader thread's frame counter moves, and cached otherwise. At 5 fps
+  against a ~30 fps redraw that is a 6x saving on thousands of spans.
+* Leaving the screen stops the remote capture (:meth:`on_exit`). A preview that keeps a
+  camera open after you walk away is a bug on the robot, not a cosmetic issue.
+"""
+from __future__ import annotations
+
+import subprocess
+import time
+from typing import TYPE_CHECKING, Any
+
+from pyratatui import Color, Constraint, Direction, Layout, Line, Paragraph, Span, Style, Text
+
+from .. import ROOT
+from ..camstream import CameraStream, decode_jpeg, half_blocks
+from ..framework import theme
+from ..framework.events import ESC, LEFT, RIGHT, TAB, Key
+from ..framework.screen import Nothing, Pop, ScreenState
+from .chrome import draw_slim_header, hint_slot_line
+
+if TYPE_CHECKING:
+    from ..context import Context
+    from ..framework.app import App
+
+#: The launcher that owns the remote capture bash (the SOLE argv source, as everywhere).
+FIND_CAMERAS_SCRIPT = ROOT / "scripts" / "find_cameras.sh"
+
+#: Preview geometry. Small on purpose: 320x240 at q50 is ~12 KB, so 5 fps is ~60 KB/s,
+#: which keeps the Pi's USB+WiFi load nowhere near the level that used to freeze it.
+FPS = 5
+WIDTH = 320
+HEIGHT = 240
+QUALITY = 50
+
+#: Cell budget for the image. Beyond this the span count starts to cost more than the
+#: extra detail is worth, and a camera is identifiable long before that.
+MAX_COLS = 96
+MAX_ROWS = 40
+
+_ROT_DEGREES = {"NO_ROTATION": 0, "ROTATE_90": 90, "ROTATE_180": 180, "ROTATE_270": 270}
+
+
+def rotation_degrees(value: Any) -> int:
+    """A yaml rotation (``ROTATE_180``) or a number -> degrees the Pi should apply."""
+    text = str(value or "NO_ROTATION").strip().upper()
+    if text in _ROT_DEGREES:
+        return _ROT_DEGREES[text]
+    try:
+        deg = int(text)
+    except ValueError:
+        return 0
+    return deg if deg in (0, 90, 180, 270) else 0
+
+
+def configured_cameras(doc: Any) -> list[dict[str, Any]]:
+    """The ``_cameras`` block as ``[{name, device, rotation}]``, in yaml order."""
+    from ..config import cfg_get
+
+    cams = cfg_get("_cameras", doc=doc) or {}
+    if not isinstance(cams, dict):
+        return []
+    out = []
+    for name, spec in cams.items():
+        spec = spec if isinstance(spec, dict) else {}
+        out.append({
+            "name": str(name),
+            "device": str(spec.get("index_or_path", "")),
+            "rotation": rotation_degrees(spec.get("rotation")),
+        })
+    return [c for c in out if c["device"]]
+
+
+def build_stream_argv(ctx: "Context", camera: dict[str, Any]) -> list[str]:
+    """`ssh <host> "<emit-stream remote bash>"` for one camera.
+
+    No ``-t``: a PTY would translate the raw JPEG bytes this reads off stdout.
+    """
+    from ..remote import validate_remote_name, validate_ssh_host
+
+    host = validate_ssh_host(ctx.cfg["LEKIWI_HOST"])
+    conda_env = validate_remote_name(ctx.cfg["CONDA_ENV"], "conda env")
+    remote = subprocess.check_output(
+        ["bash", str(FIND_CAMERAS_SCRIPT), "emit-stream",
+         "--conda-env", conda_env, "--device", str(camera["device"]),
+         "--fps", str(FPS), "--width", str(WIDTH), "--height", str(HEIGHT),
+         "--quality", str(QUALITY), "--rotation", str(camera["rotation"])],
+        text=True,
+    )
+    return ["ssh", "-o", "ConnectTimeout=5", host, remote]
+
+
+class CameraPreviewScreen(ScreenState):
+    """One camera at a time, ~5 fps, as half-block cells. ``tab``/←→ switch camera."""
+
+    title = "camera preview"
+
+    def __init__(self, app: "App", ctx: "Context", *, index: int = 0,
+                 spawn: Any = None) -> None:
+        self.app = app
+        self.ctx = ctx
+        self.cameras = configured_cameras(getattr(ctx, "doc", None))
+        self.index = index if 0 <= index < len(self.cameras) else 0
+        self._spawn = spawn                 # injected in tests; None = real ssh
+        self._stream: CameraStream | None = None
+        self._cells: list[list[tuple[str, tuple[int, int, int], tuple[int, int, int]]]] = []
+        self._cells_from = -1               # frame_count the cached cells were built from
+        self._decode_failed = False
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+    def on_enter(self) -> None:
+        self._restart()
+
+    def on_exit(self) -> None:
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream = None
+
+    def _restart(self) -> None:
+        self.on_exit()
+        self._cells, self._cells_from, self._decode_failed = [], -1, False
+        if not self.cameras:
+            return
+        camera = self.cameras[self.index]
+        spawn = self._spawn or (lambda: subprocess.Popen(
+            build_stream_argv(self.ctx, camera),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
+        self._stream = CameraStream(spawn=spawn)
+        self._stream.start(now=time.monotonic())
+
+    # ── keys ──────────────────────────────────────────────────────────────────
+    def handle_key(self, key: "Key") -> Any:
+        name = key.name
+        if name in ("q", ESC):
+            self.on_exit()
+            return Pop()
+        if name in (TAB, RIGHT, "l") and self.cameras:
+            self.index = (self.index + 1) % len(self.cameras)
+            self._restart()
+            return Nothing
+        if name in (LEFT, "h") and self.cameras:
+            self.index = (self.index - 1) % len(self.cameras)
+            self._restart()
+            return Nothing
+        if name == "r":
+            self._restart()
+            return Nothing
+        return Nothing
+
+    # ── rendering ─────────────────────────────────────────────────────────────
+    def _refresh_cells(self, cols: int, rows: int) -> None:
+        """Rebuild the cell grid, but only when a new frame has arrived."""
+        stream = self._stream
+        if stream is None or stream.latest is None or stream.frame_count == self._cells_from:
+            return
+        pixels = decode_jpeg(stream.latest)
+        self._cells_from = stream.frame_count
+        if pixels is None:
+            self._decode_failed = True
+            return
+        self._decode_failed = False
+        # Nearest-neighbour downsample to the cell grid: two pixel rows per cell row.
+        target_h, target_w = max(1, rows * 2), max(1, cols)
+        src_h, src_w = len(pixels), len(pixels[0]) if pixels else 0
+        if not src_h or not src_w:
+            return
+        picked = [[pixels[min(src_h - 1, y * src_h // target_h)][min(src_w - 1, x * src_w // target_w)]
+                   for x in range(target_w)] for y in range(target_h)]
+        self._cells = half_blocks(picked)
+
+    def _image_lines(self, cols: int, rows: int) -> list[Line]:
+        self._refresh_cells(cols, rows)
+        if self._stream is not None and self._stream.error:
+            return [Line([Span(f"✗ {self._stream.error}", theme.ERR_STYLE)])]
+        if self._decode_failed:
+            return [Line([Span("frames arrive but cannot be decoded here — install opencv "
+                               "or pillow in this env", theme.WARN_STYLE)])]
+        if not self._cells:
+            return [Line([Span("waiting for the first frame…", theme.FAINT_STYLE)])]
+        return [Line([Span(glyph, Style().fg(Color.rgb(*fg)).bg(Color.rgb(*bg)))
+                      for glyph, fg, bg in row])
+                for row in self._cells]
+
+    def draw(self, frame: Any, area: Any) -> None:
+        bands = (Layout().direction(Direction.Vertical)
+                 .constraints([Constraint.length(1), Constraint.length(1),
+                               Constraint.fill(1), Constraint.length(1)])
+                 .split(area))
+        camera = self.cameras[self.index] if self.cameras else {"name": "none", "device": "-",
+                                                                "rotation": 0}
+        rot = f" · rot {camera['rotation']}°" if camera["rotation"] else ""
+        draw_slim_header(frame, bands[0], self.ctx, "camera preview",
+                         right=[Span(f"{camera['name']} · {camera['device']}{rot}",
+                                     theme.TEXT_STYLE)])
+        frame.render_widget(
+            Paragraph.from_string(theme.rule(bands[1].width)).style(theme.RULE_HEAVY_STYLE),
+            bands[1])
+
+        cols = max(1, min(MAX_COLS, bands[2].width))
+        rows = max(1, min(MAX_ROWS, bands[2].height))
+        frame.render_widget(Paragraph(Text(self._image_lines(cols, rows))), bands[2])
+
+        fps = self._stream.fps(now=time.monotonic()) if self._stream else 0.0
+        which = f"{self.index + 1}/{len(self.cameras)}" if self.cameras else "0/0"
+        frame.render_widget(hint_slot_line(
+            f"{which} · {fps:.1f} fps · {WIDTH}x{HEIGHT} on the Pi · host must be stopped",
+            bands[3].width,
+            keys=(("tab", "next camera"), ("r", "restart"), ("q", "back"))),
+            bands[3])
+
+
+__all__ = ["CameraPreviewScreen", "build_stream_argv", "configured_cameras", "rotation_degrees"]
