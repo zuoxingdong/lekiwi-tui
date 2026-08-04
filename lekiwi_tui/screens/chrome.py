@@ -1,8 +1,11 @@
-"""Shared screen chrome for the LeKiwi TUI.
+"""Shared screen chrome for the LeKiwi TUI — the one design system every screen uses.
 
-The menu established the current visual language: compact status chips, keycap-style
-footer hints, and selected rows with a visible accent gutter plus a subtle row tint.
-Screens use these helpers so subpages do not drift back into one-off text styling.
+The vocabulary (screens must not re-invent styling, contract R6): a slim one-line
+header with LIVE status right-aligned (`draw_slim_header` / `slim_status_spans` /
+`mode_chip_spans`), quiet section groups (`section_line`), pill/segment controls
+(`seg`), right-aligned composition (`padded_line`), keycap footers with a single
+focused-field hint slot (`hint_slot_line` / `keycap_hint_line`), value clipping
+(`clip_end` / `clip_middle`), and the classic field row (`option_line`).
 """
 from __future__ import annotations
 
@@ -12,12 +15,6 @@ from typing import Any, Literal
 from pyratatui import Line, Paragraph, Span, Style, Text
 
 from ..framework import runner, theme
-
-
-# Shared option_line label widths, so field/action columns align ACROSS screens
-# instead of each screen picking its own number (they had drifted: 9/20/42).
-LABEL_W_FIELD = 9    # short knob rows: python / recreate / install / lerobot / plugin …
-LABEL_W_ACTION = 20  # action rows: "▶ Sync now" / "▶ Run setup" style
 
 
 def ellipsis() -> str:
@@ -52,75 +49,38 @@ def clip_middle(text: str, width: int) -> str:
     return f"{text[:head]}{mark}{text[-tail:]}"
 
 
-def chip_spans(pairs: Sequence[tuple[str, str, Style | None]]) -> list[Span]:
-    spans: list[Span] = []
-    for label, value, value_style in pairs:
-        spans.append(Span(f" {label} ", theme.CHIP_STYLE))
-        spans.append(Span(f"{value} ", value_style or theme.CHIP_TEXT_STYLE))
-        spans.append(Span(" ", theme.BASE_STYLE))
-    return spans
+def mode_chip_spans() -> list[Span]:
+    """The execution-mode chip. REAL wears the amber ARMED fill (live hardware = the
+    hot state; green stays reserved for live/ready dots); PREVIEW is a quiet chip."""
+    if runner.DRY_RUN:
+        return [Span(" PREVIEW ", theme.CHIP_MUTED_STYLE), Span(" ", theme.BASE_STYLE)]
+    return [Span(" REAL ", theme.CHIP_ARMED_STYLE), Span(" ", theme.BASE_STYLE)]
 
 
-def chip_line(pairs: Sequence[tuple[str, str, Style | None]]) -> Paragraph:
-    return Paragraph(Text([Line(chip_spans(pairs))])).style(theme.BASE_STYLE)
-
-
-def _cfg(ctx: Any, key: str, default: str = "") -> str:
-    try:
-        return str(ctx.cfg[key])
-    except Exception:
-        return default
-
-
-def robot_chip_spans(ctx: Any) -> list[Span]:
-    """The `robot` chip: type + LIVE host state. `●` (green) when the Pi host answers
-    on its ZMQ command port, `○` (muted) when it does not, nothing until the first
-    probe lands. While a launched session is running, the remaining time trails the
-    dot (`● 23:41`). The probe is throttled + threaded (hostprobe.py) — calling this
-    every frame is free."""
+def slim_status_spans(ctx: Any) -> list[Span]:
+    """The one-line live status for slim headers: host ● + session countdown, then the
+    mode chip. Machine constants (env, robot type, GPU model) deliberately stay off —
+    they never change mid-session; Settings owns them."""
     from ..hostprobe import get_probe, session_remaining
 
-    robot = _cfg(ctx, "ROBOT_TYPE")
-    if not robot:
-        return []
-    spans = [Span(" robot ", theme.CHIP_STYLE), Span(f"{robot} ", theme.CHIP_VALUE_STYLE)]
+    spans: list[Span] = []
     probe = get_probe(ctx)
     if probe is not None:
         probe.poll()
         if probe.alive is True:
-            spans.append(Span(f"{theme.status_dot()} ", theme.CHIP_OK_STYLE))
+            spans.append(Span(f"{theme.status_dot()} ", theme.OK_STYLE))
+            spans.append(Span("host ", theme.MUTED_STYLE))
             left = session_remaining(ctx)
             if left is not None:
-                spans.append(Span(f"{left // 60}:{left % 60:02d} ", theme.CHIP_TEXT_STYLE))
+                spans.append(Span(f"{left // 60}:{left % 60:02d}", theme.TEXT_STYLE))
+            else:
+                spans.append(Span("live", theme.TEXT_STYLE))
         elif probe.alive is False:
-            spans.append(Span("○ " if not theme.ASCII_MODE else "o ", theme.CHIP_MUTED_STYLE))
-    spans.append(Span(" ", theme.BASE_STYLE))
+            spans.append(Span("○ " if not theme.ASCII_MODE else "o ", theme.MUTED_STYLE))
+            spans.append(Span("host down", theme.MUTED_STYLE))
+    spans.append(Span("   ", theme.BASE_STYLE))
+    spans.extend(mode_chip_spans())
     return spans
-
-
-def runtime_chips(ctx: Any) -> Paragraph:
-    spans: list[Span] = []
-    host = _cfg(ctx, "LEKIWI_HOST")
-    env = _cfg(ctx, "LAPTOP_ENV")
-    if host:
-        spans.extend(chip_spans([("host", host, theme.CHIP_VALUE_STYLE)]))
-    if env:
-        spans.extend(chip_spans([("env", env, theme.CHIP_VALUE_STYLE)]))
-    # which follower the launchers drive + whether it is LIVE right now
-    spans.extend(robot_chip_spans(ctx))
-
-    spans.append(Span(" GPU ", theme.CHIP_STYLE))
-    if getattr(ctx, "gpu_name", ""):
-        spans.append(Span(f"{theme.status_dot()} ", theme.CHIP_OK_STYLE))
-        spans.append(Span(f"{ctx.gpu_name} ", theme.CHIP_TEXT_STYLE))
-    else:
-        spans.append(Span("none ", theme.CHIP_MUTED_STYLE))
-    spans.append(Span(" ", theme.BASE_STYLE))
-
-    mode = "PREVIEW" if runner.DRY_RUN else "REAL"
-    mode_style = theme.CHIP_WARN_STYLE if runner.DRY_RUN else theme.CHIP_OK_STYLE
-    spans.extend(chip_spans([("mode", mode, mode_style)]))
-    return Paragraph(Text([Line(spans)])).style(theme.BASE_STYLE)
 
 
 def keycap_hint_line(pairs: Sequence[tuple[str, str]]) -> Paragraph:
@@ -129,6 +89,206 @@ def keycap_hint_line(pairs: Sequence[tuple[str, str]]) -> Paragraph:
         spans.append(Span(f" {theme.key_label(key)} ", theme.KEYCAP_STYLE))
         spans.append(Span(f" {label}  ", theme.HINT_STYLE))
     return Paragraph(Text([Line(spans)])).style(theme.BASE_STYLE)
+
+
+# ── the record-page design system, shared (R6: screens must not re-invent) ────
+def padded_line(left: list[Span], right: list[Span], width: int,
+                pad_style: Style | None = None) -> Line:
+    """Compose a Line with *right* right-aligned at *width* (drop right on overflow)."""
+    used = sum(len(s.content) for s in left) + sum(len(s.content) for s in right)
+    pad = int(width) - used
+    if pad < 1:
+        return Line(left)
+    return Line(left + [Span(" " * pad, pad_style or theme.BASE_STYLE)] + right)
+
+
+def section_line(name: str) -> Line:
+    """A quiet group header (DATASET / SESSION / …) — spacing does the separating."""
+    return Line([Span(f"  {name}", theme.FAINT_STYLE)])
+
+
+def seg(label: str, active: bool) -> Span:
+    """One pill / segmented-control cell: accent fill when active, quiet panel when
+    not. Toggles are two calls (seg('on', v), seg('off', not v) is WRONG — a toggle
+    renders ONE pill: seg('on' if v else 'off', v))."""
+    return Span(f" {label} ", theme.PILL_ON_STYLE if active else theme.PILL_OFF_STYLE)
+
+
+#: Width of a stepper's value well, so every stepper in a column lines up.
+STEPPER_W = 6
+
+
+def stepper(text: str, *, focused: bool, width: int = STEPPER_W) -> list[Span]:
+    """The adjustable-number affordance: ``‹   30 ›``.
+
+    Purely a display cell — the number was ALWAYS adjustable (←→ steps it, typing digits
+    live-commits), the row just never said so. The guillemets are the whole point: they
+    tell you the value takes input before you focus it.
+    """
+    style = theme.HIGHLIGHT_TEXT_STYLE if focused else theme.CHOICE_STYLE
+    bracket = theme.HIGHLIGHT_MUTED_STYLE if focused else theme.MUTED_STYLE
+    return [Span("‹ ", bracket), Span(f"{text:>{width}}", style), Span(" ›", bracket)]
+
+
+def toggle(on: bool, *, focused: bool, labels: tuple[str, str] = ("on", "off")) -> list[Span]:
+    """A two-pill toggle: both states visible, the live one filled.
+
+    Deliberately NOT the single pill :func:`seg` renders. A lone ``off`` pill leaves you
+    guessing what the other state is called; showing both makes ←→ obvious."""
+    del focused  # the row's own highlight already marks focus; a third emphasis is noise
+    return [seg(labels[0], on), Span(" ", theme.BASE_STYLE), seg(labels[1], not on)]
+
+
+def setting_line(label: str, control: list[Span], note: str = "", *,
+                 focused: bool = False, label_width: int = 14,
+                 width: int | None = None) -> Line:
+    """ONE setting on ONE row: ``▌ Label   <control>   why it matters``.
+
+    The row archetype for every form screen. Packing two or three settings onto a line
+    saved vertical space the screens did not need and made the form hard to operate: no
+    affordance, and no anchor for which value ←→ was about to change.
+
+    *note* is always-visible explanation, which is also what keeps a zero-sentinel legible
+    while the field is focused — the old behaviour swapped the label out for a raw ``0``
+    at exactly the moment you were deciding what to type.
+    """
+    spans = [
+        Span(theme.selector(focused),
+             theme.HIGHLIGHT_LABEL_STYLE if focused else theme.BASE_STYLE),
+        Span(f"{label:<{label_width}}",
+             theme.HIGHLIGHT_LABEL_STYLE if focused else theme.MUTED_STYLE),
+        *control,
+    ]
+    if note:
+        used = sum(len(s.content) for s in spans)
+        room = (int(width) - used - 3) if width is not None else len(note)
+        if room >= 8:
+            spans.append(Span("   ", theme.HIGHLIGHT_STYLE if focused else theme.BASE_STYLE))
+            spans.append(Span(clip_end(note, room),
+                              theme.HIGHLIGHT_MUTED_STYLE if focused else theme.FAINT_STYLE))
+    return Line(spans, theme.HIGHLIGHT_STYLE if focused else None)
+
+
+def number_line(field: Any, label: str, focused: bool, note: str = "", *,
+                width: int | None = None, label_width: int = 14) -> Line:
+    """A :class:`NumberField` as a setting row: ``▌ FPS   ‹   30 ›   what it means``.
+
+    The stepper always shows the NUMBER, never the zero-label, and the meaning lives in the
+    note where it stays visible. That is the fix for the old behaviour: ``FieldRow.num``
+    swapped in the raw editor value on focus, so "until Ctrl+C" vanished at exactly the
+    moment you moved onto the field to change it.
+
+    While focused the well shows the live editor buffer plus a caret, because typing
+    live-commits digit by digit and you need to see what you have typed so far.
+    """
+    if focused:
+        text = f"{field.editor.value}█"
+    else:
+        text = f"{field.value}{field.unit}" if getattr(field, "unit", "") else str(field.value)
+    zero_label = getattr(field, "zero_label", None)
+    if field.value == 0 and zero_label:
+        note = zero_label if zero_label.lstrip().startswith("0") else f"0 = {zero_label}"
+    return setting_line(label, stepper(text, focused=focused), note,
+                        focused=focused, label_width=label_width, width=width)
+
+
+def draw_slim_header(frame: Any, area: Any, ctx: Any, title: str,
+                     right: list[Span] | None = None) -> None:
+    """The one-line screen header: `◆ LEKIWI · <title>` left, LIVE status right
+    (host ● + countdown + mode chip by default). Replaces the old chips row +
+    per-screen info blocks; machine constants live in Settings."""
+    left = [Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE),
+            Span(f" · {title}", theme.SUBTITLE_STYLE)]
+    frame.render_widget(Paragraph(Text([
+        padded_line(left, right if right is not None else slim_status_spans(ctx),
+                    area.width)])).style(theme.BASE_STYLE), area)
+
+
+def hint_slot_line(hint: str, width: int,
+                   keys: Sequence[tuple[str, str]] = (("↑↓/jk", "move"), ("←→", "adjust"),
+                                                      ("⏎", "edit·start"), ("q", "back")),
+                   ) -> Paragraph:
+    """The single footer hint slot: the FOCUSED element's documentation on the left,
+    global keycaps on the right. The ONLY place interaction hints render."""
+    left = [Span("  ", theme.BASE_STYLE), Span(theme.key_label(hint), theme.FAINT_STYLE)]
+    right: list[Span] = []
+    for k, lab in keys:
+        right.append(Span(f" {theme.key_label(k)} ", theme.KEYCAP_STYLE))
+        right.append(Span(f" {lab}  ", theme.HINT_STYLE))
+    return Paragraph(Text([padded_line(left, right, int(width))])).style(theme.BASE_STYLE)
+
+
+def plan_row(label: str, plan_spans: "list[Span] | str", *, focused: bool,
+             accent: Literal["default", "ok", "danger"] = "default",
+             label_pad: int = 8) -> Line:
+    """The action row every screen ends with: `▶ <label>   <plan sentence>`.
+
+    *plan_spans* is the plan text (or pre-built spans, e.g. a warning-as-plan Span).
+    *accent* picks the label color family: "ok" = green safe-commit (Save), "danger" =
+    red destructive (Stop host, delete) — the only red/green Start-style rows allowed.
+    """
+    if focused:
+        lstyle = (theme.HIGHLIGHT_DANGER_STYLE if accent == "danger"
+                  else theme.HIGHLIGHT_LABEL_STYLE)
+    else:
+        lstyle = {"ok": theme.OK_STYLE, "danger": theme.ERR_STYLE}.get(accent, theme.TEXT_STYLE)
+    if isinstance(plan_spans, str):
+        plan_spans = [Span(plan_spans,
+                           theme.HIGHLIGHT_MUTED_STYLE if focused else theme.MUTED_STYLE)]
+    return Line([
+        Span(theme.selector(focused),
+             lstyle if focused else theme.BASE_STYLE),
+        Span(f"{theme.play_mark()} {label}", lstyle),
+        Span(" " * max(1, label_pad), theme.HIGHLIGHT_STYLE if focused else theme.BASE_STYLE),
+        *plan_spans,
+    ], theme.HIGHLIGHT_STYLE if focused else None)
+
+
+def draw_form_page(frame: Any, area: Any, ctx: Any, title: str, body_lines: "list[Line]",
+                   *, header_right: "list[Span] | None" = None, msg: str = "",
+                   msg_style: Any = None, hint: str = "",
+                   keys: Sequence[tuple[str, str]] = (("↑↓/jk", "move"), ("←→", "adjust"),
+                                                      ("⏎", "edit·start"), ("q", "back")),
+                   ) -> None:
+    """The standard form-page skeleton every screen shares: slim header · heavy rule ·
+    body (fill) · optional message row · the footer hint slot. Screens supply only
+    their body_lines + focused-field hint."""
+    from pyratatui import Constraint, Direction, Layout
+
+    frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
+    rows = (Layout().direction(Direction.Vertical).constraints(
+        [Constraint.length(1), Constraint.length(1), Constraint.fill(1),
+         Constraint.length(1), Constraint.length(1)]).split(area))
+    draw_slim_header(frame, rows[0], ctx, title, header_right)
+    frame.render_widget(
+        Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
+    frame.render_widget(Paragraph(Text(body_lines)).style(theme.BASE_STYLE), rows[2])
+    if msg:
+        frame.render_widget(Paragraph(Text([Line([Span(f"  {msg}", msg_style or theme.ERR_STYLE)])])
+                                      ).style(theme.BASE_STYLE), rows[3])
+    frame.render_widget(hint_slot_line(hint, rows[4].width, keys=keys), rows[4])
+
+
+class FieldRow:
+    """The label/gutter/value cell builders every form repeats, bound to one label
+    width. `rows.lab("Steps", focused)` / `rows.gutter(on)` / `rows.num(field, focused)`."""
+
+    def __init__(self, label_width: int = 14) -> None:
+        self.label_width = label_width
+
+    def lab(self, text: str, focused: bool) -> Span:
+        return Span(f"{text:<{self.label_width}}",
+                    theme.TITLE_STYLE if focused else theme.MUTED_STYLE)
+
+    def gutter(self, on: bool) -> Span:
+        return Span(theme.selector(on), theme.TITLE_STYLE if on else theme.BASE_STYLE)
+
+    def num(self, field: Any, focused: bool, pad: int = 0) -> Span:
+        """A NumberField cell: live editor + caret when focused, display() otherwise."""
+        if focused:
+            return Span(f"{field.editor.value}█", theme.HIGHLIGHT_TEXT_STYLE)
+        text = field.display()
+        return Span(f"{text:<{pad}}" if pad else text, theme.TEXT_STYLE)
 
 
 def option_line(

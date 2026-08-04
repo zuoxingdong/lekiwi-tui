@@ -174,10 +174,16 @@ class RunScreen(ScreenState):
         *,
         title: str,
         dry_run: bool = False,
+        telemetry: "Callable[[int], list[Any]] | None" = None,
     ) -> None:
         self.title = title
         self._lines = lines
         self._dry_run = dry_run
+        #: Optional live-telemetry hook: called each frame with the content width,
+        #: returns pyratatui Lines rendered between the title bar and the log (the
+        #: train screen's step meter + loss sparkline). Exceptions are swallowed —
+        #: a bad parser must not take down the stream view.
+        self._telemetry = telemetry
         #: Set True once Stop is requested; stream_run polls this to begin escalation.
         self.stop_requested = False
         #: Flipped by stream_run to update the title bar ("stopping…" / "[exit N]").
@@ -204,10 +210,17 @@ class RunScreen(ScreenState):
         # owns its whole area and fills its own background).
         frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
 
+        # Telemetry lines (if the hook yields any) sit between the title and the log.
+        tele_lines: list[Any] = []
+        if self._telemetry is not None:
+            try:
+                tele_lines = list(self._telemetry(int(area.width)))
+            except Exception:  # noqa: BLE001 - telemetry must never kill the view
+                tele_lines = []
         rows = Layout().direction(Direction.Vertical).constraints(
-            [Constraint.length(1), Constraint.fill(1)]
+            [Constraint.length(1), Constraint.length(len(tele_lines)), Constraint.fill(1)]
         ).split(area)
-        title_area, log_area = rows[0], rows[1]
+        title_area, tele_area, log_area = rows[0], rows[1], rows[2]
 
         # Title bar: accent-on-bg, bold; a PREVIEW tag + any live status appended.
         title_spans = [Span(f" {self.title} ", theme.TITLE_STYLE)]
@@ -219,18 +232,31 @@ class RunScreen(ScreenState):
             Paragraph(Text([Line(title_spans)])).style(theme.BASE_STYLE),
             title_area,
         )
+        if tele_lines:
+            frame.render_widget(
+                Paragraph(Text(tele_lines)).style(theme.BASE_STYLE), tele_area)
 
         # Body: the scrollback, bottom-pinned. We render the whole buffer and scroll so
         # the last `inner_h` lines show — Paragraph has no native tail/auto-scroll.
+        # Log body wears muted (telemetry/title stay the primary layer); WARN/ERROR
+        # lines keep their status color — same treatment as StreamController.draw_log.
         block = theme.block(bordered=True)
         inner = log_area.inner(1, 1)
         inner_h = max(1, inner.height)
         body_lines = list(self._lines)
         if not body_lines:
             body_lines = ["(waiting for output…)"]
+
+        def _style_for(ln: str) -> Any:
+            if "ERROR" in ln or "Traceback" in ln:
+                return theme.ERR_STYLE
+            if "WARN" in ln:
+                return theme.WARN_STYLE
+            return theme.MUTED_STYLE
+
         # Scroll offset = lines above the visible window (0 if everything fits).
         scroll_y = max(0, len(body_lines) - inner_h)
-        text = Text([Line([Span(ln, theme.TEXT_STYLE)]) for ln in body_lines])
+        text = Text([Line([Span(ln, _style_for(ln))]) for ln in body_lines])
         para = (
             Paragraph(text)
             .block(block)
@@ -268,6 +294,7 @@ async def stream_run(
     title: str,
     env: "Mapping[str, str] | None" = None,
     on_line: "Callable[[str], None] | None" = None,
+    telemetry: "Callable[[int], list[Any]] | None" = None,
 ) -> int:
     """Stream *argv* into an on-screen log and return its exit code (contract R7).
 
@@ -298,7 +325,8 @@ async def stream_run(
 
     real_argv = safe_argv(argv)
     lines: "deque[str]" = deque(maxlen=SCROLLBACK_MAXLEN)
-    screen = RunScreen(lines, title=title, dry_run=(real_argv != list(argv)))
+    screen = RunScreen(lines, title=title, dry_run=(real_argv != list(argv)),
+                       telemetry=telemetry)
     screen.on_enter()
 
     # Spawn. A launch failure is surfaced in the log + a 127 exit, like the original.

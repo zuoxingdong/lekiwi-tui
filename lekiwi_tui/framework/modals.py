@@ -40,6 +40,7 @@ Two asymmetries from the original are preserved EXACTLY (both have dedicated sel
 """
 from __future__ import annotations
 
+import textwrap
 from typing import TYPE_CHECKING, Any
 
 from pyratatui import (
@@ -95,6 +96,28 @@ if TYPE_CHECKING:
 # centered with Layout percentages + length splits. Both modals share this geometry so
 # they read as the same family of cards.
 _CARD_WIDTH = 72
+
+#: Ceiling on wrapped prompt-label rows. A label longer than this is a design smell, not
+#: something to render: the card would outgrow a short terminal. Generous on purpose.
+_MAX_LABEL_ROWS = 8
+
+
+def wrap_label(text: str, width: int, max_rows: int = _MAX_LABEL_ROWS) -> list[str]:
+    """Word-wrap a modal prompt to ``width`` columns, at most ``max_rows`` rows.
+
+    A prompt used to be rendered on ONE fixed row, so anything past the card width was
+    silently clipped. That is how the delete confirmation managed to hide its own
+    "Type 'delete' to confirm" tail and left the user staring at an unexplained field.
+    Never shorten a label without saying so: an over-long one ends in "…" rather than
+    just stopping. Returns at least one (possibly empty) row so the caller's height
+    arithmetic never sees zero.
+    """
+    rows = textwrap.wrap(text, width=max(1, width)) or [""]
+    if len(rows) > max_rows:
+        rows = rows[:max_rows]
+        rows[-1] = rows[-1][: max(0, width - 1)].rstrip() + "…"
+    return rows
+
 
 # Selected-row marker (the original used a left ``▌`` accent bar via the highlight style;
 # the menu port uses "▌ " — we mirror that affordance so a highlighted choice reads the
@@ -232,7 +255,11 @@ class ConfirmModalState(ScreenState):
         _fill_background(frame, area)
         # Height: 1 title + (blank) 1 + N choices + (blank) 1 + 1 hint, + 2 for borders,
         # + top/bottom padding 1 each → matches the original's padded card feel.
-        body_lines = 1 + 1 + len(self.choices) + 1 + 1
+        # The question wraps for the same reason the prompt label does: a clipped question
+        # can hide the very thing that distinguishes the choices.
+        q_rows = wrap_label(self.question, max(1, _CARD_WIDTH - 2 - 2 * 2))
+        q_h = len(q_rows)
+        body_lines = q_h + 1 + len(self.choices) + 1 + 1
         card_h = body_lines + 2 + 2  # borders + vertical padding
         card = _centered_rect(area, _CARD_WIDTH, card_h)
 
@@ -248,7 +275,7 @@ class ConfirmModalState(ScreenState):
             .direction(Direction.Vertical)
             .constraints(
                 [
-                    Constraint.length(1),                    # title
+                    Constraint.length(q_h),                  # title (wrapped)
                     Constraint.length(1),                    # gap
                     Constraint.length(len(self.choices)),    # the choice list
                     Constraint.fill(1),                      # gap (absorbs slack)
@@ -260,7 +287,7 @@ class ConfirmModalState(ScreenState):
 
         # Title (bold accent, like the menu section headers).
         frame.render_widget(
-            Paragraph(Text([Line([Span(self.question, SECTION_STYLE)])])),
+            Paragraph(Text([Line([Span(r, SECTION_STYLE)]) for r in q_rows])),
             rows[0],
         )
 
@@ -310,6 +337,14 @@ _HELP_NOTES: dict[str, list[tuple[str, str]]] = {
     "record": [
         ("Start", "starts recording in the terminal"),
         ("then", "wasd + zx drive the base; left/right/esc control episodes"),
+    ],
+    "dataset": [
+        ("Space", "mark / unmark the highlighted episode"),
+        ("D", "delete marked episodes in place (typed confirm, auto-backup)"),
+        ("T", "retag marked episodes — rewrite the task text (auto-backup)"),
+        ("V / Enter", "open the highlighted episode in Rerun"),
+        ("d", "switch to another dataset (picker)"),
+        ("r", "reload the table from disk"),
     ],
     "host": [
         ("s / Ctrl+C", "stop a running host stream"),
@@ -671,8 +706,13 @@ class PromptModalState(ScreenState):
             ml_lines = None
             editor_h = 1
 
-        body_lines = 1 + 1 + editor_h + 1 + 1  # label / gap / editor / gap / hint
-        card_h = body_lines + 2 + 2            # borders + v-padding
+        # The label wraps instead of clipping: a prompt that carries an instruction in its
+        # tail (the delete confirmation) must never lose it to the card edge.
+        label_rows = wrap_label(self.prompt, inner_w)
+        label_h = len(label_rows)
+
+        body_lines = label_h + 1 + editor_h + 1 + 1  # label / gap / editor / gap / hint
+        card_h = body_lines + 2 + 2                  # borders + v-padding
         card = _centered_rect(area, _CARD_WIDTH, card_h)
 
         frame.render_widget(Clear(), card)
@@ -685,7 +725,7 @@ class PromptModalState(ScreenState):
             .direction(Direction.Vertical)
             .constraints(
                 [
-                    Constraint.length(1),         # label
+                    Constraint.length(label_h),   # label (wrapped)
                     Constraint.length(1),         # gap
                     Constraint.length(editor_h),  # editor
                     Constraint.fill(1),           # gap
@@ -697,7 +737,7 @@ class PromptModalState(ScreenState):
 
         # Label (bold accent — the original ``#prompt-label`` is accent + bold).
         frame.render_widget(
-            Paragraph(Text([Line([Span(self.prompt, TITLE_STYLE)])])),
+            Paragraph(Text([Line([Span(r, TITLE_STYLE)]) for r in label_rows])),
             rows[0],
         )
 

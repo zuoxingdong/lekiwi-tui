@@ -36,7 +36,8 @@ print(json.dumps({
     "dot": theme.status_dot(),
     "choice": theme.choice("on"),
     "rule": theme.rule(3),
-    "progress": theme.progress_segments(0.5, 4),
+    "meter": theme.meter_segments(0.5, 4),
+    "spark": theme.sparkline([0.0, 1.0], 2, lo=0.0, hi=1.0),
     "key": theme.key_label("\\u2191\\u2193/jk \\u2190\\u2192 \\u23ce"),
 }))
 """
@@ -57,7 +58,8 @@ def test_ascii_mode_replaces_wide_glyphs_and_emoji():
     assert probe["dot"] == "*"
     assert probe["choice"] == "< on >"
     assert probe["rule"] == "---"
-    assert probe["progress"] == ["##", "--"]
+    assert probe["meter"] == ["==", "--"]
+    assert probe["spark"] == ".#"
     assert probe["key"] == "up/down/jk left/right enter"
 
 

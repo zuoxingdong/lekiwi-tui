@@ -61,15 +61,6 @@ class StreamController:
         self.phase = "idle"            # idle | running | ended
         self.status = ""
         self.returncode: int | None = None
-        # Optional output watchers, set by the screen BEFORE start():
-        #   health_pattern — a compiled regex searched over every decoded chunk (pre
-        #   newline-split, so tqdm-style \r updates are seen too); the LAST match's
-        #   group(0) lands in .health (e.g. "27.3 fps"). The screens' loop gauge.
-        #   line_hook — called with each COMPLETED line (ANSI-stripped); screens use it
-        #   to track structured progress (record's "Recording episode N").
-        self.health_pattern: "re.Pattern[str] | None" = None
-        self.health = ""
-        self.line_hook: "Any | None" = None
 
     # ── introspection ──────────────────────────────────────────────────────────
     @property
@@ -144,20 +135,9 @@ class StreamController:
             self._on_eof()
             return
         clean = _ANSI_RE.sub("", data.decode("utf-8", "replace"))
-        if self.health_pattern is not None:
-            # Search the raw chunk BEFORE \r removal: tqdm/loop meters redraw in place
-            # with \r and rarely emit a newline, so the log-line path never sees them.
-            for m in self.health_pattern.finditer(clean):
-                self.health = m.group(0)
         text = self._partial + clean.replace("\r", "")
         *whole, self._partial = text.split("\n")
         self._lines.extend(whole)
-        if self.line_hook is not None:
-            for ln in whole:
-                try:
-                    self.line_hook(ln)
-                except Exception:  # a watcher must never kill the pump
-                    pass
 
     def _on_eof(self) -> None:
         if self._master is not None and self._loop is not None:
@@ -206,39 +186,6 @@ class StreamController:
         except (ProcessLookupError, OSError):
             pass
 
-    # ── input forwarding (interactive streams: the record HUD) ───────────────────
-    #: Key.name → the terminal byte sequence the child's tty reader expects.
-    _KEY_BYTES = {
-        "Up": b"\x1b[A", "Down": b"\x1b[B", "Right": b"\x1b[C", "Left": b"\x1b[D",
-        "Enter": b"\r", "Esc": b"\x1b", "Tab": b"\t", "Backspace": b"\x7f",
-        "Home": b"\x1b[H", "End": b"\x1b[F",
-    }
-
-    def write_bytes(self, data: bytes) -> bool:
-        """Write raw bytes to the child's PTY (its stdin). True iff written."""
-        if self._master is None or not self.running:
-            return False
-        try:
-            os.write(self._master, data)
-            return True
-        except OSError:
-            return False
-
-    def forward_key(self, key: Any) -> bool:
-        """Encode a normalized :class:`~..events.Key` press as terminal input bytes and
-        write it to the child. Presses only (that is all the App has); hold-to-move
-        consumers in the child must use their own below-the-terminal backend (evdev).
-        Returns True iff the key was representable AND written."""
-        name = getattr(key, "name", "")
-        if getattr(key, "ctrl", False) and len(name) == 1 and name.isalpha():
-            return self.write_bytes(bytes([ord(name.lower()) & 0x1F]))
-        seq = self._KEY_BYTES.get(name)
-        if seq is not None:
-            return self.write_bytes(seq)
-        if len(name) == 1:
-            return self.write_bytes(name.encode("utf-8", "replace"))
-        return False
-
     def handle_stop_key(self, key: Any) -> bool:
         """Route a Stop key (``s`` or Ctrl+C) while running. Returns True iff it handled
         the key (so the screen can `return Nothing`)."""
@@ -251,15 +198,25 @@ class StreamController:
 
     # ── render ─────────────────────────────────────────────────────────────────
     def draw_log(self, frame: Any, area: Any, *, title: str = "log") -> None:
-        """Render the log into *area* as a bordered, bottom-pinned pane (newest visible)."""
+        """Render the log into *area* as a bordered, bottom-pinned pane (newest visible).
+        The body is demoted to muted so the screen's own telemetry stays the primary
+        layer; WARN/ERROR lines keep their status color."""
         block = theme.block(title, bordered=True)
         inner = block.inner(area)
         frame.render_widget(block, area)
         h = max(1, inner.height)
         body = list(self._lines) or ["(waiting for output…)"]
         scroll_y = max(0, len(body) - h)
+
+        def _style_for(ln: str) -> Any:
+            if "ERROR" in ln or "Traceback" in ln:
+                return theme.ERR_STYLE
+            if "WARN" in ln:
+                return theme.WARN_STYLE
+            return theme.MUTED_STYLE
+
         frame.render_widget(
-            Paragraph(Text([Line([Span(ln, theme.TEXT_STYLE)]) for ln in body]))
+            Paragraph(Text([Line([Span(ln, _style_for(ln))]) for ln in body]))
             .style(theme.BASE_STYLE).scroll(scroll_y, 0), inner)
 
 
