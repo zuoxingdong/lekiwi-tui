@@ -41,6 +41,46 @@ if TYPE_CHECKING:
 SCRIPTS = ROOT / "scripts"
 
 
+async def pick_dataset(app: "App", doc, extra: list[str] | None = None,
+                       *, title: str) -> tuple[str, str] | None:
+    """Pick which dataset to act on, then resolve it to ``(repo_id, root)``.
+
+    Shows a DatasetPicker over the datasets dir (the parent of the configured record
+    root) with a ``Custom path…`` row; the configured dataset is pre-selected so ⏎
+    keeps today's default. repo_id is reconstructed as ``<ns>/<name>`` from the picked
+    root's basename + the configured namespace (root drives loading; repo_id is the
+    identity/label). In headless / direct mode (no live terminal) fall back to the
+    configured dataset. Returns None if the user cancels.
+
+    Module-level (not a Dispatcher method) so screens — replay/view flows AND the
+    dataset editor's ``d`` key — share the one picker."""
+    default_root = record_root(doc, extra or [])
+    default_repo = dataset_repo_id(doc)
+    ns = default_repo.rsplit("/", 1)[0] if "/" in default_repo else "local"
+
+    if app is None or app.terminal is None:
+        return default_repo, default_root
+
+    from .framework.modals import PromptModalState
+    from .widgets.pickers import CUSTOM, DatasetPicker
+
+    chosen = await app.run_modal(DatasetPicker(
+        str(Path(default_root).parent), default_root=default_root, title=title))
+    if chosen is None:
+        return None
+    if chosen == CUSTOM:
+        ans = await app.run_modal(PromptModalState(
+            "Dataset folder (local path)", value=default_root,
+            hint="⏎ apply · esc cancel"))
+        if ans is None or not ans:
+            return None
+        root = os.path.expanduser(ans).rstrip("/")
+    else:
+        root = chosen
+    name = Path(root).name
+    return f"{ns}/{name}", root
+
+
 class Dispatcher:
     """Resolves + runs a lekiwi action. Bound to the App after construction."""
 
@@ -95,40 +135,7 @@ class Dispatcher:
 
     # ── app-level suspend handlers ────────────────────────────────────────────
     async def _pick_dataset(self, app: "App", extra: list[str], *, title: str) -> tuple[str, str] | None:
-        """Pick which dataset to act on, then resolve it to ``(repo_id, root)``.
-
-        Shows a DatasetPicker over the datasets dir (the parent of the configured record
-        root) with a ``Custom path…`` row; the configured dataset is pre-selected so ⏎
-        keeps today's default. repo_id is reconstructed as ``<ns>/<name>`` from the picked
-        root's basename + the configured namespace (root drives loading; repo_id is the
-        identity/label). In headless / direct mode (no live terminal) fall back to the
-        configured dataset. Returns None if the user cancels."""
-        doc = self.ctx.doc
-        default_root = record_root(doc, extra)
-        default_repo = dataset_repo_id(doc)
-        ns = default_repo.rsplit("/", 1)[0] if "/" in default_repo else "local"
-
-        if app.terminal is None:
-            return default_repo, default_root
-
-        from .framework.modals import PromptModalState
-        from .widgets.pickers import CUSTOM, DatasetPicker
-
-        chosen = await app.run_modal(DatasetPicker(
-            str(Path(default_root).parent), default_root=default_root, title=title))
-        if chosen is None:
-            return None
-        if chosen == CUSTOM:
-            ans = await app.run_modal(PromptModalState(
-                "Dataset folder (local path)", value=default_root,
-                hint="⏎ apply · esc cancel"))
-            if ans is None or not ans:
-                return None
-            root = os.path.expanduser(ans).rstrip("/")
-        else:
-            root = chosen
-        name = Path(root).name
-        return f"{ns}/{name}", root
+        return await pick_dataset(app, self.ctx.doc, extra, title=title)
 
     async def _ask_episode(self, app: "App", *, title: str, repo_id: str, root: str) -> str | None:
         """Pick an episode via the rich EpisodeScreen (dataset identity + episode COUNT +
@@ -191,4 +198,4 @@ class Dispatcher:
         ]
         return runner.suspend_run(app, argv)
 
-__all__ = ["Dispatcher", "SCRIPTS"]
+__all__ = ["Dispatcher", "SCRIPTS", "pick_dataset"]
