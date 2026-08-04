@@ -38,8 +38,11 @@ HEADER = b"FRAME "
 UPPER_HALF = "▀"
 
 
-def frames(stream: IO[bytes], *, max_bytes: int = 4 << 20) -> Iterator[bytes]:
-    """Yield JPEG payloads from *stream* until EOF.
+def named_frames(stream: IO[bytes], *, max_bytes: int = 4 << 20) -> Iterator[tuple[str, bytes]]:
+    """Yield ``(camera name, JPEG payload)`` from *stream* until EOF.
+
+    The header is ``FRAME <name> <bytes>`` when several cameras share one channel, and
+    ``FRAME <bytes>`` for a single stream, which yields the name ``""``.
 
     Tolerates junk before a header (the remote shell can print warnings on the same fd)
     by resynchronising on the next ``FRAME`` line, and stops rather than trusting a
@@ -51,8 +54,12 @@ def frames(stream: IO[bytes], *, max_bytes: int = 4 << 20) -> Iterator[bytes]:
             return
         if not line.startswith(HEADER):
             continue                      # remote noise; wait for the next header
+        parts = line[len(HEADER):].split()
+        if not parts:
+            continue
+        name = parts[0].decode("utf-8", "replace") if len(parts) > 1 else ""
         try:
-            size = int(line[len(HEADER):].strip())
+            size = int(parts[-1])
         except ValueError:
             continue
         if size <= 0 or size > max_bytes:
@@ -60,6 +67,12 @@ def frames(stream: IO[bytes], *, max_bytes: int = 4 << 20) -> Iterator[bytes]:
         payload = stream.read(size)
         if not payload or len(payload) < size:
             return                        # truncated tail: the capture went away
+        yield name, payload
+
+
+def frames(stream: IO[bytes], *, max_bytes: int = 4 << 20) -> Iterator[bytes]:
+    """Payload-only view of :func:`named_frames`, for a single-camera stream."""
+    for _, payload in named_frames(stream, max_bytes=max_bytes):
         yield payload
 
 
@@ -126,6 +139,13 @@ class CameraStream:
     started_at: float = 0.0
     error: str = ""
     remote_error: str = ""                # first line the remote wrote to stderr
+    #: Latest frame per camera name, for a multiplexed stream. A dict rather than a queue
+    #: for the same reason ``latest`` is one frame: a stale tile is worse than a skipped one.
+    per_camera: dict = field(default_factory=dict)
+    counts: dict = field(default_factory=dict)
+    #: Every stderr line, so a per-camera failure can be shown on that camera's tile while
+    #: the others keep streaming.
+    remote_errors: list = field(default_factory=list)
     _proc: Any = None
     _thread: threading.Thread | None = None
     _stop: threading.Event = field(default_factory=threading.Event)
@@ -149,9 +169,11 @@ class CameraStream:
         try:
             for raw in self._proc.stderr:
                 line = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else str(raw).strip()
-                if line and not self.remote_error:
+                if not line:
+                    continue
+                self.remote_errors.append(line)
+                if not self.remote_error:
                     self.remote_error = line
-                    break
         except Exception:
             pass
 
@@ -159,12 +181,15 @@ class CameraStream:
         stdout = getattr(self._proc, "stdout", None)
         if stdout is None:
             return
-        for payload in frames(stdout):
+        for name, payload in named_frames(stdout):
             if self._stop.is_set():
                 break
             with self._lock:
                 self.latest = payload
                 self.frame_count += 1
+                if name:
+                    self.per_camera[name] = payload
+                    self.counts[name] = self.counts.get(name, 0) + 1
         if not self._stop.is_set() and self.frame_count == 0:
             # give the stderr reader a moment: its message is more specific than ours
             self._stop.wait(0.4)
@@ -191,4 +216,15 @@ class CameraStream:
         self._proc = None
 
 
-__all__ = ["CameraStream", "UPPER_HALF", "decode_jpeg", "frames", "half_blocks"]
+def camera_error(lines: list, name: str) -> str:
+    """The remote complaint about camera *name*, if any. The remote prints one line per
+    device it could not open, so a three-camera preview can show two pictures and one
+    reason instead of failing wholesale."""
+    for line in lines:
+        if f" {name} " in f" {line} ":
+            return line
+    return ""
+
+
+__all__ = ["CameraStream", "UPPER_HALF", "camera_error", "decode_jpeg", "frames",
+           "half_blocks", "named_frames"]

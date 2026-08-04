@@ -90,8 +90,8 @@ def test_the_stream_argv_carries_geometry_and_rotation():
     payload = argv[-1]
     assert 'cv2.VideoCapture("/dev/video4")' in payload
     assert "cv2.rotate(frame, rot[180])" in payload
-    assert "(640, 480)" in payload and "period = 1.0 / 5" in payload
-    assert "IMWRITE_JPEG_QUALITY), 60" in payload
+    assert "(320, 240)" in payload and "period = 1.0 / 5" in payload
+    assert "IMWRITE_JPEG_QUALITY), 50" in payload
 
 
 @pytest.mark.parametrize(("flag", "value", "message"), [
@@ -180,14 +180,22 @@ def test_a_stream_that_never_yields_says_so():
 # ── the screen ────────────────────────────────────────────────────────────────
 
 
-def _screen(monkeypatch, payloads=(b"jpeg-bytes",)) -> tuple[CameraPreviewScreen, list[_Proc]]:
+def _named_wire(*pairs: tuple[str, bytes]) -> io.BytesIO:
+    buf = bytearray()
+    for name, payload in pairs:
+        buf += b"FRAME %s %d\n" % (name.encode(), len(payload)) + payload
+    return io.BytesIO(bytes(buf))
+
+
+def _screen(_unused=None, pairs=(("front", b"jpeg-front"), ("wrist", b"jpeg-wrist"))
+            ) -> tuple[CameraPreviewScreen, list[_Proc]]:
     ctx = make_ctx(gpu_name="")
     ctx.doc = _doc(front={"index_or_path": "/dev/video0"},
                    wrist={"index_or_path": "/dev/video4", "rotation": "ROTATE_180"})
     spawned: list[_Proc] = []
 
     def spawn():
-        proc = _Proc(_wire(*payloads))
+        proc = _Proc(_named_wire(*pairs))
         spawned.append(proc)
         return proc
 
@@ -195,14 +203,26 @@ def _screen(monkeypatch, payloads=(b"jpeg-bytes",)) -> tuple[CameraPreviewScreen
     return screen, spawned
 
 
-def test_entering_starts_one_capture_and_tab_restarts_it_for_the_next_camera(monkeypatch):
-    screen, spawned = _screen(monkeypatch)
+def test_entering_starts_one_capture_for_all_cameras_and_tab_only_moves_the_selection():
+    """Selection is a local matter; restarting the robot's capture to highlight a different
+    tile would be gratuitous."""
+    screen, spawned = _screen(None)
     screen.on_enter()
     assert len(spawned) == 1 and screen.index == 0
 
     assert screen.handle_key(Key(name=TAB)) is Nothing
-    assert screen.index == 1 and len(spawned) == 2, "switching camera restarts the capture"
-    assert spawned[0].killed, "the previous camera is released"
+    assert screen.index == 1 and len(spawned) == 1, "no restart just to move the cursor"
+
+
+def test_rotating_restarts_the_capture_so_the_tile_shows_what_the_robot_would_send():
+    screen, spawned = _screen(None)
+    screen.on_enter()
+    screen.handle_key(Key(name="]"))
+    assert screen.cameras[0]["rotation"] == 90
+    assert len(spawned) == 2 and spawned[0].killed
+    screen.handle_key(Key(name="["))
+    assert screen.cameras[0]["rotation"] == 0
+    assert screen._dirty, "an unsaved rotation is flagged"
 
 
 def test_leaving_the_screen_stops_the_capture(monkeypatch):
@@ -212,14 +232,14 @@ def test_leaving_the_screen_stops_the_capture(monkeypatch):
     assert spawned[0].killed
 
 
-def test_undecodable_frames_are_reported_not_raised(monkeypatch):
+def test_undecodable_frames_are_reported_not_raised():
     """CI has no cv2/PIL, and neither does a bare install: it must degrade in words."""
-    screen, _ = _screen(monkeypatch)
+    screen, _ = _screen(None)
     screen.on_enter()
     screen._stream._thread.join(timeout=2)
-    lines = screen._image_lines(cols=20, rows=10)
+    lines = screen._tile_body_lines(screen.cameras[0], 20, 10)
     text = "".join(sp.content for ln in lines for sp in ln.spans)
-    assert "cannot be decoded" in text or "waiting for the first frame" in text
+    assert "no decoder" in text or "waiting" in text
 
 
 # ── the way in ────────────────────────────────────────────────────────────────
@@ -358,12 +378,29 @@ def test_kitty_is_detected_from_the_environment_not_by_querying():
     assert kitty_capable({"TERM": "xterm-256color", PROTOCOL_ENV: "kitty"})
 
 
-def test_the_capture_is_sized_for_a_graphics_protocol():
-    """640x480 at q60 is ~35 KB, so 5 fps is ~175 KB/s — an order below the load that used
-    to freeze the Pi, and only spent while the host is stopped."""
+def test_the_capture_is_sized_for_tiles():
+    """Three tiles at 320x240 q50 is ~180 KB/s in total — the same budget one full-size
+    single preview used, and an order below the load that used to freeze the Pi."""
     from lekiwi_tui.screens.camera_preview import HEIGHT, QUALITY, WIDTH
 
-    assert (WIDTH, HEIGHT) == (640, 480) and QUALITY == 60
+    assert (WIDTH, HEIGHT) == (320, 240) and QUALITY == 50
+
+
+def test_one_ssh_channel_carries_every_camera():
+    """One session, not one per camera: three logins would mean three pythons and three
+    chances to leave a device open."""
+    from lekiwi_tui.screens.camera_preview import build_all_streams_argv
+
+    cams = [{"name": "front", "device": "/dev/video0", "rotation": 0},
+            {"name": "wrist", "device": "/dev/video4", "rotation": 180}]
+    argv = build_all_streams_argv(make_ctx(gpu_name=""), cams)
+    assert argv[:2] == ["ssh", "-n"]
+    payload = argv[-1]
+    assert '("front", "/dev/video0", 0)' in payload
+    assert '("wrist", "/dev/video4", 180)' in payload
+    # a device that will not open is skipped, not fatal: with three cameras one bad node is
+    # exactly when the other two matter
+    assert "could not open" in payload and "continue" in payload
 
 
 # ── failure shows what the robot actually has ─────────────────────────────────
@@ -387,24 +424,22 @@ def test_a_missing_node_reports_the_remote_message_and_asks_what_exists(monkeypa
         def kill(self): pass
 
     screen = CameraPreviewScreen(None, ctx, spawn=_Failing)
-    fetched = []
-    monkeypatch.setattr(screen, "_fetch_listing", lambda: fetched.append(True))
     screen.on_enter()
     screen._stream._thread.join(timeout=2)
 
-    lines = screen._failure_lines()
-    text = "\n".join("".join(sp.content for sp in ln.spans) for ln in lines)
-    assert "/dev/video4" in text and "could not open" in text
-    assert fetched, "a failure is exactly when the device list is worth fetching"
+    # the tile itself carries the reason, so two good cameras keep streaming beside it
+    tile = "".join(sp.content for ln in screen._tile_body_lines(screen.cameras[0], 20, 10)
+                   for sp in ln.spans)
+    assert "/dev/video4" in tile and "could not open" in tile
+    # and with NOTHING streaming, the screen asks the robot what it has
+    assert screen._all_failed()
 
 
-def test_a_healthy_stream_never_fetches_the_listing(monkeypatch):
-    screen, _ = _screen(monkeypatch)
-    monkeypatch.setattr(screen, "_fetch_listing",
-                        lambda: pytest.fail("must not ask while frames are arriving"))
+def test_a_healthy_stream_is_not_a_failure():
+    screen, _ = _screen(None)
     screen.on_enter()
     screen._stream._thread.join(timeout=2)
-    assert screen._failure_lines() is None
+    assert not screen._all_failed()
 
 
 def test_the_hint_row_keeps_keycaps_when_labels_do_not_fit():
@@ -424,3 +459,76 @@ def test_the_hint_row_keeps_keycaps_when_labels_do_not_fit():
     tight = rendered(96)          # labels no longer fit
     assert " p " in tight, "the keycap survives"
     assert "preview" not in tight.split("cameras")[-1], "its label does not"
+
+
+# ── writing the rotation back ─────────────────────────────────────────────────
+
+
+def test_saving_rotations_preserves_anchors_comments_and_keeps_a_backup(tmp_path):
+    """lekiwi.yaml is git-ignored, so the backup IS the undo. And a PyYAML dump would
+    rename &cameras to &id001 and drop every comment, which is why this round-trips."""
+    from lekiwi_tui.screens.camera_preview import write_rotations
+
+    cfg = tmp_path / "lekiwi.yaml"
+    cfg.write_text(
+        "# top comment\n"
+        "_cameras: &cameras\n"
+        "  front:\n"
+        "    index_or_path: /dev/video0\n"
+        "    rotation: NO_ROTATION      # inline note\n"
+        "  wrist:\n"
+        "    index_or_path: /dev/video4\n"
+        "    rotation: NO_ROTATION\n"
+        "teleop:\n"
+        "  cameras: *cameras\n")
+
+    backup = write_rotations([{"name": "wrist", "device": "/dev/video4", "rotation": 180},
+                              {"name": "front", "device": "/dev/video0", "rotation": 0}],
+                             path=cfg)
+    saved = cfg.read_text()
+    assert "rotation: ROTATE_180" in saved
+    assert "&cameras" in saved and "*cameras" in saved, "anchors survive"
+    assert "# top comment" in saved and "# inline note" in saved, "comments survive"
+    assert Path(backup).exists() and "NO_ROTATION" in Path(backup).read_text()
+
+
+def test_saving_ignores_a_camera_the_yaml_does_not_have(tmp_path):
+    from lekiwi_tui.screens.camera_preview import write_rotations
+
+    cfg = tmp_path / "lekiwi.yaml"
+    cfg.write_text("_cameras:\n  front:\n    index_or_path: /dev/video0\n    rotation: NO_ROTATION\n")
+    write_rotations([{"name": "ghost", "device": "/dev/video9", "rotation": 90}], path=cfg)
+    assert "ROTATE_90" not in cfg.read_text(), "a stale name must not invent a block"
+
+
+def test_the_rotation_names_are_lerobots_own():
+    """The degrees map to cv2 the same way lerobot's get_cv2_rotation does (90 clockwise,
+    270 counter-clockwise), so the preview cannot claim a rotation the robot won't apply."""
+    from lekiwi_tui.screens.camera_preview import ROT_NAMES, ROTATIONS
+
+    assert ROTATIONS == (0, 90, 180, 270)
+    assert ROT_NAMES == {0: "NO_ROTATION", 90: "ROTATE_90", 180: "ROTATE_180",
+                         270: "ROTATE_270"}
+
+
+def test_w_writes_and_clears_the_unsaved_flag(tmp_path, monkeypatch):
+    import lekiwi_tui.screens.camera_preview as mod
+
+    screen, _ = _screen(None)
+    screen.on_enter()
+    screen.handle_key(Key(name="]"))
+    assert screen._dirty
+
+    written = {}
+    monkeypatch.setattr(mod, "write_rotations",
+                        lambda cams, path=None: written.setdefault("cams", cams) and "" or "/tmp/x.bak")
+    monkeypatch.setattr("lekiwi_tui.config.load_yaml", lambda *a, **k: {})
+    screen.handle_key(Key(name="w"))
+    assert not screen._dirty and "saved" in screen._saved_note
+    assert written["cams"][0]["rotation"] == 90
+
+
+def test_the_footer_says_how_to_rotate_and_save():
+    """The two things a first-time user cannot guess."""
+    source = Path(ROOT / "lekiwi_tui" / "screens" / "camera_preview.py").read_text()
+    assert "[ ] rotate the selected camera, w writes it to lekiwi.yaml" in source

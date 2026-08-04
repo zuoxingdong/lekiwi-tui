@@ -183,6 +183,76 @@ PY
       "$width" "$height" "$quality"
 }
 
+
+# emit_stream_all <conda_env> <specs> <fps> <width> <height> <quality>
+#   Print the remote bash that previews EVERY configured camera over ONE ssh channel.
+#
+#   One process, not one per camera: three ssh sessions would mean three logins, three
+#   pythons and three chances to leave a camera open. Frames are tagged with the camera
+#   name (`FRAME <name> <bytes>`) and interleaved round-robin, so a slow device delays
+#   only its own tile.
+#
+#   A device that will not open is REPORTED and SKIPPED rather than fatal — with three
+#   cameras, one bad node is exactly when you want to see the other two, and the tile
+#   for the missing one then carries the reason.
+#
+#   Tiles are small, so the frames are small: 320x240 q50 is ~12 KB, and three of them at
+#   5 fps is ~180 KB/s, the same budget one full-size single preview used.
+emit_stream_all() {
+  local conda_env="$1" specs="$2" fps="$3" width="$4" height="$5" quality="$6"
+  printf '
+        eval "$(~/miniforge3/bin/mamba shell hook --shell bash)" || exit 1
+        mamba activate %s || { echo '"'"'✗ could not activate %s'"'"' >&2; exit 1; }
+
+        python - <<'"'"'PY'"'"'
+import sys, time
+import cv2
+
+# (name, device, rotation-degrees); rotation matches lerobot get_cv2_rotation exactly
+specs = [%s]
+ROT = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+caps = []
+for name, dev, rot in specs:
+    cap = cv2.VideoCapture(dev)
+    if not cap.isOpened():
+        sys.stderr.write("✗ %%s %%s: could not open (is the host stopped?)\n" %% (name, dev))
+        sys.stderr.flush()
+        continue
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    caps.append((name, rot, cap))
+
+if not caps:
+    sys.stderr.write("✗ no camera could be opened\n")
+    raise SystemExit(1)
+
+period = 1.0 / %s
+out = sys.stdout.buffer
+try:
+    while True:
+        start = time.monotonic()
+        for name, rot, cap in caps:
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            if rot in ROT:
+                frame = cv2.rotate(frame, ROT[rot])
+            frame = cv2.resize(frame, (%s, %s), interpolation=cv2.INTER_AREA)
+            ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), %s])
+            if not ok:
+                continue
+            payload = jpeg.tobytes()
+            out.write(b"FRAME %%s %%d\n" %% (name.encode(), len(payload)))
+            out.write(payload)
+            out.flush()
+        time.sleep(max(0.0, period - (time.monotonic() - start)))
+finally:
+    for _, _, cap in caps:
+        cap.release()
+PY
+    ' "$conda_env" "$conda_env" "$specs" "$fps" "$width" "$height" "$quality"
+}
+
 # ── parse ───────────────────────────────────────────────────────────────────
 # First positional is the subcommand (emit-detect | emit-stream). Long flags only;
 # unknown flags are an error, since the emitted bash is fixed (no passthrough).
@@ -198,6 +268,7 @@ height="240"
 quality="50"
 rotation="0"           # 0 | 90 | 180 | 270, applied on the Pi
 deep="0"               # 1 = lerobot's own probe (opens every device; slow and noisy on a Pi)
+cameras=()             # emit-stream-all: repeated name=/dev/videoN@rotation
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -206,6 +277,7 @@ while [[ $# -gt 0 ]]; do
     --record-time) record_time="${2:-}"; shift 2 ;;
     --warmup)      warmup="${2:-}"; shift 2 ;;
     --device)      device="${2:-}"; shift 2 ;;
+    --camera)      cameras+=("${2:-}"); shift 2 ;;
     --fps)         fps="${2:-}"; shift 2 ;;
     --width)       width="${2:-}"; shift 2 ;;
     --height)      height="${2:-}"; shift 2 ;;
@@ -252,8 +324,33 @@ case "$subcmd" in
       *) die_usage "--rotation must be 0, 90, 180 or 270 (got '$rotation')" ;;
     esac
     emit_stream "$conda_env" "$device" "$fps" "$width" "$height" "$quality" "$rotation" ;;
+  emit-stream-all)
+    validate_remote_name "$conda_env" "conda env"
+    validate_positive_int "$fps" "--fps"
+    (( fps <= 30 )) || die_usage "--fps must be 30 or less (this is a preview, not a recording)"
+    validate_positive_int "$width" "--width"
+    validate_positive_int "$height" "--height"
+    validate_positive_int "$quality" "--quality"
+    (( quality <= 100 )) || die_usage "--quality must be 1..100"
+    (( ${#cameras[@]} > 0 )) || die_usage "emit-stream-all needs at least one --camera name=/dev/videoN[@rotation]"
+    specs=""
+    for spec in "${cameras[@]}"; do
+      cam_name="${spec%%=*}"
+      cam_rest="${spec#*=}"
+      cam_dev="${cam_rest%%@*}"
+      cam_rot="0"; [[ "$cam_rest" == *@* ]] && cam_rot="${cam_rest##*@}"
+      # Names and devices are interpolated into remote python, so both are validated hard.
+      [[ "$cam_name" =~ ^[A-Za-z0-9_-]+$ ]] || die_usage "--camera name must be alphanumeric (got '$cam_name')"
+      [[ "$cam_dev" =~ ^(/dev/[A-Za-z0-9_./-]+|[0-9]{1,3})$ ]] \
+        || die_usage "--camera device must be a /dev path or a small index (got '$cam_dev')"
+      [[ "$cam_dev" != *..* ]] || die_usage "--camera device must not contain '..'"
+      case "$cam_rot" in 0|90|180|270) ;; *) die_usage "--camera rotation must be 0, 90, 180 or 270 (got '$cam_rot')" ;; esac
+      specs+="(\"$cam_name\", \"$cam_dev\", $cam_rot), "
+    done
+    emit_stream_all "$conda_env" "$specs" "$fps" "$width" "$height" "$quality" ;;
   ""|-h|--help) die_usage "usage: find_cameras.sh emit-detect                       # fast sysfs listing (no lerobot needed)
        find_cameras.sh emit-detect --deep --conda-env <env> [--backend opencv|realsense|all] [--record-time N] [--warmup N]
+       find_cameras.sh emit-stream-all --conda-env <env> --camera front=/dev/video0 --camera wrist=/dev/video4@180
        find_cameras.sh emit-stream --conda-env <env> --device /dev/videoN [--fps 5] [--width 320] [--height 240] [--quality 50] [--rotation 0|90|180|270]" ;;
-  *) die_usage "unknown subcommand: $subcmd (expected emit-detect or emit-stream)" ;;
+  *) die_usage "unknown subcommand: $subcmd (expected emit-detect, emit-stream-all or emit-stream)" ;;
 esac
