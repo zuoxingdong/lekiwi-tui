@@ -56,10 +56,10 @@ _launcher:
 # applies `rotation`; the client only reads width/height for dataset feature shapes
 # and never rotates, so the rotations here are inert on the client side.
 #
-# Two hard-won details worth keeping:
-#   • fourcc: MJPG on every camera. Without it OpenCV can auto-negotiate
-#     uncompressed YUYV (~150 Mbps per camera), and that USB load combined with
-#     WiFi TX is enough to hard-freeze a Pi.
+# Two details worth keeping:
+#   • fourcc: MJPG is belt-and-braces on lerobot 0.6.1+, which already pins MJPG for
+#     LeKiwi and prefers it when unset over ZMQ. Kept explicit because uncompressed YUYV
+#     at ~150 Mbps per camera plus WiFi TX is what used to hard-freeze the Pi.
 #   • a bare /dev/videoN is not reboot/replug-stable, and adding a camera can
 #     renumber the others. Prefer /dev/v4l/by-path/...-video-index0 once the
 #     hardware is settled.
