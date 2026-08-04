@@ -9,6 +9,8 @@ import subprocess
 import types
 from pathlib import Path
 
+import pytest
+
 from lekiwi_tui import ROOT
 from lekiwi_tui.screens.dataset_edit import (
     DatasetEditScreen,
@@ -27,8 +29,12 @@ def _key(name: str, **mods) -> types.SimpleNamespace:
 
 
 def _make_dataset(root: Path, lengths: list[int], fps: int = 30) -> None:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    # The episode index a v3 dataset keeps is parquet, and load_episodes reads it as
+    # parquet, so there is no honest way to fake it without a writer. pyarrow rides in
+    # with lerobot on a robot machine; it is in the dev extra so CI has one too, and
+    # skipped rather than failed if someone runs the suite in a barer env.
+    pa = pytest.importorskip("pyarrow", reason="parquet writer needed to fake a dataset")
+    pq = pytest.importorskip("pyarrow.parquet")
 
     (root / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
     (root / "meta" / "info.json").write_text(json.dumps(

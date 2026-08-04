@@ -31,6 +31,10 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.6.0",
+    # Test-only: the dataset-editor tests fake a v3 dataset, whose episode index is
+    # parquet. On a robot machine pyarrow arrives with lerobot; CI installs only this
+    # extra, so name it here or those tests skip themselves.
+    "pyarrow>=15",
 ]
 
 [project.scripts]
