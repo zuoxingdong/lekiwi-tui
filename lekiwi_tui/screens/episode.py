@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 _CARD_WIDTH = 76
 
 
-def _tilde(path: str) -> str:
+def collapse_home(path: str) -> str:
     """Collapse a leading ``$HOME`` to ``~`` (verbatim from the Textual EpisodeScreen)."""
     home = os.path.expanduser("~")
     return "~" + path[len(home):] if path.startswith(home) else path
@@ -227,7 +227,7 @@ class EpisodeScreen(ScreenState):
             Paragraph(Text([Line([
                 Span(self._repo_id, theme.STATUS_VALUE_STYLE),
                 Span("  ·  ", theme.MUTED_STYLE),
-                Span(_tilde(self._root), theme.MUTED_STYLE),
+                Span(collapse_home(self._root), theme.MUTED_STYLE),
             ])])), rows[2])
 
         # Episode count + valid range.

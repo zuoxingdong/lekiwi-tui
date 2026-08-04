@@ -25,16 +25,20 @@ pure → unit-testable with a synthetic ``Key`` (no ``Terminal``).
 from __future__ import annotations
 
 import os
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
+from pyratatui import Line, Span
 
 from .. import CFG_FILE, ROOT
-from ..config import resolve_editor
+from ..config import collapse_home, resolve_editor
+from ..hostprobe import host_alive
 from ..framework import theme
 from ..framework.events import DOWN, ENTER, ESC, UP, Key
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
-from .chrome import keycap_hint_line, option_line, runtime_chips
+from .chrome import draw_form_page, padded_line, plan_row, section_line
 
 if TYPE_CHECKING:
     from ..context import Context
@@ -46,14 +50,6 @@ if TYPE_CHECKING:
 # resolved cfg scalars as flags. ``runner.safe_argv`` appends ``--dry-run`` (R8) because
 # this is a ``scripts/*.sh`` wrapper.
 CALIBRATE_SCRIPT = ROOT / "scripts" / "calibrate.sh"
-RULE = "─" * 54
-
-
-def _tilde(path: str) -> str:
-    """Collapse a leading ``$HOME`` to ``~`` for display (ported verbatim from the
-    Textual screen)."""
-    home = os.path.expanduser("~")
-    return "~" + path[len(home):] if path.startswith(home) else path
 
 
 def _calib_base() -> str:
@@ -173,129 +169,94 @@ class CalibrateScreen(ScreenState):
             "--robot-type", cfg["ROBOT_TYPE"],
         ]
 
-    # ── view (rebuilt fresh each frame) ───────────────────────────────────────
-    def draw(self, frame: Any, area: Any) -> None:
-        frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
-        rows = (
-            Layout().direction(Direction.Vertical).constraints([
-                Constraint.length(1),   # header
-                Constraint.length(1),   # rule
-                Constraint.length(1),   # runtime chips
-                Constraint.length(1),   # leader row
-                Constraint.length(1),   # follower row
-                Constraint.length(1),   # gap
-                Constraint.length(3),   # info (device / saves / note)
-                Constraint.length(1),   # gap
-                Constraint.length(1),   # start
-                Constraint.length(1),   # result msg
-                Constraint.fill(1),     # spacer
-                Constraint.length(1),   # hint
-            ]).split(area)
-        )
-        frame.render_widget(
-            Paragraph(Text([Line([
-                Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE),
-                Span("  calibrate", theme.SUBTITLE_STYLE),
-            ])])).style(theme.BASE_STYLE), rows[0])
-        frame.render_widget(Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
-        frame.render_widget(runtime_chips(self.ctx), rows[2])
+    # ── view (rebuilt fresh each frame; _body_lines is the testable view-model) ─
+    _LABEL_W = 12
 
-        cur = self.FIELDS[self._fpos]
-        self._row(frame, rows[3], "🎯 Leader (SO101)", "local, this laptop", cur == "leader")
-        self._row(frame, rows[4], "🤖 Follower (LeKiwi)", "on the Pi over SSH", cur == "follower")
-        frame.render_widget(self._info_text(), rows[6])
-        self._start_row(frame, rows[8])
-        if self._msg:
-            frame.render_widget(
-                Paragraph(Text([Line([Span(self._msg, self._msg_style())])]))
-                .style(theme.BASE_STYLE),
-                rows[9],
-            )
-        self._hint(frame, rows[11])
+    def _leader_calib_age(self) -> str:
+        """`calibrated <date> (N d ago)` from the LOCAL leader calibration file's mtime
+        (a stale calibration is a robot-quality issue nothing else surfaces), or
+        'not calibrated yet'. The follower's file lives on the Pi — no local stat."""
+        path = (Path(_calib_base()) / "teleoperators" / "so101_leader"
+                / f"{self.ctx.cfg['LEADER_ID']}.json")
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return "not calibrated yet"
+        days = max(0, int((time.time() - mtime) / 86400))
+        stamp = datetime.fromtimestamp(mtime).strftime("%b %d")
+        return f"calibrated {stamp} ({days} d ago)"
 
-    # ── row helpers (the teleop ▌-gutter idiom; a leading bar when focused) ─────
-    def _row(self, frame: Any, area: Any, label: str, value: str, focused: bool) -> None:
-        frame.render_widget(
-            Paragraph(Text([option_line(
-                label,
-                value,
-                focused=focused,
-                label_width=20,
-                width=area.width,
-            )])).style(theme.BASE_STYLE),
-            area,
-        )
+    def _host_alive(self) -> bool | None:
+        return host_alive(self.ctx)
 
-    def _info_text(self) -> Paragraph:
-        """The device / saves / note panel for the *currently focused* arm. Reads
-        ``self.ctx.cfg`` (the Textual original read ``self.app.cfg``; here cfg lives on
-        the context so ``draw`` works even before ``app`` is wired). Colour mapping:
-        SAND→STATUS_VALUE_STYLE, TEXT_MUTED→MUTED_STYLE, TEXT→TEXT_STYLE."""
+    def _focused_hint(self) -> str:
         cfg = self.ctx.cfg
-        if self._arm == "leader":
-            saves = os.path.join(_calib_base(), "teleoperators", "so101_leader", f"{cfg['LEADER_ID']}.json")
-            lines = [
-                Line([
-                    Span("device   ", theme.MUTED_STYLE),
-                    Span(f"so101_leader · {cfg['LEADER_PORT']} · {cfg['LEADER_ID']}", theme.STATUS_VALUE_STYLE),
-                ]),
-                Line([
-                    Span("saves    ", theme.MUTED_STYLE),
-                    Span(_tilde(saves), theme.MUTED_STYLE),
-                ]),
-                Line([
-                    Span("note     follow prompts: move the arm and press Enter", theme.MUTED_STYLE),
-                ]),
-            ]
-        else:
-            saves = f"~/.cache/huggingface/lerobot/calibration/robots/lekiwi/{cfg['ROBOT_ID']}.json"
-            lines = [
-                Line([
-                    Span("device   ", theme.MUTED_STYLE),
-                    Span(f"lekiwi · robot.id {cfg['ROBOT_ID']} · host {cfg['LEKIWI_HOST']}", theme.STATUS_VALUE_STYLE),
-                ]),
-                Line([
-                    Span("saves    ", theme.MUTED_STYLE),
-                    Span(saves + "  (on the Pi)", theme.MUTED_STYLE),
-                ]),
-                Line([
-                    Span("note     ", theme.MUTED_STYLE),
-                    Span("stop the host first (it holds the serial bus)", theme.STATUS_VALUE_STYLE),
-                    Span("; then follow the calibration prompts", theme.MUTED_STYLE),
-                ]),
-            ]
-        return Paragraph(Text(lines)).style(theme.BASE_STYLE)
+        cur = self.FIELDS[self._fpos]
+        if cur == "leader":
+            saves = os.path.join(_calib_base(), "teleoperators", "so101_leader",
+                                 f"{cfg['LEADER_ID']}.json")
+            return f"saves {collapse_home(saves)}"
+        if cur == "follower":
+            return (f"saves ~/.cache/…/calibration/robots/lekiwi/{cfg['ROBOT_ID']}.json"
+                    " on the Pi")
+        return "the terminal guides each joint: move to the limit, press Enter"
 
-    def _start_row(self, frame: Any, area: Any) -> None:
-        focused = self.FIELDS[self._fpos] == "start"
-        frame.render_widget(
-            Paragraph(Text([option_line(
-                f"{theme.play_mark()} Start calibration",
-                self._arm,
-                focused=focused,
-                label_width=24,
-                width=area.width,
-                label_unfocused_style=theme.TEXT_STYLE,
-            )])).style(theme.BASE_STYLE),
-            area,
-        )
+    def _body_lines(self, width: int = 100) -> list[Line]:
+        cfg = self.ctx.cfg
+        cur = self.FIELDS[self._fpos]
+        w = int(width)
+        radio_on = "◉ " if not theme.ASCII_MODE else "(*) "
+        radio_off = "○ " if not theme.ASCII_MODE else "( ) "
+        lines: list[Line] = [section_line("ARM  (pick one)")]
+        lines.append(padded_line(
+            [Span(theme.selector(cur == "leader"),
+                  theme.TITLE_STYLE if cur == "leader" else theme.BASE_STYLE),
+             Span(radio_on if self._arm == "leader" else radio_off,
+                  theme.TITLE_STYLE if self._arm == "leader" else theme.MUTED_STYLE),
+             Span(f"{'leader':<{self._LABEL_W}}",
+                  theme.TITLE_STYLE if cur == "leader" else theme.MUTED_STYLE),
+             Span(f"SO101 · local {cfg['LEADER_PORT']} · {cfg['LEADER_ID']}",
+                  theme.TEXT_STYLE)],
+            [Span(self._leader_calib_age(), theme.FAINT_STYLE),
+             Span("  ", theme.BASE_STYLE)], w))
+        lines.append(Line([
+            Span(theme.selector(cur == "follower"),
+                 theme.TITLE_STYLE if cur == "follower" else theme.BASE_STYLE),
+            Span(radio_on if self._arm == "follower" else radio_off,
+                 theme.TITLE_STYLE if self._arm == "follower" else theme.MUTED_STYLE),
+            Span(f"{'follower':<{self._LABEL_W}}",
+                 theme.TITLE_STYLE if cur == "follower" else theme.MUTED_STYLE),
+            Span(f"LeKiwi arm · robot.id {cfg['ROBOT_ID']} · on {cfg['LEKIWI_HOST']} over ssh",
+                 theme.TEXT_STYLE),
+        ]))
+        lines.append(Line([]))
+        focused = cur == "start"
+        # INVERSE host condition: the FOLLOWER needs the host STOPPED (it holds the
+        # arm's serial bus); the leader is a local device and ignores host state.
+        if self._arm == "follower" and self._host_alive() is True:
+            plan_span = Span("⚠ host is running — Stop host first; it owns the follower's motors",
+                             theme.WARN_STYLE)
+        else:
+            plan_span = Span(
+                f"interactive {self._arm} calibration in the terminal · move joints to limits",
+                theme.HIGHLIGHT_MUTED_STYLE if focused else theme.MUTED_STYLE)
+        lines.append(plan_row("Start", [plan_span], focused=focused))
+        if self._msg:
+            lines.append(Line([]))
+            lines.append(Line([Span(f"  {self._msg}", self._msg_style())]))
+        return lines
+
+    def draw(self, frame: Any, area: Any) -> None:
+        draw_form_page(frame, area, self.ctx, "calibrate", self._body_lines(area.width),
+                       hint=self._focused_hint(),
+                       keys=(("↑↓/jk", "move"), ("⏎", "select·start"),
+                             ("e", "edit config"), ("q", "back")))
 
     def _msg_style(self):
         # ✓ "finished" = ok (green); "calibration exited (rc≠0)" = warn (amber). A
         # non-zero rc here is usually the user aborting an interactive calibration, not a
         # crash, so WARN (not ERR) — matches sync.py's _msg_style discrimination.
         return theme.OK_STYLE if self._msg.startswith("✓") else theme.WARN_STYLE
-
-    def _hint(self, frame: Any, area: Any) -> None:
-        frame.render_widget(
-            keycap_hint_line([
-                ("↑↓/jk", "move"),
-                ("⏎", "select/start"),
-                ("e", "edit config"),
-                ("q", "back"),
-            ]),
-            area,
-        )
 
 
 __all__ = ["CalibrateScreen"]

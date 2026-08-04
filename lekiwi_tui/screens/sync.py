@@ -47,14 +47,18 @@ from typing import TYPE_CHECKING, Any
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
 from .. import CFG_FILE, ROOT
-from ..config import Config, resolve_workspace_path
+from ..config import Config, collapse_home, resolve_workspace_path
 from ..framework import runner, theme
 from ..framework.events import DOWN, ENTER, LEFT, RIGHT, UP, ESC, Key
 from ..framework.modals import PromptModalState
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
 from ..framework.stream import StreamController
-from .chrome import LABEL_W_ACTION, LABEL_W_FIELD, chip_spans, keycap_hint_line, option_line, runtime_chips
-from .provision import checkout_provenance, local_checkout, pyproject_version
+from .chrome import (
+    plan_row,
+    clip_middle, draw_slim_header, hint_slot_line, keycap_hint_line,
+    mode_chip_spans, padded_line, section_line, seg,
+)
+from ..workspace import checkout_provenance, local_checkout, pyproject_version
 from ..remote import RemoteValueError, validate_ssh_host
 
 if TYPE_CHECKING:
@@ -67,7 +71,6 @@ HEADLESS_HOOK = "run_headless"
 #: Absolute path to the sync launcher this screen fronts.
 SYNC_SCRIPT = ROOT / "scripts" / "sync.sh"
 
-RULE = "─" * 54
 
 
 def build_sync_argv(*, script: Any = SYNC_SCRIPT, install: bool = False) -> list[str]:
@@ -258,177 +261,113 @@ class SyncScreen(ScreenState):
         else:
             self._draw_stream(frame, area)
 
-    def _draw_idle(self, frame: Any, area: Any) -> None:
-        rows = (
-            Layout()
-            .direction(Direction.Vertical)
-            .constraints([
-                Constraint.length(1),   # 0 header
-                Constraint.length(1),   # 1 heavy rule
-                Constraint.length(1),   # 2 runtime chips
-                Constraint.length(1),   # 3 info line
-                Constraint.length(1),   # 4 gap
-                Constraint.length(4),   # 5 repo + provenance, plugin + provenance
-                Constraint.length(1),   # 6 dest line
-                Constraint.length(1),   # 7 install toggle
-                Constraint.length(1),   # 8 gap
-                Constraint.length(1),   # 9 sync-now row
-                Constraint.length(1),   # 10 result msg
-                Constraint.fill(1),     # 11 spacer
-                Constraint.length(1),   # 12 light rule
-                Constraint.length(1),   # 13 hint
-            ])
-            .split(area)
-        )
-        self._header(frame, rows[0])
-        frame.render_widget(
-            Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1]
-        )
-        frame.render_widget(runtime_chips(self.ctx), rows[2])
-        frame.render_widget(self._info(), rows[3])
-        self._source_rows(frame, rows[5])
-        frame.render_widget(self._dest_line(), rows[6])
-        frame.render_widget(self._install_row(rows[7].width), rows[7])
-        frame.render_widget(self._sync_row(), rows[9])
-        if self._msg:
-            frame.render_widget(
-                Paragraph(Text([Line([Span(self._msg, self._msg_style())])])).style(theme.BASE_STYLE),
-                rows[10],
-            )
-        frame.render_widget(
-            Paragraph.from_string(theme.rule(rows[12].width, light=True)).style(theme.RULE_LIGHT_STYLE), rows[12]
-        )
-        self._hint(frame, rows[13], [
-            ("↑↓/jk", "move"), ("⏎", "edit/toggle/sync"), ("q", "back"),
-        ])
+    _LABEL_W = 12
 
-    def _draw_stream(self, frame: Any, area: Any) -> None:
-        rows = (
-            Layout()
-            .direction(Direction.Vertical)
-            .constraints([
-                Constraint.length(1),   # header
-                Constraint.length(1),   # heavy rule
-                Constraint.length(1),   # target (read-only context)
-                Constraint.length(1),   # status
-                Constraint.fill(1),     # log pane
-                Constraint.length(1),   # hint
-            ])
-            .split(area)
-        )
-        self._header(frame, rows[0])
-        frame.render_widget(
-            Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1]
-        )
-        # Target, read-only, on the same page as the log.
+    def _lab(self, text: str, focused: bool) -> Span:
+        return Span(f"{text:<{self._LABEL_W}}",
+                    theme.TITLE_STYLE if focused else theme.MUTED_STYLE)
+
+    def _gutter(self, *fields: str) -> Span:
+        on = self.FIELDS[self._fpos] in fields
+        return Span(theme.selector(on), theme.TITLE_STYLE if on else theme.BASE_STYLE)
+
+    def _focused_hint(self) -> str:
+        cur = self.FIELDS[self._fpos]
+        if cur == "repo":
+            return "local lerobot checkout to mirror · ⏎ edit path"
+        if cur == "plugin":
+            return "local PincOpen plugin to mirror · ⏎ edit path"
+        if cur == "install":
+            return "auto = reinstall only when deps changed · force = this run · ←→/⏎"
+        return "mirrors both checkouts over ssh, then the install check"
+
+    def _body_lines(self, width: int = 100) -> list[Line]:
+        cur = self.FIELDS[self._fpos]
+        w = int(width)
+        pw = max(24, w - self._LABEL_W - 28)
+        lines: list[Line] = [section_line("SOURCES  (laptop → Pi)")]
+        lines.append(padded_line(
+            [self._gutter("repo"), self._lab("lerobot", cur == "repo"),
+             Span(clip_middle(self._path_display("LOCAL_REPO", self._repo_dir), pw),
+                  theme.TEXT_STYLE)],
+            [Span(self._repo_prov, theme.FAINT_STYLE), Span("  ", theme.BASE_STYLE)], w))
+        lines.append(padded_line(
+            [self._gutter("plugin"), self._lab("plugin", cur == "plugin"),
+             Span(clip_middle(self._path_display("LOCAL_PLUGIN", self._plugin_dir), pw),
+                  theme.TEXT_STYLE)],
+            [Span(self._plugin_prov, theme.FAINT_STYLE), Span("  ", theme.BASE_STYLE)], w))
+        lines.append(Line([]))
+        lines.append(section_line("DESTINATION"))
         host = self.ctx.cfg["LEKIWI_HOST"]
         repo = self.ctx.cfg["PI_REPO"]
+        lines.append(Line([
+            self._gutter("install"),
+            Span(f"{'target':<{self._LABEL_W}}", theme.MUTED_STYLE),
+            Span(f"{host}:{repo}", theme.TEXT_STYLE),
+            Span("      ", theme.BASE_STYLE),
+            self._lab("Reinstall", cur == "install"),
+            seg("auto", not self._force), Span(" ", theme.BASE_STYLE),
+            seg("force", self._force),
+        ]))
+        lines.append(Line([]))
+        focused = cur == "sync"
+        plan = ("rsync both checkouts · reinstall forced this run" if self._force
+                else "rsync both checkouts · reinstall only if deps changed")
+        lines.append(plan_row("Sync now", plan, focused=focused))
+        return lines
+
+    def _draw_idle(self, frame: Any, area: Any) -> None:
+        rows = (Layout().direction(Direction.Vertical).constraints(
+            [Constraint.length(1), Constraint.length(1), Constraint.fill(1),
+             Constraint.length(1), Constraint.length(1)]).split(area))
+        draw_slim_header(frame, rows[0], self.ctx, "sync")
         frame.render_widget(
-            Paragraph(Text([Line(chip_spans([
-                ("target", f"{host}:{repo}", theme.CHIP_VALUE_STYLE),
-            ]))])).style(theme.BASE_STYLE),
-            rows[2],
-        )
-        # Status line: green when finished ok, amber while stopping / ended-nonzero.
-        status = self.stream.status
-        st_style = theme.OK_STYLE if status.startswith("✓") else (
-            theme.WARN_STYLE if self.stream.ended else theme.STATUS_VALUE_STYLE)
-        frame.render_widget(
-            Paragraph(Text([Line([Span(status, st_style)])])).style(theme.BASE_STYLE),
-            rows[3],
-        )
-        self.stream.draw_log(frame, rows[4], title="rsync")
+            Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
+        frame.render_widget(Paragraph(Text(self._body_lines(rows[2].width))
+                                      ).style(theme.BASE_STYLE), rows[2])
+        if self._msg:
+            frame.render_widget(
+                Paragraph(Text([Line([Span(f"  {self._msg}", self._msg_style())])])
+                ).style(theme.BASE_STYLE), rows[3])
+        frame.render_widget(hint_slot_line(self._focused_hint(), rows[4].width,
+                                           keys=(("↑↓/jk", "move"), ("⏎", "edit·sync"),
+                                                 ("q", "back"))), rows[4])
+
+    def _stream_header_right(self) -> list[Span]:
+        host = self.ctx.cfg["LEKIWI_HOST"]
+        repo = self.ctx.cfg["PI_REPO"]
         if self.stream.running:
+            state = [Span("● SYNC", theme.TITLE_STYLE),
+                     Span(f"  {host}:{repo}", theme.MUTED_STYLE)]
+        else:
+            st = self.stream.status
+            state = [Span(st, theme.OK_STYLE if st.startswith("✓") else theme.WARN_STYLE),
+                     Span(f"  {host}:{repo}", theme.MUTED_STYLE)]
+        return state + [Span("   ", theme.BASE_STYLE), *mode_chip_spans()]
+
+    def _draw_stream(self, frame: Any, area: Any) -> None:
+        rows = (Layout().direction(Direction.Vertical).constraints(
+            [Constraint.length(1), Constraint.length(1), Constraint.fill(1),
+             Constraint.length(1)]).split(area))
+        draw_slim_header(frame, rows[0], self.ctx, "sync", self._stream_header_right())
+        frame.render_widget(
+            Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
+        self.stream.draw_log(frame, rows[2],
+                             title="rsync · live" if self.stream.running else "rsync")
+        if self.stream.running:
+            # q also STOPS here (not background): leaving would orphan the rsync.
             hint = [("s", "stop"), ("Ctrl+C", "stop"), ("q", "stop + back")]
         else:
             hint = [("⏎", "relaunch"), ("q", "back")]
-        self._hint(frame, rows[5], hint)
-
-    def _header(self, frame: Any, area: Any) -> None:
-        frame.render_widget(
-            Paragraph(Text([Line([
-                Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE),
-                Span("  sync to Pi", theme.SUBTITLE_STYLE),
-            ])])).style(theme.BASE_STYLE),
-            area,
-        )
-
-    def _info(self) -> Paragraph:
-        return Paragraph(Text([
-            Line([Span(
-                "mirror laptop → Pi; the editable installs re-run automatically when deps change",
-                theme.MUTED_STYLE,
-            )]),
-        ])).style(theme.BASE_STYLE)
-
-    @staticmethod
-    def _collapse(path: "Path") -> str:
-        home = str(Path.home())
-        s = str(path)
-        return "~" + s[len(home):] if s.startswith(home) else s
+        frame.render_widget(keycap_hint_line(hint), rows[3])
 
     def _path_display(self, key: str, resolved: "Path") -> str:
         raw = str(self.ctx.cfg[key]).strip()
-        return raw if raw else f"{self._collapse(resolved)}  (auto)"
-
-    def _source_rows(self, frame: Any, area: Any) -> None:
-        """The two editable source rows, each with a muted provenance sub-line (what
-        version/branch that path currently holds — a wrong checkout is caught by eye)."""
-        cur = self.FIELDS[self._fpos]
-        lines = [
-            option_line(
-                "lerobot",
-                self._path_display("LOCAL_REPO", self._repo_dir),
-                "",
-                focused=cur == "repo",
-                label_width=LABEL_W_FIELD,
-                width=area.width,
-            ),
-            Line([Span(f"           └ {self._repo_prov}", theme.MUTED_STYLE)]),
-            option_line(
-                "plugin",
-                self._path_display("LOCAL_PLUGIN", self._plugin_dir),
-                "",
-                focused=cur == "plugin",
-                label_width=LABEL_W_FIELD,
-                width=area.width,
-            ),
-            Line([Span(f"           └ {self._plugin_prov}", theme.MUTED_STYLE)]),
-        ]
-        frame.render_widget(Paragraph(Text(lines)).style(theme.BASE_STYLE), area)
-
-    def _dest_line(self) -> Paragraph:
-        host = self.ctx.cfg["LEKIWI_HOST"]
-        repo = self.ctx.cfg["PI_REPO"]
-        return Paragraph(Text([Line(chip_spans([
-            ("dest", f"{host}:{repo}  (+ plugin)", theme.CHIP_VALUE_STYLE),
-        ]))])).style(theme.BASE_STYLE)
-
-    def _install_row(self, width: int) -> Paragraph:
-        return Paragraph(Text([option_line(
-            "install",
-            theme.choice("force" if self._force else "auto"),
-            "auto = reinstall only when deps changed · force = reinstall this run",
-            focused=self.FIELDS[self._fpos] == "install",
-            label_width=LABEL_W_FIELD,
-            width=width,
-        )])).style(theme.BASE_STYLE)
-
-    def _sync_row(self) -> Paragraph:
-        return Paragraph(Text([option_line(
-            f"{theme.play_mark()} Sync now",
-            "mirror + install check over SSH",
-            focused=self.FIELDS[self._fpos] == "sync",
-            label_width=LABEL_W_ACTION,
-            label_unfocused_style=theme.TEXT_STYLE,
-        )])).style(theme.BASE_STYLE)
+        return raw if raw else f"{collapse_home(resolved)}  (auto)"
 
     def _msg_style(self):
         # ✓ = ok (green); the "✗ … not found" / other lines = warn (amber).
         return theme.OK_STYLE if self._msg.startswith("✓") else theme.WARN_STYLE
-
-    def _hint(self, frame: Any, area: Any, pairs) -> None:
-        frame.render_widget(keycap_hint_line(pairs), area)
 
 
 def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001
