@@ -310,4 +310,18 @@ if [[ "$dry" == "1" ]]; then
   exit 0
 fi
 
+# ── preflight: will this checkpoint's config even load? ──────────────────────
+# A checkpoint trained on a lerobot with a config field this one lacks (an unreleased
+# fix, a local patch, a policy plugin) fails inside draccus with a ~60-line traceback,
+# and it fails AFTER the form is filled, the GPU chosen and the robot about to move.
+# ckpt_preflight.py answers that question in one paragraph first. It exits non-zero
+# ONLY when the config genuinely will not load; "cannot tell" (hub repo id, no
+# config.json, lerobot not importable) passes through silently, because a preflight
+# that blocks a working launch is worse than no preflight. Verdicts are cached, so
+# only the first launch of a new checkpoint pays the import.
+# Escape hatch: EVAL_SKIP_PREFLIGHT=1 (dry-run skips it already, one exit above).
+if [[ "${EVAL_SKIP_PREFLIGHT:-0}" != "1" ]]; then
+  "$PY" "$SCRIPT_DIR/ckpt_preflight.py" "$policy" || exit $?
+fi
+
 exec "${argv[@]}"
