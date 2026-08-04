@@ -118,23 +118,26 @@ def test_main_never_blocks_on_being_called_wrong():
 # ── eval.sh wiring ────────────────────────────────────────────────────────────
 
 
-def _fake_python(tmp_path: Path, preflight_exit: int) -> Path:
-    """A `python` earlier on PATH: it logs its argv, fails the preflight with
-    *preflight_exit*, and stands in for the rollout shim otherwise."""
+def _fake_bins(tmp_path: Path, preflight_exit: int) -> Path:
+    """A bin dir to put earlier on PATH: a `python` that logs its argv and fails the
+    preflight with *preflight_exit* (falling through to the real interpreter for the
+    cfg_slice / cfg_get helpers), plus a `lerobot-rollout` standing in for the launch."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    fake = bin_dir / "python"
-    fake.write_text(
+    python = bin_dir / "python"
+    python.write_text(
         "#!/usr/bin/env bash\n"
         f'echo "$@" >> {tmp_path}/argv.log\n'
         'case "$1" in\n'
         f'  *ckpt_preflight.py) exit {preflight_exit} ;;\n'
-        '  *lerobot_rollout_kbd.py) echo ROLLOUT_RAN; exit 0 ;;\n'
-        # the cfg_slice / cfg_get helpers also run through `python`
-        '  -) exec /usr/bin/env python3 "$@" ;;\n'
         '  *) exec /usr/bin/env python3 "$@" ;;\n'
         'esac\n')
-    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    rollout = bin_dir / "lerobot-rollout"
+    rollout.write_text("#!/usr/bin/env bash\n"
+                       f'echo "rollout $@" >> {tmp_path}/argv.log\n'
+                       "echo ROLLOUT_RAN\n")
+    for f in (python, rollout):
+        f.chmod(f.stat().st_mode | stat.S_IEXEC)
     return bin_dir
 
 
@@ -147,25 +150,25 @@ def _run_eval(tmp_path: Path, bin_dir: Path, policy: Path):
 
 def test_eval_sh_aborts_when_the_preflight_refuses(tmp_path):
     policy = _ckpt(tmp_path)
-    r = _run_eval(tmp_path, _fake_python(tmp_path, preflight_exit=2), policy)
+    r = _run_eval(tmp_path, _fake_bins(tmp_path, preflight_exit=2), policy)
     assert r.returncode == 2
     assert "ROLLOUT_RAN" not in r.stdout
     log = (tmp_path / "argv.log").read_text()
-    assert "ckpt_preflight.py" in log and "lerobot_rollout_kbd.py" not in log
+    assert "ckpt_preflight.py" in log and "rollout " not in log
 
 
 def test_eval_sh_runs_the_rollout_when_the_preflight_passes(tmp_path):
     policy = _ckpt(tmp_path)
-    r = _run_eval(tmp_path, _fake_python(tmp_path, preflight_exit=0), policy)
+    r = _run_eval(tmp_path, _fake_bins(tmp_path, preflight_exit=0), policy)
     assert r.returncode == 0 and "ROLLOUT_RAN" in r.stdout
     log = (tmp_path / "argv.log").read_text()
-    assert log.index("ckpt_preflight.py") < log.index("lerobot_rollout_kbd.py"), "preflight runs FIRST"
+    assert log.index("ckpt_preflight.py") < log.index("rollout "), "preflight runs FIRST"
 
 
 def test_dry_run_stays_offline(tmp_path):
     """The parity gate must not import lerobot: dry-run exits before the preflight."""
     policy = _ckpt(tmp_path)
-    env = dict(os.environ, PATH=f"{_fake_python(tmp_path, 2)}:{os.environ['PATH']}", DRY="1")
+    env = dict(os.environ, PATH=f"{_fake_bins(tmp_path, 2)}:{os.environ['PATH']}", DRY="1")
     r = subprocess.run(["bash", str(EVAL_SH), "--policy", str(policy)],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 0 and "ckpt_preflight.py" not in (tmp_path / "argv.log").read_text()
