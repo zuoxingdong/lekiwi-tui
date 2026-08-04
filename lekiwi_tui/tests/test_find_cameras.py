@@ -1,0 +1,153 @@
+"""Listing the ROBOT's camera nodes: the emitted bash and its refusals.
+
+The device nodes in lekiwi.yaml are Pi-side and renumber themselves, so the TUI has to be
+able to ask what exists. There is no key for it: the preview (`p`) shows this listing when a
+configured node fails, which is the only moment the answer is needed. The launcher keeps the
+payload for CLI use, and these tests pin it — including that the fast path opens no device
+and needs no lerobot env.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from lekiwi_tui import ROOT
+from lekiwi_tui.screens.robot_config import build_find_cameras_argv
+
+from conftest import make_ctx
+
+FIND_SH = ROOT / "scripts" / "find_cameras.sh"
+
+
+def _emit(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["bash", str(FIND_SH), *args], capture_output=True, text=True)
+
+
+# ── the emitted remote bash ───────────────────────────────────────────────────
+
+
+def test_the_default_probe_opens_nothing_and_needs_no_lerobot():
+    """lerobot's probe OPENS every /dev/video*, which on a Pi means the ISP nodes and each
+    camera's metadata node, at ~3s and a wall of V4L2 warnings each (observed on the robot).
+    sysfs answers the same question instantly, and without the lerobot env at all."""
+    out = _emit("emit-detect")
+    assert out.returncode == 0
+    assert "/sys/class/video4linux" in out.stdout
+    assert "lerobot" not in out.stdout and "mamba" not in out.stdout
+    # the two facts that actually identify a camera
+    assert "$node/name" in out.stdout, "the product name is what tells wrist from top"
+    assert "by-path" in out.stdout, "the reboot-stable id belongs next to the volatile node"
+
+
+def test_the_fast_probe_runs_and_separates_capture_from_the_rest():
+    """Executed for real: on a machine with no cameras (CI) it must still exit 0 and say so
+    rather than erroring, and it must never mix metadata/ISP nodes into the camera list."""
+    body = _emit("emit-detect").stdout
+    out = subprocess.run(["bash", "-c", body], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "CAPTURE NODES" in out.stdout
+    assert "OTHER v4l2 NODES" in out.stdout
+
+
+def test_the_deep_probe_is_the_lerobot_one_and_is_list_only():
+    """--record-time 0 keeps lerobot's printout and writes no frames on the Pi."""
+    out = _emit("emit-detect", "--deep", "--conda-env", "lekiwi")
+    assert out.returncode == 0
+    assert "lerobot-find-cameras opencv" in out.stdout
+    assert "--record-time-s 0" in out.stdout
+    assert "--output-dir /tmp/lekiwi-find-cameras" in out.stdout, "never the Pi's home"
+    assert "mamba activate lekiwi" in out.stdout
+
+
+def test_frames_are_opt_in_and_the_backend_widens_on_request():
+    out = _emit("emit-detect", "--deep", "--conda-env", "lekiwi", "--backend", "all", "--record-time", "2")
+    assert "--record-time-s 2" in out.stdout
+    # `all` means no type filter, so realsense is probed too
+    assert "lerobot-find-cameras  \\" in out.stdout
+    assert "record-time 2s" in out.stdout, "the remote banner states what it is about to do"
+
+
+def test_realsense_only_is_expressible():
+    assert "lerobot-find-cameras realsense" in _emit(
+        "emit-detect", "--deep", "--conda-env", "lekiwi", "--backend", "realsense").stdout
+
+
+@pytest.mark.parametrize(("args", "message"), [
+    (("emit-detect", "--deep", "--conda-env", "bad env"), "whitespace"),
+    (("emit-detect", "--conda-env", "lekiwi", "--backend", "usb"), "--backend must be"),
+    (("emit-detect", "--conda-env", "lekiwi", "--record-time", "2.5"), "whole number"),
+    (("emit-detect", "--conda-env", "lekiwi", "--warmup", "-1"), "whole number"),
+    (("emit-detect", "--conda-env", "lekiwi", "--nope"), "unknown flag"),
+    (("wat", "--conda-env", "lekiwi"), "unknown subcommand"),
+])
+def test_the_emitter_refuses_bad_input(args, message):
+    out = _emit(*args)
+    assert out.returncode == 2 and message in out.stderr
+
+
+def test_a_missing_env_is_rejected_rather_than_emitted():
+    """An empty conda env would emit `mamba activate` with no argument (deep path only —
+    the fast path never activates anything)."""
+    out = _emit("emit-detect", "--deep", "--conda-env", "")
+    assert out.returncode == 2 and "must not be empty" in out.stderr
+
+
+# ── the ssh argv ──────────────────────────────────────────────────────────────
+
+
+def test_the_argv_is_ssh_plus_the_emitted_payload():
+    argv = build_find_cameras_argv(make_ctx(gpu_name=""))
+    assert argv[0] == "ssh"
+    assert "ConnectTimeout=5" in argv, "a powered-down robot must not hang the suspend"
+    assert "-t" not in argv, "nothing here reads keys; -t would only complicate the suspend"
+    assert "/sys/class/video4linux" in argv[-1]
+    assert "lerobot" not in argv[-1], "the key must not depend on the Pi's lerobot install"
+
+
+# ── the Pi is often older than the laptop ─────────────────────────────────────
+
+
+def _fake_cli(tmp_path: Path, *, supports_warmup: bool) -> Path:
+    """A stand-in `lerobot-find-cameras`: the older one exits 2 on an unknown flag,
+    exactly as argparse does, which is how this bug showed up on the robot."""
+    bin_dir = tmp_path / ("new" if supports_warmup else "old")
+    bin_dir.mkdir(parents=True)
+    cli = bin_dir / "lerobot-find-cameras"
+    help_line = ("usage: lerobot-find-cameras [--output-dir DIR] [--record-time-s N]"
+                 + (" [--warmup-s N]" if supports_warmup else ""))
+    reject = ("" if supports_warmup else
+              'for a in "$@"; do [[ "$a" == "--warmup-s" ]] && '
+              '{ echo "error: unrecognized arguments: --warmup-s" >&2; exit 2; }; done\n')
+    cli.write_text("#!/usr/bin/env bash\n"
+                   f'if [[ "$1" == "--help" ]]; then echo "{help_line}"; exit 0; fi\n'
+                   f"{reject}"
+                   'echo "PROBED: $*"\n')
+    cli.chmod(0o755)
+    return bin_dir
+
+
+def _run_remote_body(tmp_path: Path, *, supports_warmup: bool) -> subprocess.CompletedProcess:
+    """Execute the emitted payload locally, minus the mamba lines, against a fake CLI."""
+    emitted = _emit("emit-detect", "--deep", "--conda-env", "lekiwi").stdout
+    body = "\n".join(ln for ln in emitted.splitlines()
+                     if "mamba" not in ln and 'eval "' not in ln)
+    env = dict(os.environ, PATH=f"{_fake_cli(tmp_path, supports_warmup=supports_warmup)}:{os.environ['PATH']}")
+    return subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env)
+
+
+def test_an_older_pi_is_probed_without_the_flag_it_lacks(tmp_path):
+    """--warmup-s arrived with the find-cameras lifecycle fix; the robot is often behind,
+    and argparse exits 2 on an unknown flag instead of probing (observed on the robot)."""
+    out = _run_remote_body(tmp_path, supports_warmup=False)
+    assert out.returncode == 0, out.stderr
+    assert "PROBED: opencv --output-dir /tmp/lekiwi-find-cameras --record-time-s 0" in out.stdout
+    assert "--warmup-s" not in out.stdout
+
+
+def test_a_newer_pi_gets_the_warmup(tmp_path):
+    out = _run_remote_body(tmp_path, supports_warmup=True)
+    assert out.returncode == 0, out.stderr
+    assert "--warmup-s 1" in out.stdout

@@ -9,9 +9,13 @@ form — so this screen DISPLAYS the values and opens ``$EDITOR`` to change them
 is the right tool. (Settings writes back the flat ``_launcher:`` knobs losslessly; this
 screen stays read-only by design — there is no Save.)
 
-Keys mirror the bash ``do_robot_config`` case exactly: ``e`` suspends the app and runs
+Keys follow the bash ``do_robot_config`` case: ``e`` suspends the app and runs
 ``$EDITOR lekiwi.yaml``, then re-reads from disk and repaints; ``r`` does the same reload
-without editing; ``q`` / ``Esc`` pop back. No motion keys — this is a static panel.
+without editing; ``q`` / ``Esc`` pop back. No motion keys — this is a static panel. ``f``
+is the one addition: it lists the ROBOT's cameras over ssh, because the device nodes shown
+here are Pi-side and renumber themselves. When a configured node has gone, the preview
+shows what the robot HAS instead (:func:`build_find_cameras_argv`), so one key answers both
+"is this the right lens" and "where did it go".
 
 Immediate-mode notes
 --------------------
@@ -36,12 +40,12 @@ from typing import TYPE_CHECKING, Any
 
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
-from .. import CFG_FILE
+from .. import CFG_FILE, ROOT
 from ..config import Config, cameras_summary, cfg_get, collapse_home, load_yaml, resolve_editor
 from ..framework import theme
 from ..framework.widgets import wrap_words
 from ..framework.events import ESC, Key
-from ..framework.screen import Invoke, Nothing, Pop, ScreenState
+from ..framework.screen import Invoke, Nothing, Pop, Push, ScreenState
 from .chrome import draw_slim_header, hint_slot_line, mode_chip_spans
 
 if TYPE_CHECKING:
@@ -89,6 +93,33 @@ _SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
 _LABEL_W = 15
 
 
+#: The launcher that owns the remote camera-probe bash — the SOLE argv source, fronted
+#: and never re-translated (same seam as host.sh for the host commands).
+FIND_CAMERAS_SCRIPT = ROOT / "scripts" / "find_cameras.sh"
+
+
+def build_find_cameras_argv(ctx: "Context") -> list[str]:
+    """`ssh <host> "<emit-detect remote bash>"` — the fast sysfs listing.
+
+    No conda env is passed: reading sysfs needs neither python nor lerobot, so this also
+    works on a Pi whose env is broken, and it cannot trip over a lerobot CLI that is older
+    than the laptop's. `--deep` (lerobot's own probe, which opens every device) stays a CLI
+    choice rather than a key, since `p` answers "does this camera actually work" better.
+
+    ConnectTimeout keeps a powered-down robot from hanging the suspend; no `-t`, because
+    nothing here reads keys — the value is the printed device list, which the operator
+    copies into lekiwi.yaml with `e`.
+    """
+    import subprocess
+
+    from ..remote import validate_ssh_host
+
+    host = validate_ssh_host(ctx.cfg["LEKIWI_HOST"])
+    remote = subprocess.check_output(
+        ["bash", str(FIND_CAMERAS_SCRIPT), "emit-detect"], text=True)
+    return ["ssh", "-o", "ConnectTimeout=5", host, remote]
+
+
 class RobotConfigScreen(ScreenState):
     """Read-only view of lekiwi.yaml core values. ``e`` edits in ``$EDITOR``, ``r`` reloads,
     ``q``/``Esc`` pops back. Values are re-read live from disk on construction and after each
@@ -117,7 +148,30 @@ class RobotConfigScreen(ScreenState):
             return Invoke(self._edit)
         if name == "r":
             return Invoke(self._reload)
+        if name == "p":
+            return self._preview_cameras()
         return Nothing
+
+    def _preview_cameras(self) -> Any:
+        """``p``: push the ~5 fps preview, so a lens can be identified by looking at it.
+
+        Same host guard as ``f`` and for the same reason: the capture needs the devices,
+        which the host session holds. The preview reads the configured `_cameras` block,
+        so it previews exactly what the yaml claims — which is what makes a wrong mapping
+        or a wrong rotation visible.
+        """
+        from ..hostprobe import host_alive
+        from .camera_preview import CameraPreviewScreen, configured_cameras
+
+        if host_alive(self.ctx) is True:
+            self.app.notify(
+                "host session is running and holds the cameras — stop it first, then p again",
+                "warn")
+            return Nothing
+        if not configured_cameras(self.ctx.doc):
+            self.app.notify("no cameras with an index_or_path in lekiwi.yaml", "warn")
+            return Nothing
+        return Push(CameraPreviewScreen(self.app, self.ctx))
 
     async def _edit(self) -> None:
         """``e``: suspend the app and open ``$EDITOR`` on lekiwi.yaml, then reload. The CLI
@@ -152,10 +206,12 @@ class RobotConfigScreen(ScreenState):
         frame.render_widget(
             Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
         frame.render_widget(self._body(), rows[2])
+        # p is named in the TEXT too, not only in the keycaps: the keycap row is the first
+        # thing dropped on a narrow terminal, and a key nobody can see does not exist.
         frame.render_widget(hint_slot_line(
-            "read-only view — e edits lekiwi.yaml, r reloads after editing",
+            "read-only — e edits lekiwi.yaml, r reloads, p previews the robot cameras",
             rows[3].width,
-            keys=(("e", f"edit in {resolve_editor()}"), ("r", "reload"), ("q", "back"))),
+            keys=(("e", "edit"), ("r", "reload"), ("p", "preview"), ("q", "back"))),
             rows[3])
 
     # ── body rendering (sections → lines, ported from the original's Text builders) ──

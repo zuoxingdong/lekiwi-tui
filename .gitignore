@@ -1,7 +1,7 @@
 # Local robot configuration. Publish lekiwi.example.yaml instead.
 lekiwi.yaml
-# ...and the snapshots the Settings screen / hand-edits leave behind, which carry the
-# same local IPs, paths and tuning history.
+# ...and the snapshots the Settings screen, the camera preview's rotation save and
+# hand-edits leave behind, which carry the same local IPs, paths and tuning history.
 lekiwi.yaml.bak*
 
 __pycache__/

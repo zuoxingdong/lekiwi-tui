@@ -209,13 +209,32 @@ def hint_slot_line(hint: str, width: int,
                                                       ("⏎", "edit·start"), ("q", "back")),
                    ) -> Paragraph:
     """The single footer hint slot: the FOCUSED element's documentation on the left,
-    global keycaps on the right. The ONLY place interaction hints render."""
+    global keycaps on the right. The ONLY place interaction hints render.
+
+    Degrades in two steps rather than one. padded_line drops the right side wholesale on
+    overflow, so on a ~120-column terminal a four-key row took the keycaps with it and the
+    screen silently stopped advertising its keys (observed on Robot config, where `p` went
+    missing). Labels are dropped first, keeping the keycaps themselves, which are the part
+    that cannot be guessed.
+    """
+    return Paragraph(Text([hint_slot_row(hint, width, keys)])).style(theme.BASE_STYLE)
+
+
+def hint_slot_row(hint: str, width: int,
+                  keys: Sequence[tuple[str, str]] = (("q", "back"),)) -> Line:
+    """The hint row as a Line, so its degradation is testable (a Paragraph is opaque)."""
     left = [Span("  ", theme.BASE_STYLE), Span(theme.key_label(hint), theme.FAINT_STYLE)]
-    right: list[Span] = []
+    labelled: list[Span] = []
+    caps_only: list[Span] = []
     for k, lab in keys:
-        right.append(Span(f" {theme.key_label(k)} ", theme.KEYCAP_STYLE))
-        right.append(Span(f" {lab}  ", theme.HINT_STYLE))
-    return Paragraph(Text([padded_line(left, right, int(width))])).style(theme.BASE_STYLE)
+        cap = Span(f" {theme.key_label(k)} ", theme.KEYCAP_STYLE)
+        labelled += [cap, Span(f" {lab}  ", theme.HINT_STYLE)]
+        caps_only += [cap, Span(" ", theme.BASE_STYLE)]
+    used_left = sum(len(sp.content) for sp in left)
+    for right in (labelled, caps_only):
+        if used_left + sum(len(sp.content) for sp in right) < int(width):
+            return padded_line(left, right, int(width))
+    return padded_line(left, [], int(width))
 
 
 def plan_row(label: str, plan_spans: "list[Span] | str", *, focused: bool,
