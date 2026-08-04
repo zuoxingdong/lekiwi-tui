@@ -48,4 +48,11 @@ target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
+# The rule set is stated explicitly rather than inherited. ruff 0.16 widened its
+# DEFAULT selection (UP/BLE/S/PLW/DTZ/I…), and since CI installs `ruff>=0.6.0` it
+# floats to the newest release: a lint contract that changes on someone else's
+# release date fails CI on commits that did not touch the code. These four are the
+# pre-0.16 default (pyflakes + the pycodestyle errors that matter); widening is a
+# deliberate edit, not a surprise.
+select = ["E4", "E7", "E9", "F"]
 ignore = ["E702"]
