@@ -9,9 +9,11 @@ form — so this screen DISPLAYS the values and opens ``$EDITOR`` to change them
 is the right tool. (Settings writes back the flat ``_launcher:`` knobs losslessly; this
 screen stays read-only by design — there is no Save.)
 
-Keys mirror the bash ``do_robot_config`` case exactly: ``e`` suspends the app and runs
+Keys follow the bash ``do_robot_config`` case: ``e`` suspends the app and runs
 ``$EDITOR lekiwi.yaml``, then re-reads from disk and repaints; ``r`` does the same reload
-without editing; ``q`` / ``Esc`` pop back. No motion keys — this is a static panel.
+without editing; ``q`` / ``Esc`` pop back. No motion keys — this is a static panel. ``f``
+is the one addition: it lists the ROBOT's cameras over ssh, because the device nodes shown
+here are Pi-side and renumber themselves (see :func:`build_find_cameras_argv`).
 
 Immediate-mode notes
 --------------------
@@ -36,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
-from .. import CFG_FILE
+from .. import CFG_FILE, ROOT
 from ..config import Config, cameras_summary, cfg_get, collapse_home, load_yaml, resolve_editor
 from ..framework import theme
 from ..framework.widgets import wrap_words
@@ -89,6 +91,31 @@ _SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
 _LABEL_W = 15
 
 
+#: The launcher that owns the remote camera-probe bash — the SOLE argv source, fronted
+#: and never re-translated (same seam as host.sh for the host commands).
+FIND_CAMERAS_SCRIPT = ROOT / "scripts" / "find_cameras.sh"
+
+
+def build_find_cameras_argv(ctx: "Context") -> list[str]:
+    """`ssh <host> "<emit-detect remote bash>"`, list-only.
+
+    ConnectTimeout keeps a powered-down robot from hanging the suspend; no `-t`, because
+    nothing here reads keys — the value is the printed device list, which the operator
+    copies into lekiwi.yaml with `e`.
+    """
+    import subprocess
+
+    from ..remote import validate_remote_name, validate_ssh_host
+
+    host = validate_ssh_host(ctx.cfg["LEKIWI_HOST"])
+    conda_env = validate_remote_name(ctx.cfg["CONDA_ENV"], "conda env")
+    remote = subprocess.check_output(
+        ["bash", str(FIND_CAMERAS_SCRIPT), "emit-detect", "--conda-env", conda_env],
+        text=True,
+    )
+    return ["ssh", "-o", "ConnectTimeout=5", host, remote]
+
+
 class RobotConfigScreen(ScreenState):
     """Read-only view of lekiwi.yaml core values. ``e`` edits in ``$EDITOR``, ``r`` reloads,
     ``q``/``Esc`` pops back. Values are re-read live from disk on construction and after each
@@ -117,7 +144,36 @@ class RobotConfigScreen(ScreenState):
             return Invoke(self._edit)
         if name == "r":
             return Invoke(self._reload)
+        if name == "f":
+            return Invoke(self._detect_cameras)
         return Nothing
+
+    async def _detect_cameras(self) -> None:
+        """``f``: list the ROBOT's cameras, over ssh.
+
+        The `index_or_path` values on this screen are Pi-side device nodes, and a bare
+        /dev/videoN is not reboot/replug-stable — adding a camera renumbers the others.
+        Probing locally would enumerate the laptop's webcam and answer a question nobody
+        asked, so this runs `lerobot-find-cameras` on the robot.
+
+        Refused while the host session is up: that process has every camera open, so the
+        probe would report failures for exactly the devices that are working. `None`
+        (probe still in flight, or no host configured) is allowed through — a maybe is not
+        a reason to block, and the remote output will say what happened.
+        """
+        from ..hostprobe import host_alive
+
+        if host_alive(self.ctx) is True:
+            self.app.notify(
+                "host session is running and holds the cameras — stop it first, then f again",
+                "warn")
+            return
+        try:
+            argv = build_find_cameras_argv(self.ctx)
+        except SystemExit as exc:              # die_usage in the emitter / validators
+            self.app.notify(f"cannot probe cameras: {exc}", "error")
+            return
+        await self.app.suspend(argv)
 
     async def _edit(self) -> None:
         """``e``: suspend the app and open ``$EDITOR`` on lekiwi.yaml, then reload. The CLI
@@ -155,7 +211,8 @@ class RobotConfigScreen(ScreenState):
         frame.render_widget(hint_slot_line(
             "read-only view — e edits lekiwi.yaml, r reloads after editing",
             rows[3].width,
-            keys=(("e", f"edit in {resolve_editor()}"), ("r", "reload"), ("q", "back"))),
+            keys=(("e", f"edit in {resolve_editor()}"), ("r", "reload"),
+                  ("f", "detect cameras on the robot"), ("q", "back"))),
             rows[3])
 
     # ── body rendering (sections → lines, ported from the original's Text builders) ──
