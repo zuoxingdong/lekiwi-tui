@@ -31,9 +31,32 @@ def _emit(*args: str) -> subprocess.CompletedProcess:
 # ── the emitted remote bash ───────────────────────────────────────────────────
 
 
-def test_the_default_probe_is_list_only():
+def test_the_default_probe_opens_nothing_and_needs_no_lerobot():
+    """lerobot's probe OPENS every /dev/video*, which on a Pi means the ISP nodes and each
+    camera's metadata node, at ~3s and a wall of V4L2 warnings each (observed on the robot).
+    sysfs answers the same question instantly, and without the lerobot env at all."""
+    out = _emit("emit-detect")
+    assert out.returncode == 0
+    assert "/sys/class/video4linux" in out.stdout
+    assert "lerobot" not in out.stdout and "mamba" not in out.stdout
+    # the two facts that actually identify a camera
+    assert "$node/name" in out.stdout, "the product name is what tells wrist from top"
+    assert "by-path" in out.stdout, "the reboot-stable id belongs next to the volatile node"
+
+
+def test_the_fast_probe_runs_and_separates_capture_from_the_rest():
+    """Executed for real: on a machine with no cameras (CI) it must still exit 0 and say so
+    rather than erroring, and it must never mix metadata/ISP nodes into the camera list."""
+    body = _emit("emit-detect").stdout
+    out = subprocess.run(["bash", "-c", body], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "CAPTURE NODES" in out.stdout
+    assert "OTHER v4l2 NODES" in out.stdout
+
+
+def test_the_deep_probe_is_the_lerobot_one_and_is_list_only():
     """--record-time 0 keeps lerobot's printout and writes no frames on the Pi."""
-    out = _emit("emit-detect", "--conda-env", "lekiwi")
+    out = _emit("emit-detect", "--deep", "--conda-env", "lekiwi")
     assert out.returncode == 0
     assert "lerobot-find-cameras opencv" in out.stdout
     assert "--record-time-s 0" in out.stdout
@@ -42,7 +65,7 @@ def test_the_default_probe_is_list_only():
 
 
 def test_frames_are_opt_in_and_the_backend_widens_on_request():
-    out = _emit("emit-detect", "--conda-env", "lekiwi", "--backend", "all", "--record-time", "2")
+    out = _emit("emit-detect", "--deep", "--conda-env", "lekiwi", "--backend", "all", "--record-time", "2")
     assert "--record-time-s 2" in out.stdout
     # `all` means no type filter, so realsense is probed too
     assert "lerobot-find-cameras  \\" in out.stdout
@@ -51,11 +74,11 @@ def test_frames_are_opt_in_and_the_backend_widens_on_request():
 
 def test_realsense_only_is_expressible():
     assert "lerobot-find-cameras realsense" in _emit(
-        "emit-detect", "--conda-env", "lekiwi", "--backend", "realsense").stdout
+        "emit-detect", "--deep", "--conda-env", "lekiwi", "--backend", "realsense").stdout
 
 
 @pytest.mark.parametrize(("args", "message"), [
-    (("emit-detect", "--conda-env", "bad env"), "whitespace"),
+    (("emit-detect", "--deep", "--conda-env", "bad env"), "whitespace"),
     (("emit-detect", "--conda-env", "lekiwi", "--backend", "usb"), "--backend must be"),
     (("emit-detect", "--conda-env", "lekiwi", "--record-time", "2.5"), "whole number"),
     (("emit-detect", "--conda-env", "lekiwi", "--warmup", "-1"), "whole number"),
@@ -68,8 +91,9 @@ def test_the_emitter_refuses_bad_input(args, message):
 
 
 def test_a_missing_env_is_rejected_rather_than_emitted():
-    """An empty conda env would emit `mamba activate` with no argument."""
-    out = _emit("emit-detect", "--conda-env", "")
+    """An empty conda env would emit `mamba activate` with no argument (deep path only —
+    the fast path never activates anything)."""
+    out = _emit("emit-detect", "--deep", "--conda-env", "")
     assert out.returncode == 2 and "must not be empty" in out.stderr
 
 
@@ -81,7 +105,8 @@ def test_the_argv_is_ssh_plus_the_emitted_payload():
     assert argv[0] == "ssh"
     assert "ConnectTimeout=5" in argv, "a powered-down robot must not hang the suspend"
     assert "-t" not in argv, "nothing here reads keys; -t would only complicate the suspend"
-    assert "lerobot-find-cameras" in argv[-1]
+    assert "/sys/class/video4linux" in argv[-1]
+    assert "lerobot" not in argv[-1], "the key must not depend on the Pi's lerobot install"
 
 
 # ── the screen key ────────────────────────────────────────────────────────────
@@ -130,7 +155,7 @@ def test_it_probes_when_the_host_is_down_or_unknown(monkeypatch):
         app, screen = _screen(monkeypatch, alive)
         asyncio.run(screen._detect_cameras())
         assert app.suspended is not None and app.suspended[0] == "ssh"
-        assert "lerobot-find-cameras" in app.suspended[-1]
+        assert "/sys/class/video4linux" in app.suspended[-1]
         assert app.toasts == []
 
 
@@ -164,7 +189,7 @@ def _fake_cli(tmp_path: Path, *, supports_warmup: bool) -> Path:
 
 def _run_remote_body(tmp_path: Path, *, supports_warmup: bool) -> subprocess.CompletedProcess:
     """Execute the emitted payload locally, minus the mamba lines, against a fake CLI."""
-    emitted = _emit("emit-detect", "--conda-env", "lekiwi").stdout
+    emitted = _emit("emit-detect", "--deep", "--conda-env", "lekiwi").stdout
     body = "\n".join(ln for ln in emitted.splitlines()
                      if "mamba" not in ln and 'eval "' not in ln)
     env = dict(os.environ, PATH=f"{_fake_cli(tmp_path, supports_warmup=supports_warmup)}:{os.environ['PATH']}")

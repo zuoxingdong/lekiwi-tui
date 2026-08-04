@@ -97,7 +97,12 @@ FIND_CAMERAS_SCRIPT = ROOT / "scripts" / "find_cameras.sh"
 
 
 def build_find_cameras_argv(ctx: "Context") -> list[str]:
-    """`ssh <host> "<emit-detect remote bash>"`, list-only.
+    """`ssh <host> "<emit-detect remote bash>"` — the fast sysfs listing.
+
+    No conda env is passed: reading sysfs needs neither python nor lerobot, so this also
+    works on a Pi whose env is broken, and it cannot trip over a lerobot CLI that is older
+    than the laptop's. `--deep` (lerobot's own probe, which opens every device) stays a CLI
+    choice rather than a key, since `p` answers "does this camera actually work" better.
 
     ConnectTimeout keeps a powered-down robot from hanging the suspend; no `-t`, because
     nothing here reads keys — the value is the printed device list, which the operator
@@ -105,14 +110,11 @@ def build_find_cameras_argv(ctx: "Context") -> list[str]:
     """
     import subprocess
 
-    from ..remote import validate_remote_name, validate_ssh_host
+    from ..remote import validate_ssh_host
 
     host = validate_ssh_host(ctx.cfg["LEKIWI_HOST"])
-    conda_env = validate_remote_name(ctx.cfg["CONDA_ENV"], "conda env")
     remote = subprocess.check_output(
-        ["bash", str(FIND_CAMERAS_SCRIPT), "emit-detect", "--conda-env", conda_env],
-        text=True,
-    )
+        ["bash", str(FIND_CAMERAS_SCRIPT), "emit-detect"], text=True)
     return ["ssh", "-o", "ConnectTimeout=5", host, remote]
 
 
