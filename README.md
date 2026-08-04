@@ -12,8 +12,8 @@ train, evaluate, keep the Pi in sync. Runs real `lerobot` commands through the
   session time on every screen.
 - **One-terminal flow.** Start the host, hit `q`, it keeps running while you
   record or teleoperate. Come back and the live log re-attaches.
-- **Record HUD.** Episode progress, loop-rate gauge, and a dataset panel
-  (episodes, length, size, resume plan) before you commit.
+- **Dataset editor.** Browse episodes with anomaly flags, view them in Rerun,
+  delete or retag in place — every edit keeps a timestamped backup.
 - **Smart sync.** Mirrors the laptop checkouts to the Pi, re-installs only when
   dependencies changed, and prints exactly which version/branch ships.
 - **Panic stop.** `K` twice from any screen kills the remote host.
@@ -29,8 +29,6 @@ train, evaluate, keep the Pi in sync. Runs real `lerobot` commands through the
   [lerobot_robot_lekiwi_pincopen](https://github.com/zuoxingdong/lerobot_robot_lekiwi_pincopen)
   plugin on the Pi. Set up Pi / Sync to Pi install and ship it automatically.
   Driving an original (unmodified) LeKiwi instead: set `ROBOT_TYPE` to `lekiwi` in Settings.
-- Optional: `input` group membership enables base wasd keys in the record HUD
-  view. The terminal view needs no system changes.
 
 ## Install
 

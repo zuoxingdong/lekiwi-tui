@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from dataclasses import dataclass
 from collections.abc import Sequence
 from pathlib import Path
 
-from .config import cfg_get
+from . import CFG_FILE, ROOT
+from .config import cfg_get, dump_yaml_rt, load_yaml_rt
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def record_root(doc: dict | None = None, extra: Sequence[str] = ()) -> str:
@@ -132,3 +137,113 @@ def dataset_stats(root: str | Path) -> str:
         return ""
     return (f"{parts['episodes']} episodes · {parts['minutes']} min · "
             f"{parts['size']} · updated {parts['updated']}")
+
+
+# ── the record-dataset domain (moved from screens/record.py: screens must not
+#    import from screens; this module owns dataset logic) ────────────────────
+@dataclass(frozen=True)
+class DeleteTarget:
+    ok: bool
+    path: Path
+    reason: str = ""
+
+
+def dataset_defaults(doc: dict | None = None) -> dict:
+    """Per-run record defaults from the yaml `record` block (ported verbatim)."""
+    repo_id = str(cfg_get("record.dataset.repo_id", doc=doc) or "local/lekiwi_dataset")
+    root = str(cfg_get("record.dataset.root", doc=doc) or "../../datasets/lekiwi_dataset")
+    ns = repo_id.rsplit("/", 1)[0] if "/" in repo_id else "local"
+    parent = str(Path(root).parent) if str(Path(root).parent) != "." else ""
+
+    def _int(key: str, fallback: int) -> int:
+        v = cfg_get(f"record.dataset.{key}", doc=doc)
+        if isinstance(v, bool):
+            return fallback
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+        return fallback
+
+    def _bool(key: str, fallback: bool) -> bool:
+        v = cfg_get(f"record.dataset.{key}", doc=doc)
+        if v is None:
+            return fallback
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("1", "true", "on", "yes")
+
+    return {
+        "name": Path(root).name or "lekiwi_dataset",
+        "ns": ns, "parent": parent,
+        "task": str(cfg_get("record.dataset.single_task", doc=doc) or ""),
+        "episodes": _int("num_episodes", 5), "ep_time": _int("episode_time_s", 40),
+        "reset_time": _int("reset_time_s", 5), "fps": _int("fps", 30),
+        "img_threads": _int("num_image_writer_threads_per_camera", 3),
+        "display": bool(cfg_get("record.display_data", doc=doc)),
+        "streaming": _bool("streaming_encoding", True),
+        "resume": bool(cfg_get("record.resume", doc=doc)),
+    }
+
+
+def resolve_repo_root(name: str, ns: str, parent: str) -> tuple[str, str]:
+    """A dataset name -> (repo_id, root), preserving the yaml namespace + parent dir."""
+    return f"{ns}/{name}", (f"{parent}/{name}" if parent else name)
+
+
+def valid_dataset_name(name: str) -> bool:
+    """Return True for a single safe dataset folder name."""
+    return bool(_NAME_RE.fullmatch(name)) and name not in (".", "..")
+
+
+def workspace_path(path: str | Path) -> Path:
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p
+    return ROOT / p
+
+
+def safe_delete_target(root: str | Path, parent: str | Path) -> DeleteTarget:
+    """Validate a record delete target against its configured dataset parent."""
+    raw = str(root).strip()
+    if raw in ("", "/", os.path.expanduser("~")):
+        return DeleteTarget(False, workspace_path(root), "empty, root, or home path")
+    target = workspace_path(root).resolve(strict=False)
+    parent_path = workspace_path(parent or ".").resolve(strict=False)
+    if target == parent_path:
+        return DeleteTarget(False, target, "target is the dataset parent")
+    if target.name in ("", ".", ".."):
+        return DeleteTarget(False, target, "target has no safe folder name")
+    try:
+        target.relative_to(parent_path)
+    except ValueError:
+        return DeleteTarget(False, target, f"target is outside dataset parent {parent_path}")
+    return DeleteTarget(True, target)
+
+
+def persist_record_defaults(*, repo_id: str, root: str, task: str, episodes: int,
+                            ep_time: int, reset_time: int, fps: int, img_threads: int,
+                            display: bool, streaming: bool, cfg_path: Path = CFG_FILE) -> None:
+    """Write the form values back into lekiwi.yaml (lossless ruamel round-trip). Ported
+    verbatim from the Textual app (anchors/merges/comments survive; shared &task anchor)."""
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+
+    doc = load_yaml_rt(cfg_path)
+    rd = doc["record"]["dataset"]
+    rd["num_episodes"] = int(episodes)
+    rd["episode_time_s"] = int(ep_time)
+    rd["reset_time_s"] = int(reset_time)
+    rd["fps"] = int(fps)
+    rd["num_image_writer_threads_per_camera"] = int(img_threads)
+    rd["streaming_encoding"] = bool(streaming)
+    doc["record"]["display_data"] = bool(display)
+    doc["_dataset"]["repo_id"] = repo_id
+    doc["_dataset"]["root"] = root
+    ns = DoubleQuotedScalarString(task)
+    ns.yaml_set_anchor("task", always_dump=True)
+    doc["_task"] = ns
+    doc["record"]["dataset"]["single_task"] = ns
+    doc["rollout"]["task"] = ns
+    dump_yaml_rt(doc, cfg_path)
+
+

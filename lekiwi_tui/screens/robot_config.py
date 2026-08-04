@@ -32,17 +32,17 @@ Immediate-mode notes
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
 from .. import CFG_FILE
-from ..config import Config, cameras_summary, cfg_get, load_yaml, resolve_editor
+from ..config import Config, cameras_summary, cfg_get, collapse_home, load_yaml, resolve_editor
 from ..framework import theme
+from ..framework.widgets import wrap_words
 from ..framework.events import ESC, Key
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
-from .chrome import chip_spans, keycap_hint_line
+from .chrome import draw_slim_header, hint_slot_line, mode_chip_spans
 
 if TYPE_CHECKING:
     from ..context import Context
@@ -52,7 +52,6 @@ if TYPE_CHECKING:
 HEADLESS_HOOK = "run_headless"
 
 # A thin rule under the header (the Nordic look; sections carry their own hairline).
-RULE = "─" * 54
 
 # Rotation enum → short tag (ported VERBATIM from the Textual original's local _ROT, which
 # mirrors config.cameras_summary). Anything unrecognized (incl. a missing rotation) → NO_ROT.
@@ -88,18 +87,6 @@ _SECTIONS: list[tuple[str, list[tuple[str, str, str]]]] = [
 
 # Label column width so values align across all sections ("poll timeout" is longest).
 _LABEL_W = 15
-
-
-def _collapse_home(value: str) -> str:
-    """~-collapse a path under $HOME for display (bash ``${CFG_FILE/#$HOME/\\~}``).
-
-    Ported VERBATIM from the Textual original (framework-free helper)."""
-    home = str(Path.home())
-    if value == home:
-        return "~"
-    if value.startswith(home + "/"):
-        return "~" + value[len(home):]
-    return value
 
 
 class RobotConfigScreen(ScreenState):
@@ -155,56 +142,21 @@ class RobotConfigScreen(ScreenState):
     # ── view (rebuilt fresh each frame from ctx.doc) ──────────────────────────
     def draw(self, frame: Any, area: Any) -> None:
         frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
-        rows = (
-            Layout()
-            .direction(Direction.Vertical)
-            .constraints([
-                Constraint.length(1),   # header
-                Constraint.length(1),   # heavy rule
-                Constraint.length(2),   # source line
-                Constraint.length(1),   # gap
-                Constraint.fill(1),     # body (the read-only sections)
-                Constraint.length(1),   # light rule
-                Constraint.length(1),   # hint
-            ])
-            .split(area)
-        )
-        # Header: "◆ LEKIWI  robot config"
+        rows = (Layout().direction(Direction.Vertical).constraints(
+            [Constraint.length(1), Constraint.length(1), Constraint.fill(1),
+             Constraint.length(1)]).split(area))
+        draw_slim_header(frame, rows[0], self.ctx, "robot config",
+                         [Span(f"{collapse_home(str(CFG_FILE))} · read-only",
+                               theme.FAINT_STYLE),
+                          Span("   ", theme.BASE_STYLE), *mode_chip_spans()])
         frame.render_widget(
-            Paragraph(Text([Line([
-                Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE),
-                Span("  ", theme.BASE_STYLE),
-                Span("robot config", theme.SUBTITLE_STYLE),
-            ])])).style(theme.BASE_STYLE),
-            rows[0],
-        )
-        frame.render_widget(
-            Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1]
-        )
-        frame.render_widget(self._src_line(), rows[2])
-        frame.render_widget(self._body(), rows[4])
-        frame.render_widget(
-            Paragraph.from_string(theme.rule(rows[5].width, light=True)).style(theme.RULE_LIGHT_STYLE), rows[5]
-        )
-        frame.render_widget(self._hint_line(), rows[6])
-
-    def _src_line(self) -> Paragraph:
-        # "source <lekiwi.yaml>  ·  read-only here (anchors + comments); edit in $EDITOR"
-        # (bash 1126). Two lines so the long suffix never clips on a narrow terminal.
-        return Paragraph(Text([
-            Line(chip_spans([("source", _collapse_home(str(CFG_FILE)), theme.CHIP_VALUE_STYLE)])),
-            Line([
-                Span("read-only view; edit lekiwi.yaml in $EDITOR", theme.MUTED_STYLE),
-            ]),
-        ])).style(theme.BASE_STYLE)
-
-    def _hint_line(self) -> Paragraph:
-        # "e edit in <editor>   r reload   q back" (bash 1134).
-        return keycap_hint_line([
-            ("e", f"edit in {resolve_editor()}"),
-            ("r", "reload"),
-            ("q", "back"),
-        ])
+            Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
+        frame.render_widget(self._body(), rows[2])
+        frame.render_widget(hint_slot_line(
+            "read-only view — e edits lekiwi.yaml, r reloads after editing",
+            rows[3].width,
+            keys=(("e", f"edit in {resolve_editor()}"), ("r", "reload"), ("q", "back"))),
+            rows[3])
 
     # ── body rendering (sections → lines, ported from the original's Text builders) ──
     def _section_line(self, label: str, *, first: bool) -> list[Line]:
@@ -247,18 +199,9 @@ class RobotConfigScreen(ScreenState):
         return lines
 
     def _wrap(self, text: str, width: int) -> list[str]:
-        """Char-wrap *text* to *width* for the TASK instruction (the original rendered it
-        wrapped). Splits on real newlines first, then hard-wraps each at *width*."""
-        if width < 1:
-            width = 1
-        out: list[str] = []
-        for para in text.split("\n"):
-            if para == "":
-                out.append("")
-                continue
-            for i in range(0, len(para), width):
-                out.append(para[i:i + width])
-        return out or [""]
+        """Word-wrap the TASK instruction to *width*. Was a char-wrapper, which rendered
+        "second" as "se" / "cond"."""
+        return wrap_words(text, width)
 
     def _body(self) -> Paragraph:
         doc = self.ctx.doc

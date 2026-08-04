@@ -143,18 +143,24 @@ def test_cameras_row_cycles_modes_and_the_form_remembers_both_knobs(tmp_path):
     screen = EvalScreen(None, ctx)
     assert screen._cam_mode == "auto"
 
+    # TWO modes: auto ⇄ native. "map"/"trained" were dropped from the picker — auto already
+    # resolves to the yaml map whenever that is the best answer, and the only case forced
+    # "map" behaved DIFFERENTLY was sending a mapping the checkpoint contradicts.
+    from lekiwi_tui.screens.eval import CAM_MODES
+    assert CAM_MODES == ("auto", "native")
+
     screen._fpos = screen._fields().index("cameras")
     screen.handle_key(Key(RIGHT))
-    assert screen._cam_mode == "map"
-    screen.handle_key(Key(ENTER))
     assert screen._cam_mode == "native"
+    screen.handle_key(Key(ENTER))
+    assert screen._cam_mode == "auto"
     screen.handle_key(Key(LEFT))
-    assert screen._cam_mode == "map"
+    assert screen._cam_mode == "native"
 
     screen._steps.set_text("10")
     screen._remember()
     reopened = EvalScreen(None, ctx)
-    assert reopened._cam_mode == "map"
+    assert reopened._cam_mode == "native"
     assert reopened._steps.value == 10
 
 
@@ -172,6 +178,9 @@ def test_start_argv_carries_the_resolved_cam_slots_and_action_steps(tmp_path, mo
         async def suspend(self, argv, **kwargs):  # noqa: ANN001
             self.suspended = list(argv)
             return 0
+
+        async def run_modal(self, modal):  # noqa: ANN001 - the post-run verdict; skip
+            return None
 
     ckpt = _checkpoint(tmp_path, "native", [f"observation.images.{c}" for c in ("front", "wrist", "top")])
     ctx = _ctx(tmp_path)
@@ -243,6 +252,94 @@ def test_eval_sh_map_and_zero_steps_emit_no_extra_tokens(tmp_path):
     tokens = _dry_run(_script_workspace(tmp_path), "--cam-slots", "map", "--action-steps", "0")
     assert not [t for t in tokens if t.startswith("--rename_map=")]
     assert not [t for t in tokens if t.startswith("--policy.n_action_steps=")]
+
+
+# ── extra passthrough flags ─────────────────────────────────────────────────
+
+
+async def _preflight_ok(*args, **kwargs):  # noqa: ANN002, ANN003
+    return True
+
+
+class _StartApp:
+    """Captures the suspended argv; skips the post-run verdict modal."""
+
+    def __init__(self, answer: str | None = None) -> None:
+        self.suspended = None
+        self._answer = answer
+
+    async def suspend(self, argv, **kwargs):  # noqa: ANN001
+        self.suspended = list(argv)
+        return 0
+
+    async def run_modal(self, modal):  # noqa: ANN001
+        return self._answer
+
+
+def _run_start(screen) -> None:  # noqa: ANN001
+    action = screen.handle_key(Key("s"))
+    assert isinstance(action, Invoke)
+    asyncio.run(action.thunk())
+
+
+def test_extra_flags_row_present_and_persists(tmp_path):
+    ctx = _ctx(tmp_path)
+    screen = EvalScreen(None, ctx)
+    assert "extra" in screen._fields()
+    screen._extra_text = "--policy.num_inference_timesteps=10"
+    screen._remember()
+    reopened = EvalScreen(None, ctx)
+    assert reopened._extra_text == "--policy.num_inference_timesteps=10"
+
+
+def test_extra_flags_prompt_strips_and_updates_session_memory(tmp_path):
+    ctx = _ctx(tmp_path)
+    screen = EvalScreen(_StartApp(answer="  --policy.vlm_dtype=bfloat16  "), ctx)
+    asyncio.run(screen._edit_extra())
+    assert screen._extra_text == "--policy.vlm_dtype=bfloat16"  # stripped
+    assert EvalScreen(None, ctx)._extra_text == "--policy.vlm_dtype=bfloat16"
+
+
+def test_start_argv_appends_shlex_split_extra_flags(tmp_path, monkeypatch):
+    monkeypatch.setattr(eval_mod, "confirm_preflight", _preflight_ok)
+    monkeypatch.setattr(eval_mod, "eval_issues", lambda *a, **k: [])
+    ckpt = _checkpoint(tmp_path, "native", ["observation.images.front"])
+    app = _StartApp()
+    screen = EvalScreen(app, _ctx(tmp_path))
+    screen._policy = str(ckpt)
+    screen._extra_text = "--policy.num_inference_timesteps=10 --policy.vlm_dtype=bfloat16"
+    _run_start(screen)
+    argv = app.suspended
+    assert "--policy.num_inference_timesteps=10" in argv
+    assert "--policy.vlm_dtype=bfloat16" in argv
+    # forwarded after the built flags (draccus last-wins); --gpu is the last fixed knob
+    assert argv.index("--policy.num_inference_timesteps=10") > argv.index("--gpu")
+
+
+def test_start_argv_has_no_trailing_tokens_when_extra_blank(tmp_path, monkeypatch):
+    monkeypatch.setattr(eval_mod, "confirm_preflight", _preflight_ok)
+    monkeypatch.setattr(eval_mod, "eval_issues", lambda *a, **k: [])
+    ckpt = _checkpoint(tmp_path, "native", ["observation.images.front"])
+    app = _StartApp()
+    screen = EvalScreen(app, _ctx(tmp_path))
+    screen._policy = str(ckpt)
+    _run_start(screen)
+    # nothing trails the --gpu <name> pair (empty extra field, no CLI-dispatch extra)
+    assert app.suspended[-2] == "--gpu"
+
+
+def test_start_rejects_malformed_extra_flags_without_launching(tmp_path, monkeypatch):
+    monkeypatch.setattr(eval_mod, "confirm_preflight", _preflight_ok)
+    monkeypatch.setattr(eval_mod, "eval_issues", lambda *a, **k: [])
+    ckpt = _checkpoint(tmp_path, "native", ["observation.images.front"])
+    app = _StartApp()
+    screen = EvalScreen(app, _ctx(tmp_path))
+    screen._policy = str(ckpt)
+    screen._extra_text = '--task="unterminated'
+    _run_start(screen)
+    assert app.suspended is None  # never handed to the TTY
+    assert "extra flags" in screen._err
+
 
 
 def test_eval_sh_rejects_auto_cam_slots(tmp_path):

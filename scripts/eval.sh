@@ -156,8 +156,8 @@ done
 # The TUI resolves its "auto" mode BEFORE fronting this script; here only the two
 # concrete values are legal (fail fast on a typo rather than silently keeping map).
 case "$cam_slots" in
-  map|native) ;;
-  *) die_usage "--cam-slots must be 'map' or 'native' (got '$cam_slots'); 'auto' is TUI-side" ;;
+  map|native|trained) ;;
+  *) die_usage "--cam-slots must be 'map', 'native' or 'trained' (got '$cam_slots'); 'auto' is TUI-side" ;;
 esac
 
 # rename_identity_token
@@ -187,6 +187,45 @@ if not isinstance(rmap, dict) or not rmap:
     sys.exit(0)                      # nothing to neutralize -> no token
 body = ", ".join(f"{k}: {k}" for k in rmap)
 print("--rename_map={" + body + "}")
+PY
+}
+
+# rename_trained_token
+#   Print the --rename_map=… token reproducing the mapping the CHECKPOINT WAS TRAINED
+#   WITH, read from its own train_config.json (fallback: saved policy_preprocessor.json).
+#
+#   This exists because a set-based compatibility check cannot see a PERMUTATION: if the
+#   yaml sends wrist->camera2 while the policy was trained with top->camera2, both sides
+#   still use exactly {camera1,camera2,camera3}, nothing errors, and the robot simply acts
+#   on two swapped views. The checkpoint is the authority on what it expects, so send that.
+#   Absent/unreadable -> no output, and the caller falls back to the yaml map.
+rename_trained_token() {
+  "$PY" - "$policy" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+base = Path(sys.argv[1])
+
+
+def from_preprocessor(d):
+    for step in d.get("steps") or []:
+        m = (step.get("config") or {}).get("rename_map")
+        if isinstance(m, dict) and m:
+            return m
+    return None
+
+
+for name, pick in (("train_config.json", lambda d: d.get("rename_map")),
+                   ("policy_preprocessor.json", from_preprocessor)):
+    try:
+        data = json.loads((base / name).read_text())
+    except Exception:
+        continue
+    m = pick(data)
+    if isinstance(m, dict) and m:
+        print("--rename_map={" + ", ".join(f"{k}: {v}" for k, v in m.items()) + "}")
+        break
 PY
 }
 
@@ -238,6 +277,11 @@ if [[ "$cam_slots" == "native" ]]; then
   identity_token="$(rename_identity_token)"
   if [[ -n "$identity_token" ]]; then
     argv+=("$identity_token")
+  fi
+elif [[ "$cam_slots" == "trained" ]]; then
+  trained_token="$(rename_trained_token)"
+  if [[ -n "$trained_token" ]]; then
+    argv+=("$trained_token")
   fi
 fi
 #   6) --policy.n_action_steps only when --action-steps n>0 (0 = the checkpoint's

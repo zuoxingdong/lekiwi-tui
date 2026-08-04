@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
 from .. import ROOT
-from ..config import cameras_summary, cfg_for, cfg_get, resolve_workspace_path
+from ..config import as_int, cameras_summary, cfg_for, cfg_get, resolve_workspace_path
 from ..framework import runner, theme
 from ..framework.events import (
     BACKTAB, DOWN, ENTER, ESC, LEFT, RIGHT, TAB, UP, Key, is_char,
@@ -46,7 +46,11 @@ from ..framework.screen import Invoke, Nothing, Pop, ScreenState
 from ..framework.stream import StreamController
 from ..framework.widgets import NumberField, TextField
 from ..remote import RemoteValueError, validate_positive_int, validate_remote_name, validate_ssh_host
-from .chrome import keycap_hint_line, option_line, runtime_chips
+from .chrome import (
+    plan_row,
+    draw_slim_header, hint_slot_line, keycap_hint_line, mode_chip_spans,
+    padded_line, section_line,
+)
 
 # The run_headless hook name (parity with the Textual app's HEADLESS_HOOK).
 HEADLESS_HOOK = "run_headless"
@@ -57,7 +61,6 @@ if TYPE_CHECKING:
 
 # The SOLE argv source: the carried-over host.sh emitter (fronted, never re-translated).
 HOST_SCRIPT = ROOT / "scripts" / "host.sh"
-RULE = "─" * 54
 
 # scp target on the Pi for the shipped host config (original _host_ssh _pi_cfg).
 PI_CFG_PATH = "/tmp/lekiwi_host.yaml"
@@ -144,17 +147,6 @@ def _loop_flag(loop_hz):  # noqa: ANN001
     return f"--host.max_loop_freq_hz={loop_hz}" if loop_hz else ""
 
 
-def _as_int(v: Any, default: int) -> int:
-    """Coerce a config value (a string like "600", or an int) to an int, default on miss."""
-    if isinstance(v, bool):
-        return default
-    if isinstance(v, int):
-        return v
-    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
-        return int(v)
-    return default
-
-
 def _format_duration(seconds: float | int, *, ceiling: bool = False) -> str:
     """Format seconds as mm:ss, or h:mm:ss for long sessions."""
     total = math.ceil(seconds) if ceiling else int(seconds)
@@ -180,12 +172,6 @@ def _session_progress(
     return remaining, fraction
 
 
-def _progress_bar(fraction: float, width: int) -> tuple[str, str]:
-    """Return filled/empty progress-bar segments."""
-    width = max(1, int(width))
-    filled = max(0, min(width, int(fraction * width)))
-    return "█" * filled, "░" * (width - filled)
-
 
 class _Start:
     """The Launch pseudo-field — focusable, activated by the screen (Enter), not itself."""
@@ -203,15 +189,16 @@ class HostLaunchScreen(ScreenState):
         self.app = app
         self.ctx = ctx
         self._extra = list(extra or [])
-        def_min = max(_as_int(ctx.cfg["CONNECTION_TIME"], 600) // 60, 1)
+        def_min = max(as_int(ctx.cfg["CONNECTION_TIME"], 600) // 60, 1)
         self.minutes = NumberField("Session", def_min, minimum=1, step=5, unit=" min")
         # Robot id (per-launch --robot.id override) — a free-text field, prefilled from cfg.
         self.robot = TextField(str(ctx.cfg["ROBOT_ID"]))
         # Host loop-freq Hz (per-launch --host.max_loop_freq_hz override), from the yaml.
-        def_hz = _as_int(cfg_get("host.host.max_loop_freq_hz", doc=ctx.doc), 30)
+        def_hz = as_int(cfg_get("host.host.max_loop_freq_hz", doc=ctx.doc), 30)
         self.hz = NumberField("Loop freq", def_hz, minimum=1, step=5, unit=" Hz")
         self.start = _Start()
-        self.ring = FocusRing([self.minutes, self.robot, self.hz, self.start])
+        # Ring order == VISUAL order: (Session | Loop freq) row, then Robot id, Start.
+        self.ring = FocusRing([self.minutes, self.hz, self.robot, self.start])
         self._msg = ""
         self._fresh = True
         # ── streaming engine (idle | running | ended; idle == the pre-launch form) ──
@@ -387,179 +374,148 @@ class HostLaunchScreen(ScreenState):
         else:
             self._draw_form(frame, area)
 
-    def _draw_form(self, frame: Any, area: Any) -> None:
-        rows = (Layout().direction(Direction.Vertical).constraints([
-            Constraint.length(1),   # 0 header
-            Constraint.length(1),   # 1 rule
-            Constraint.length(1),   # 2 runtime chips
-            Constraint.length(3),   # 3 info (2 lines + the config summary)
-            Constraint.length(1),   # 4 gap
-            Constraint.length(1),   # 5 Session
-            Constraint.length(1),   # 6 Robot id
-            Constraint.length(1),   # 7 Loop freq
-            Constraint.length(1),   # 8 gap
-            Constraint.length(1),   # 9 Launch
-            Constraint.length(1),   # 10 msg
-            Constraint.fill(1),     # 11 spacer
-            Constraint.length(1),   # 12 hint
-        ]).split(area))
-        self._header(frame, rows[0])
-        frame.render_widget(Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
-        frame.render_widget(runtime_chips(self.ctx), rows[2])
-        self._info(frame, rows[3])
-        self._num_row(frame, rows[5], self.minutes,
-                      self.minutes.hint() + " · how long the host stays available")
-        self._text_row(frame, rows[6], self.robot, "Robot id", "robot identity for this launch")
-        self._num_row(frame, rows[7], self.hz,
-                      self.hz.hint() + " · host control-loop limit")
-        self._start_row(frame, rows[9])
-        if self._msg:
-            frame.render_widget(Paragraph(Text([Line([Span(self._msg, theme.ERR_STYLE)])])
-                                          ).style(theme.BASE_STYLE), rows[10])
-        self._hint(frame, rows[12], [("↑↓/jk", "move"), ("←→/hl", "adjust"),
-                                     ("⏎", "edit/launch"), ("q", "back")])
+    _LABEL_W = 14
 
-    def _text_row(self, frame: Any, area: Any, field: "TextField", label: str, hint: str) -> None:
-        """Render a focusable TextField row (the Robot-id field), same gutter shape as _num_row."""
-        focused = self.ring.is_focused(field)
-        cols = (Layout().direction(Direction.Horizontal)
-                .constraints([Constraint.length(2), Constraint.fill(1)]).split(area))
-        frame.render_widget(Paragraph(Text([Line([Span(theme.selector(focused),
-                            theme.HIGHLIGHT_LABEL_STYLE)])])).style(theme.BASE_STYLE), cols[0])
-        if focused:
-            sub = (Layout().direction(Direction.Horizontal)
-                   .constraints([Constraint.length(28), Constraint.fill(1)]).split(cols[1]))
-            field.draw(frame, sub[0], focused=True, label=f"{label}  ")
-            frame.render_widget(Paragraph(Text([Line([Span(f"  {hint}", theme.MUTED_STYLE)])])
-                                          ).style(theme.BASE_STYLE), sub[1])
+    def _lab(self, text: str, focused: bool) -> Span:
+        return Span(f"{text:<{self._LABEL_W}}",
+                    theme.TITLE_STYLE if focused else theme.MUTED_STYLE)
+
+    def _gutter(self, *fields: Any) -> Span:
+        on = any(self.ring.is_focused(f) for f in fields)
+        return Span(theme.selector(on), theme.TITLE_STYLE if on else theme.BASE_STYLE)
+
+    def _num_text(self, field: "NumberField") -> tuple[str, Any]:
+        if self.ring.is_focused(field):
+            return f"{field.editor.value}█", theme.HIGHLIGHT_TEXT_STYLE
+        return field.display(), theme.TEXT_STYLE
+
+    def _focused_hint(self) -> str:
+        cur = self.ring.current()
+        if cur is self.minutes:
+            return "how long the host stays available · ←→ ±5 · ⏎ type a number"
+        if cur is self.hz:
+            return "host control-loop limit · ←→ ±5 · ⏎ type a number"
+        if cur is self.robot:
+            return "robot identity for this launch · type to edit"
+        return "ships the plugin + cameras/tuning, then starts the host"
+
+    def _body_lines(self, width: int = 100) -> list[Line]:
+        """The form's rows as the testable view-model (grouped, one hint slot)."""
+        lines: list[Line] = [section_line("SESSION")]
+        mv, ms = self._num_text(self.minutes)
+        hv, hs = self._num_text(self.hz)
+        lines.append(Line([
+            self._gutter(self.minutes, self.hz),
+            self._lab("Session", self.ring.is_focused(self.minutes)),
+            Span(f"{mv:<10}", ms),
+            Span("   ", theme.BASE_STYLE),
+            self._lab("Loop freq", self.ring.is_focused(self.hz)),
+            Span(hv, hs),
+        ]))
+        rf = self.ring.is_focused(self.robot)
+        if rf:
+            c = self.robot.cursor
+            rspans = [Span(self.robot.value[:c], theme.HIGHLIGHT_TEXT_STYLE),
+                      Span("█", theme.HIGHLIGHT_TEXT_STYLE),
+                      Span(self.robot.value[c:], theme.HIGHLIGHT_TEXT_STYLE)]
         else:
-            frame.render_widget(Paragraph(Text([Line([
-                Span(f"{label:<10}", theme.MUTED_STYLE),
-                Span(f"  {field.value}", theme.TEXT_STYLE),
-                Span(f"   {hint}", theme.MUTED_STYLE),
-            ])])).style(theme.BASE_STYLE), cols[1])
+            rspans = [Span(self.robot.value, theme.TEXT_STYLE)]
+        pad = max(0, 10 - len(self.robot.value) - (1 if rf else 0))
+        lines.append(Line([
+            self._gutter(self.robot),
+            self._lab("Robot id", rf),
+            *rspans,
+            Span(" " * pad, theme.BASE_STYLE),
+            Span("   ", theme.BASE_STYLE),
+            self._lab("Robot type", False),
+            Span(str(self.ctx.cfg["ROBOT_TYPE"]), theme.FAINT_STYLE),
+            Span("  (yaml)", theme.FAINT_STYLE),
+        ]))
+        lines.append(Line([]))
+        focused = self.ring.is_focused(self.start)
+        plan = (f"{self.minutes.value} min session on {self.ctx.cfg['LEKIWI_HOST']}"
+                f" · ships plugin + cameras/tuning first")
+        lines.append(plan_row("Start", plan, focused=focused))
+        return lines
+
+    def _draw_form(self, frame: Any, area: Any) -> None:
+        rows = (Layout().direction(Direction.Vertical).constraints(
+            [Constraint.length(1), Constraint.length(1), Constraint.fill(1),
+             Constraint.length(1), Constraint.length(1)]).split(area))
+        draw_slim_header(frame, rows[0], self.ctx, "host")
+        frame.render_widget(Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
+        frame.render_widget(Paragraph(Text(self._body_lines(rows[2].width))
+                                      ).style(theme.BASE_STYLE), rows[2])
+        if self._msg:
+            frame.render_widget(Paragraph(Text([Line([Span(f"  {self._msg}", theme.ERR_STYLE)])])
+                                          ).style(theme.BASE_STYLE), rows[3])
+        frame.render_widget(hint_slot_line(self._focused_hint(), rows[4].width), rows[4])
+
+    def _stream_header_right(self) -> list[Span]:
+        """The stream states' header status: ● HOST live / stopping / the outcome."""
+        if self.stream.running and not self.stream.status.startswith("stopping"):
+            state = [Span("● HOST", theme.OK_STYLE), Span("  session live", theme.MUTED_STYLE)]
+        elif self.stream.running:
+            state = [Span(self.stream.status, theme.WARN_STYLE)]
+        else:
+            st = self.stream.status
+            state = [Span(st, theme.OK_STYLE if st.startswith("✓") else theme.WARN_STYLE),
+                     Span(f"  session {_format_duration(self._session_total_s)}",
+                          theme.MUTED_STYLE)]
+        return state + [Span("   ", theme.BASE_STYLE), *mode_chip_spans()]
+
+    def _session_meter_line(self, width: int) -> Line:
+        """running: a countdown meter · stopping: the escalation status · ended: summary."""
+        host = self.ctx.cfg["LEKIWI_HOST"]
+        if self.stream.running and not self.stream.status.startswith("stopping"):
+            remaining, fraction = _session_progress(self._session_total_s, self._session_started_at)
+            fill, trough = theme.meter_segments(fraction, 22)
+            remote_ip = cfg_get("_robot.remote_ip", doc=self.ctx.doc) or "?"
+            return padded_line(
+                [Span("  session   ", theme.MUTED_STYLE),
+                 Span(fill, theme.TITLE_STYLE), Span(trough, theme.BORDER_STYLE),
+                 Span(f"  {_format_duration(remaining, ceiling=True)} left"
+                      f" / {_format_duration(self._session_total_s)}", theme.TEXT_STYLE)],
+                [Span(f"client {remote_ip}", theme.FAINT_STYLE), Span("  ", theme.BASE_STYLE)],
+                width)
+        if self.stream.running:
+            return Line([Span(f"  {self.stream.status}", theme.WARN_STYLE)])
+        return padded_line(
+            [Span(f"  session ended on {host} · "
+                  f"{_format_duration(self._session_total_s)} elapsed", theme.MUTED_STYLE)],
+            [Span("relaunch keeps these settings", theme.FAINT_STYLE),
+             Span("  ", theme.BASE_STYLE)], width)
+
+    def _facts_line(self, width: int) -> Line:
+        """Shipped-config facts (cams · units · watchdog), verifiable against the log."""
+        if not self.stream.running:
+            return Line([])
+        doc = self.ctx.doc
+        units = "degrees" if cfg_get("host.robot.use_degrees", doc=doc) else "raw units"
+        watchdog = cfg_get("host.host.watchdog_timeout_ms", doc=doc) or "?"
+        facts = f"{cameras_summary(doc)} · {units} · watchdog {watchdog} ms"
+        return padded_line([Span("  ", theme.BASE_STYLE)],
+                           [Span(facts, theme.FAINT_STYLE), Span("  ", theme.BASE_STYLE)],
+                           width)
 
     def _draw_stream(self, frame: Any, area: Any) -> None:
         rows = (Layout().direction(Direction.Vertical).constraints([
             Constraint.length(1), Constraint.length(1), Constraint.length(1),
             Constraint.length(1), Constraint.fill(1), Constraint.length(1),
         ]).split(area))
-        self._header(frame, rows[0])
+        draw_slim_header(frame, rows[0], self.ctx, "host", self._stream_header_right())
         frame.render_widget(Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
-        self._draw_session_status(frame, rows[2])
-        self._draw_session_progress(frame, rows[3])
-        self.stream.draw_log(frame, rows[4], title="host log")
+        frame.render_widget(Paragraph(Text([self._session_meter_line(rows[2].width)])
+                                      ).style(theme.BASE_STYLE), rows[2])
+        frame.render_widget(Paragraph(Text([self._facts_line(rows[3].width)])
+                                      ).style(theme.BASE_STYLE), rows[3])
+        self.stream.draw_log(frame, rows[4],
+                             title="host log · live" if self.stream.running else "host log")
         if self.stream.running:
-            hint = [("s", "stop"), ("Ctrl+C", "stop"), ("q", "menu · host keeps running")]
+            hint = [("s", "stop host"), ("Ctrl+C", "stop"), ("q", "menu · host keeps running")]
         else:
             hint = [("⏎", "relaunch"), ("q", "back")]
-        self._hint(frame, rows[5], hint)
-
-    def _draw_session_status(self, frame: Any, area: Any) -> None:
-        """Draw the live host-session status row."""
-        host = self.ctx.cfg["LEKIWI_HOST"]
-        if self.stream.running and not self.stream.status.startswith("stopping"):
-            remaining, _ = _session_progress(self._session_total_s, self._session_started_at)
-            line = Line([
-                Span("  running · session ", theme.MUTED_STYLE),
-                Span(_format_duration(remaining, ceiling=True), theme.STATUS_VALUE_STYLE),
-                Span(f" left / {_format_duration(self._session_total_s)}", theme.MUTED_STYLE),
-                Span(f"   on {host}", theme.MUTED_STYLE),
-            ])
-        elif self.stream.running:
-            line = Line([
-                Span(f"  {self.stream.status}", theme.WARN_STYLE),
-                Span(f"   on {host}", theme.MUTED_STYLE),
-            ])
-        else:
-            status = self.stream.status
-            st_style = theme.OK_STYLE if status.startswith("✓") else theme.WARN_STYLE
-            line = Line([
-                Span(f"  {status}", st_style),
-                Span(f"   session {_format_duration(self._session_total_s)} on {host}",
-                     theme.MUTED_STYLE),
-            ])
-        frame.render_widget(Paragraph(Text([line])).style(theme.BASE_STYLE), area)
-
-    def _draw_session_progress(self, frame: Any, area: Any) -> None:
-        """Draw a visual elapsed-session progress bar while the host is running."""
-        if not self.stream.running:
-            frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
-            return
-        _, fraction = _session_progress(self._session_total_s, self._session_started_at)
-        bar_width = min(48, max(8, int(area.width) - 30))
-        filled, empty = theme.progress_segments(fraction, bar_width)
-        percent = int(fraction * 100)
-        frame.render_widget(Paragraph(Text([Line([
-            Span("  [", theme.MUTED_STYLE),
-            Span(filled, theme.HIGHLIGHT_LABEL_STYLE),
-            Span(empty, theme.MUTED_STYLE),
-            Span("] ", theme.MUTED_STYLE),
-            Span(f"{percent:3d}% elapsed", theme.MUTED_STYLE),
-        ])])).style(theme.BASE_STYLE), area)
-
-    # ── small render helpers ──────────────────────────────────────────────────
-    def _header(self, frame: Any, area: Any) -> None:
-        frame.render_widget(Paragraph(Text([Line([
-            Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE), Span("  start host", theme.SUBTITLE_STYLE),
-        ])])).style(theme.BASE_STYLE), area)
-
-    def _info(self, frame: Any, area: Any) -> None:
-        doc = self.ctx.doc
-        host = str(self.ctx.cfg["LEKIWI_HOST"])
-        # Live config summary (client IP · control units · cameras · watchdog), read
-        # from lekiwi.yaml — the original do_host_launch summary line.
-        remote_ip = cfg_get("_robot.remote_ip", doc=doc) or "?"
-        use_deg = cfg_get("host.robot.use_degrees", doc=doc)
-        watchdog = cfg_get("host.host.watchdog_timeout_ms", doc=doc) or "?"
-        cams = cameras_summary(doc)
-        units = "degrees" if use_deg else "raw units"
-        summary = f"client {remote_ip}  ·  control {units}  ·  {cams}  ·  watchdog {watchdog} ms"
-        robot_type = str(self.ctx.cfg["ROBOT_TYPE"])
-        frame.render_widget(Paragraph(Text([
-            # What Launch actually does, in order — so "why is it shipping things"
-            # is never a surprise and a ship failure message has context.
-            Line([Span(f"launch = sync plugin → ship cameras/tuning (lekiwi.yaml) → start {robot_type} host on {host}",
-                       theme.MUTED_STYLE)]),
-            Line([Span(summary, theme.MUTED_STYLE)]),
-            Line([Span("log streams here · q returns to the menu, the host keeps running for Teleop/Record",
-                       theme.STATUS_VALUE_STYLE)]),
-        ])).style(theme.BASE_STYLE), area)
-
-    def _num_row(self, frame: Any, area: Any, field: "NumberField", hint: str) -> None:
-        focused = self.ring.is_focused(field)
-        cols = (Layout().direction(Direction.Horizontal)
-                .constraints([Constraint.length(2), Constraint.fill(1)]).split(area))
-        frame.render_widget(Paragraph(Text([Line([Span(theme.selector(focused),
-                            theme.HIGHLIGHT_LABEL_STYLE)])])).style(theme.BASE_STYLE), cols[0])
-        if focused:
-            sub = (Layout().direction(Direction.Horizontal)
-                   .constraints([Constraint.length(28), Constraint.fill(1)]).split(cols[1]))
-            field.draw(frame, sub[0], focused=True)
-            frame.render_widget(Paragraph(Text([Line([Span(f"  {hint}", theme.MUTED_STYLE)])])
-                                          ).style(theme.BASE_STYLE), sub[1])
-        else:
-            frame.render_widget(Paragraph(Text([Line([
-                Span(f"{field.label:<10}", theme.MUTED_STYLE),
-                Span(f"  {field.display()}", theme.TEXT_STYLE),
-                Span(f"   {hint}", theme.MUTED_STYLE),
-            ])])).style(theme.BASE_STYLE), cols[1])
-
-    def _start_row(self, frame: Any, area: Any) -> None:
-        focused = self.ring.is_focused(self.start)
-        frame.render_widget(Paragraph(Text([
-            option_line(
-                f"{theme.play_mark()} Start host",
-                "open SSH session and stream logs here",
-                focused=focused,
-                label_width=18,
-                width=area.width,
-                label_unfocused_style=theme.TEXT_STYLE,
-            ),
-        ])).style(theme.BASE_STYLE), area)
-
-    def _hint(self, frame: Any, area: Any, pairs) -> None:
-        frame.render_widget(keycap_hint_line(pairs), area)
+        frame.render_widget(keycap_hint_line(hint), rows[5])
 
 
 def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001

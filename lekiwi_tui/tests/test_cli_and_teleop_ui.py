@@ -13,6 +13,7 @@ from lekiwi_tui.context import Context
 from lekiwi_tui.framework.events import DOWN, ENTER, Key
 from lekiwi_tui.framework.screen import Invoke, Nothing
 from lekiwi_tui.screens.teleop import TELEOP_SCRIPT, TeleopScreen
+from conftest import make_ctx
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -139,3 +140,51 @@ def test_unknown_cli_action_suggests_near_matches(tmp_path):
     assert "unknown action: 'hots'" in proc.stderr
     assert "did you mean:" in proc.stderr
     assert "host" in proc.stderr
+
+
+# ── the redesigned teleop page view-model ─────────────────────────────────────
+
+
+def _teleop_screen():
+
+    from lekiwi_tui.screens.teleop import TeleopScreen
+
+    ctx = make_ctx(gpu_name="")
+    return TeleopScreen(None, ctx)
+
+
+def test_teleop_form_view_model_one_setting_per_row_and_plan():
+    scr = _teleop_screen()
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(90))
+    # ONE setting per row (this used to assert all three shared a line — the cramming was
+    # the thing that made the form uncomfortable to operate, so the contract is inverted).
+    assert "SESSION" in body
+    dur_row = next(ln for ln in body.splitlines() if "Duration" in ln)
+    assert "FPS" not in dur_row and "Display" not in dur_row
+    assert sum(1 for ln in body.splitlines() if "FPS" in ln) == 1
+    # every adjustable number advertises itself with the ‹ › stepper
+    assert "‹" in dur_row and "›" in dur_row
+    # and the zero-sentinel's meaning is on the row, not swapped out on focus
+    assert "until Ctrl+C" in dur_row
+    # the Start plan says what actually happens (full-TTY suspend, no recording)
+    assert "leader arm + wasd·zx base · no recording · full-TTY session" in body
+    # ring order == visual order: Duration → FPS → Display → Start
+    order = [scr.ring.current()]
+    for _ in range(3):
+        scr.ring.next()
+        order.append(scr.ring.current())
+    assert order == [scr.dur, scr.fps, scr.display, scr.start]
+
+
+def test_teleop_host_down_warning_replaces_start_plan():
+    scr = _teleop_screen()
+    scr._host_alive = lambda: False  # type: ignore[method-assign]
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(90))
+    assert "⚠ host not reachable — Start host first" in body
+    assert "full-TTY session" not in body      # the warning REPLACES the plan
+    # focus Start → the footer hint explains preflight will refuse
+    while scr.ring.current() is not scr.start:
+        scr.ring.next()
+    assert "preflight will stop the launch" in scr._focused_hint()

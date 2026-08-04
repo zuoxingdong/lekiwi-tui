@@ -14,14 +14,14 @@ from typing import TYPE_CHECKING, Any
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Style, Text
 
 from .. import CFG_FILE
-from ..config import CONFIG_SPEC, Config, resolve_editor
+from ..config import CONFIG_SPEC, Config, collapse_home, resolve_editor
 from ..framework import theme
 from ..framework.events import DOWN, ENTER, ESC, LEFT, RIGHT, UP, Key
 from ..framework.modals import ConfirmModalState, PromptModalState
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
 from ..policies import discover_policies
 from ..widgets.pickers import DirPicker
-from .chrome import keycap_hint_line, option_line
+from .chrome import draw_slim_header, hint_slot_line, mode_chip_spans, option_line, plan_row, section_line
 
 if TYPE_CHECKING:
     from ..context import Context
@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 #: The run_headless hook name used by direct no-TTY CLI dispatch.
 HEADLESS_HOOK = "run_headless"
 
-RULE = "─" * 54
 _LABEL_W = 18
 _SECTION_BEFORE = {"LAPTOP_ENV": "LAPTOP", "LEKIWI_HOST": "ROBOT HOST", "POLICY_PATH": "EVAL"}
 _AUTO = "Auto - use the newest checkpoint under POLICY_ROOT"
@@ -40,15 +39,6 @@ _TYPE = "Type a path or model repo id…"
 # "Edit config" lead-in of the sub-line is bold TEXT (bash 1040 `_sub_line`): there is no
 # theme constant for it, so compose it here rather than mutate a shared theme.* style.
 _SUB_LEAD_STYLE = Style().fg(theme.TEXT).bold()
-
-
-def _collapse_home(value: str) -> str:
-    home = str(Path.home())
-    if value == home:
-        return "~"
-    if value.startswith(home + "/"):
-        return "~" + value[len(home):]
-    return value
 
 
 def _expand_home(value: str) -> str:
@@ -165,7 +155,7 @@ class SettingsScreen(ScreenState):
             except ValueError:
                 rels.append(str(p))
         choice = await self.app.run_modal(ConfirmModalState(
-            f"Default policy checkpoint - root: {_collapse_home(str(root))}",
+            f"Default policy checkpoint - root: {collapse_home(str(root))}",
             [_AUTO, *rels, _BROWSE, _TYPE]))
         if choice is None:
             return
@@ -202,7 +192,7 @@ class SettingsScreen(ScreenState):
         self._work = dict(new_cfg.values)
         self._env_set = set(new_cfg.env_set)
         self.dirty = False
-        self.message = f"✓ reloaded {_collapse_home(str(self._cfg_path))}"; self._msg_ok = True
+        self.message = f"✓ reloaded {collapse_home(str(self._cfg_path))}"; self._msg_ok = True
 
     # ── save (sync) ─────────────────────────────────────────────────────────────
     def _save(self) -> None:
@@ -210,11 +200,11 @@ class SettingsScreen(ScreenState):
         try:
             new_cfg.save(self._cfg_path)
         except OSError:
-            self.message = f"✗ could not write {_collapse_home(str(self._cfg_path))} — check file permissions"; self._msg_ok = False
+            self.message = f"✗ could not write {collapse_home(str(self._cfg_path))} — check file permissions"; self._msg_ok = False
             return
         self.ctx.cfg.values.update(self._work)
         self.dirty = False
-        self.message = f"✓ saved to {_collapse_home(str(self._cfg_path))}"; self._msg_ok = True
+        self.message = f"✓ saved to {collapse_home(str(self._cfg_path))}"; self._msg_ok = True
 
     # ── view ────────────────────────────────────────────────────────────────────
     def _display_value(self, key: str, kind: str) -> str:
@@ -223,41 +213,55 @@ class SettingsScreen(ScreenState):
             if not val:
                 val = _enum_options(kind)[0]
             return theme.choice(val)
-        disp = _collapse_home(val)
+        disp = collapse_home(val)
         if not disp:
             return "auto (newest under POLICY_ROOT)" if key == "POLICY_PATH" else "(empty)"
         return disp
 
+    def _header_right(self) -> list[Span]:
+        spans: list[Span] = []
+        if self.dirty:
+            n = sum(1 for k, v in self._work.items()
+                    if str(self.ctx.cfg.values.get(k)) != str(v))
+            spans += [Span(f"{theme.status_dot()} ", theme.WARN_STYLE),
+                      Span(f"unsaved ({n})" if n else "unsaved", theme.WARN_STYLE)]
+        spans.append(Span("   ", theme.BASE_STYLE))
+        spans.extend(mode_chip_spans())
+        return spans
+
     def draw(self, frame: Any, area: Any) -> None:
         frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
-        # Rows: 0 header · 1 heavy rule · 2 sub-line (config path) · 3 body · 4 info/active-field
-        # hint · 5 message (conditional) · 6 key-legend. The sub-line + info row are the two
-        # NEW rows; body stays the flexible fill, message + legend keep their behavior.
         rows = (Layout().direction(Direction.Vertical).constraints(
             [Constraint.length(1), Constraint.length(1), Constraint.length(1),
-             Constraint.fill(1), Constraint.length(1), Constraint.length(1),
-             Constraint.length(1)]).split(area))
-        hdr = [Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE), Span("  settings", theme.SUBTITLE_STYLE)]
-        if self.dirty:
-            hdr.append(Span(f"   {theme.status_dot()} unsaved", theme.STATUS_VALUE_STYLE))
-        frame.render_widget(Paragraph(Text([Line(hdr)])).style(theme.BASE_STYLE), rows[0])
+             Constraint.fill(1), Constraint.length(1), Constraint.length(1)]).split(area))
+        draw_slim_header(frame, rows[0], self.ctx, "settings", self._header_right())
         frame.render_widget(Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
         frame.render_widget(self._sub(), rows[2])
         frame.render_widget(self._body(rows[3].width), rows[3])
-        frame.render_widget(self._info(), rows[4])
         if self.message:
             style = theme.OK_STYLE if self._msg_ok else theme.ERR_STYLE
-            frame.render_widget(Paragraph(Text([Line([Span(self.message, style)])])
-                                          ).style(theme.BASE_STYLE), rows[5])
-        frame.render_widget(self._hint(), rows[6])
+            frame.render_widget(Paragraph(Text([Line([Span(f"  {self.message}", style)])])
+                                          ).style(theme.BASE_STYLE), rows[4])
+        frame.render_widget(hint_slot_line(self._focused_hint(), rows[5].width,
+                                           keys=(("↑↓/jk", "move"), ("⏎", "edit·save"),
+                                                 ("e", "edit file"), ("q", "back"))), rows[5])
+
+    def _focused_hint(self) -> str:
+        """The footer hint slot: the active field's documentation (with the env-override
+        provenance caveat when it applies), or the Save row's note."""
+        if self.cursor >= self._n:
+            return "writes launcher settings to lekiwi.yaml · launch env vars still win"
+        f = CONFIG_SPEC[self.cursor]
+        if f.key in self._env_set:
+            return f"[env override] an env var set this; it wins until unset · {f.hint}"
+        return f.hint
 
     def _body(self, width: int = 120) -> Paragraph:
         lines: list[Line] = []
         for i, f in enumerate(CONFIG_SPEC):
             section = _SECTION_BEFORE.get(f.key)
             if section:
-                lines.append(Line([Span(f"{section} ", theme.SECTION_STYLE),
-                                   Span(theme.rule(max(4, 44 - len(section))), theme.BORDER_STYLE)]))
+                lines.append(section_line(section))
             active = i == self.cursor
             line = option_line(
                 f.key,
@@ -270,19 +274,15 @@ class SettingsScreen(ScreenState):
             if f.key in self._env_set:
                 line.push_span(Span(
                     "   [env]",
-                    theme.HIGHLIGHT_MUTED_STYLE if active else theme.STATUS_VALUE_STYLE,
+                    theme.HIGHLIGHT_MUTED_STYLE if active else theme.WARN_STYLE,
                 ))
             lines.append(line)
+        # Save — the SAFE-COMMIT row: green (the counterpart of the destructive red).
         save_active = self.cursor >= self._n
+        plan = ("nothing to save — no edits yet" if not self.dirty
+                else "writes launcher settings to lekiwi.yaml")
         lines.append(Line([Span("", theme.BASE_STYLE)]))
-        lines.append(option_line(
-            f"{theme.action_icon('💾')} Save settings",
-            "write launcher settings",
-            focused=save_active,
-            label_width=22,
-            width=width,
-            label_unfocused_style=theme.OK_STYLE,
-        ))
+        lines.append(plan_row("Save", plan, focused=save_active, accent="ok", label_pad=9))
         return Paragraph(Text(lines)).style(theme.BASE_STYLE)
 
     def _sub(self) -> Paragraph:
@@ -291,34 +291,9 @@ class SettingsScreen(ScreenState):
         return Paragraph(Text([Line([
             Span("Launcher settings", _SUB_LEAD_STYLE),
             Span("  → ", theme.MUTED_STYLE),
-            Span(_collapse_home(str(self._cfg_path)), theme.MUTED_STYLE),
+            Span(collapse_home(str(self._cfg_path)), theme.MUTED_STYLE),
             Span("  ·  env vars set at launch override these values", theme.MUTED_STYLE),
         ])])).style(theme.BASE_STYLE)
-
-    def _info(self) -> Paragraph:
-        # The active field's hint (muted), or the Save-row note. When the active field is
-        # env-overridden, prepend the [env override] provenance caveat (SAND) (bash 1058-1064
-        # _info_text). Reads self._env_set — kept in sync by _edit_yaml — to match _body.
-        if self.cursor >= self._n:
-            return Paragraph(Text([Line([Span(
-                "writes launcher settings to lekiwi.yaml · launch env vars still win",
-                theme.MUTED_STYLE)])])).style(theme.BASE_STYLE)
-        f = CONFIG_SPEC[self.cursor]
-        spans: list[Span] = []
-        if f.key in self._env_set:
-            spans.append(Span("[env override] ", theme.STATUS_VALUE_STYLE))
-            spans.append(Span("an env var set this; it wins until unset  ·  ", theme.MUTED_STYLE))
-        spans.append(Span(f.hint, theme.MUTED_STYLE))
-        return Paragraph(Text([Line(spans)])).style(theme.BASE_STYLE)
-
-    def _hint(self) -> Paragraph:
-        return keycap_hint_line([
-            ("↑↓/jk", "move"),
-            ("←→", "adjust"),
-            ("⏎", "edit/browse/save"),
-            ("e", "edit file"),
-            ("q", "back"),
-        ])
 
 
 def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001
@@ -331,7 +306,7 @@ def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001
     ``ctx`` (there is no ``app.cfg``), so it takes ``ctx`` and reads ``ctx.cfg.values`` /
     ``ctx.cfg.env_set``. ``__main__`` calls this hook for direct no-TTY settings dispatch."""
     cfg = ctx.cfg
-    print(f"# effective lekiwi config (env > {_collapse_home(str(CFG_FILE))} > built-in defaults)")
+    print(f"# effective lekiwi config (env > {collapse_home(str(CFG_FILE))} > built-in defaults)")
     for f in CONFIG_SPEC:
         val = cfg.values[f.key]
         if f.key in cfg.env_set:

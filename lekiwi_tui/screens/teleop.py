@@ -18,19 +18,27 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
+from pyratatui import Line, Span
 
 from .. import ROOT
-from ..config import cfg_get
+from ..config import as_int, cfg_get
 from ..framework import runner, theme
 from ..framework.events import (
-    BACKTAB, DOWN, ENTER, ESC, LEFT, RIGHT, SPACE, TAB, UP, Key, is_char,
+    BACKTAB, DOWN, ENTER, ESC, LEFT, RIGHT, SPACE, TAB, UP, Key,
 )
 from ..framework.focus import FocusRing
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
 from ..framework.widgets import NumberField
 from ..preflight import confirm_preflight, robot_runtime_issues
-from .chrome import keycap_hint_line, option_line, runtime_chips
+from ..hostprobe import host_alive
+from .chrome import (
+    draw_form_page,
+    number_line,
+    plan_row,
+    section_line,
+    setting_line,
+    toggle,
+)
 
 if TYPE_CHECKING:
     from ..context import Context
@@ -40,17 +48,6 @@ if TYPE_CHECKING:
 HEADLESS_HOOK = "run_headless"
 
 TELEOP_SCRIPT = ROOT / "scripts" / "teleop.sh"
-RULE = "─" * 54
-
-
-def _as_int(v: Any, default: int) -> int:
-    if isinstance(v, bool):
-        return default
-    if isinstance(v, int):
-        return v
-    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
-        return int(v)
-    return default
 
 
 class _Toggle:
@@ -63,9 +60,6 @@ class _Toggle:
 
     def toggle(self) -> None:
         self.value = not self.value
-
-    def display(self) -> str:
-        return theme.choice("on") if self.value else theme.choice("off")
 
 
 class _Start:
@@ -86,9 +80,10 @@ class TeleopScreen(ScreenState):
         doc = ctx.doc
         self.display = _Toggle("Display", bool(cfg_get("teleop.display_data", doc=doc)))
         self.dur = NumberField("Duration", 0, minimum=0, step=5, unit="s", zero_label="until Ctrl+C")
-        self.fps = NumberField("FPS", _as_int(cfg_get("teleop.fps", doc=doc), 30), minimum=1, step=5)
+        self.fps = NumberField("FPS", as_int(cfg_get("teleop.fps", doc=doc), 30), minimum=1, step=5)
         self.start = _Start()
-        self.ring = FocusRing([self.display, self.dur, self.fps, self.start])
+        # Ring order == VISUAL order: Duration · FPS · Display share the SESSION row.
+        self.ring = FocusRing([self.dur, self.fps, self.display, self.start])
         self._msg = ""
         # True when a focused number field's editor mirrors its committed value, so the
         # next printable key REPLACES it (type-to-set) rather than appending; cleared after
@@ -128,19 +123,10 @@ class TeleopScreen(ScreenState):
             return Nothing
         if name == SPACE and isinstance(cur, _Toggle):
             cur.toggle(); return Nothing
-        # Type digits / edit into a focused number field. The first printable key after a
-        # focus move / step / commit REPLACES the mirrored value (type-to-set); subsequent
-        # keys edit in place. Live-commit whenever the buffer parses as a number.
-        if isinstance(cur, NumberField) and (is_char(key) or name == "Backspace"):
-            if self._fresh and is_char(key):
-                cur.editor.clear()
+        if isinstance(cur, NumberField) and cur.type_key(key, fresh=self._fresh):
             self._fresh = False
-            if cur.editor.handle_key(key):
-                t = cur.editor.value.strip()
-                if t.isdigit():
-                    cur.set_text(t)
-                self._msg = ""
-                return Nothing
+            self._msg = ""
+            return Nothing
         return Nothing
 
     def _move(self, mover) -> None:
@@ -171,111 +157,49 @@ class TeleopScreen(ScreenState):
             return
         await self.app.suspend(self._argv(), title="teleop")
 
-    # ── view (rebuilt each frame) ─────────────────────────────────────────────
-    def draw(self, frame: Any, area: Any) -> None:
-        frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
-        rows = (
-            Layout().direction(Direction.Vertical).constraints([
-                Constraint.length(1),   # header
-                Constraint.length(1),   # rule
-                Constraint.length(1),   # runtime chips
-                Constraint.length(2),   # info
-                Constraint.length(1),   # gap
-                Constraint.length(1),   # display
-                Constraint.length(1),   # duration
-                Constraint.length(1),   # fps
-                Constraint.length(1),   # gap
-                Constraint.length(1),   # start
-                Constraint.length(1),   # msg
-                Constraint.fill(1),     # spacer
-                Constraint.length(1),   # hint
-            ]).split(area)
-        )
-        frame.render_widget(
-            Paragraph(Text([Line([
-                Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE),
-                Span("  teleop", theme.SUBTITLE_STYLE),
-            ])])).style(theme.BASE_STYLE), rows[0])
-        frame.render_widget(Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
-        frame.render_widget(runtime_chips(self.ctx), rows[2])
-        frame.render_widget(
-            Paragraph(Text([
-                Line([Span("leader arm controls the follower; keyboard drives the base (wasd + zx)", theme.MUTED_STYLE)]),
-                Line([Span("⚠ start the Pi host first; after launch, Ctrl+C stops teleop", theme.STATUS_VALUE_STYLE)]),
-            ])).style(theme.BASE_STYLE), rows[3])
+    # ── view (rebuilt each frame; body lines are the testable view-model) ─────
 
-        self._row(frame, rows[5], self.display, self.display.display(),
-                  "show live Rerun view (off lowers CPU)")
-        self._num_row(frame, rows[6], self.dur, self.dur.hint() + " · 0 = run until Ctrl+C")
-        self._num_row(frame, rows[7], self.fps, self.fps.hint() + " · control-loop rate")
-        self._start_row(frame, rows[9])
+    def _host_alive(self) -> bool | None:
+        return host_alive(self.ctx)
 
-        if self._msg:
-            frame.render_widget(
-                Paragraph(Text([Line([Span(self._msg, theme.ERR_STYLE)])])).style(theme.BASE_STYLE),
-                rows[10])
-        self._hint(frame, rows[12])
+    def _focused_hint(self) -> str:
+        cur = self.ring.current()
+        if cur is self.dur:
+            return "0 = drive until Ctrl+C · ←→ ±5 · ⏎ type a number"
+        if cur is self.fps:
+            return "control-loop rate · ←→ ±5 · ⏎ type a number"
+        if cur is self.display:
+            return "show live Rerun view (off lowers CPU) · ←→/⏎ toggle"
+        if self._host_alive() is False:
+            return "preflight will stop the launch while the host is down"
+        return "runs preflight, then hands the terminal to teleop (Ctrl+C ends it)"
 
-    # ── row helpers (shared shape: a 2-col focus gutter + content) ────────────
-    def _split_gutter(self, area: Any):
-        cols = (Layout().direction(Direction.Horizontal)
-                .constraints([Constraint.length(2), Constraint.fill(1)]).split(area))
-        return cols[0], cols[1]
-
-    def _gutter(self, frame: Any, area: Any, focused: bool) -> None:
-        bar = theme.selector(focused)
-        frame.render_widget(
-            Paragraph(Text([Line([Span(bar, theme.HIGHLIGHT_LABEL_STYLE)])])).style(theme.BASE_STYLE),
-            area)
-
-    def _row(self, frame: Any, area: Any, field: Any, value: str, hint: str) -> None:
-        focused = self.ring.is_focused(field)
-        frame.render_widget(
-            Paragraph(Text([option_line(
-                field.label, value, hint, focused=focused, label_width=10, width=area.width
-            )])).style(theme.BASE_STYLE),
-            area,
-        )
-
-    def _num_row(self, frame: Any, area: Any, field: "NumberField", hint: str) -> None:
-        focused = self.ring.is_focused(field)
-        gut, content = self._split_gutter(area)
-        self._gutter(frame, gut, focused)
-        if focused:
-            # NumberField.draw shows the live editor (caret) when focused.
-            cols = (Layout().direction(Direction.Horizontal)
-                    .constraints([Constraint.length(28), Constraint.fill(1)]).split(content))
-            field.draw(frame, cols[0], focused=True)
-            frame.render_widget(
-                Paragraph(Text([Line([Span(f"  {hint}", theme.MUTED_STYLE)])])).style(theme.BASE_STYLE),
-                cols[1])
-        else:
-            self._row(frame, area, field, field.display(), hint)
-
-    def _start_row(self, frame: Any, area: Any) -> None:
+    def _body_lines(self, width: int = 100) -> list[Line]:
+        lines: list[Line] = [section_line("SESSION")]
+        lines.append(number_line(self.dur, "Duration", self.ring.is_focused(self.dur),
+                                 "0 = drive until you press Ctrl+C", width=width))
+        lines.append(number_line(self.fps, "FPS", self.ring.is_focused(self.fps),
+                                 "the robot's control-loop rate", width=width))
+        lines.append(setting_line(
+            "Display", toggle(self.display.value, focused=self.ring.is_focused(self.display)),
+            "mirror the cameras in a window (off lowers CPU)",
+            focused=self.ring.is_focused(self.display), width=width))
+        lines.append(Line([]))
+        # Start — the plan sentence; the host-down warning REPLACES it at the
+        # decision point (the approved page-2 idiom; no banner rows).
         focused = self.ring.is_focused(self.start)
-        frame.render_widget(
-            Paragraph(Text([option_line(
-                f"{theme.play_mark()} Start teleop",
-                "launch live control",
-                focused=focused,
-                label_width=20,
-                width=area.width,
-                label_unfocused_style=theme.TEXT_STYLE,
-            )])).style(theme.BASE_STYLE),
-            area,
-        )
+        if self._host_alive() is False:
+            plan_span = Span("⚠ host not reachable — Start host first (menu 1)",
+                             theme.WARN_STYLE)
+        else:
+            plan_span = Span("leader arm + wasd·zx base · no recording · full-TTY session",
+                             theme.HIGHLIGHT_MUTED_STYLE if focused else theme.MUTED_STYLE)
+        lines.append(plan_row("Start", [plan_span], focused=focused))
+        return lines
 
-    def _hint(self, frame: Any, area: Any) -> None:
-        frame.render_widget(
-            keycap_hint_line([
-                ("↑↓/jk", "move"),
-                ("←→/hl", "adjust"),
-                ("⏎", "edit/toggle/start"),
-                ("q", "back"),
-            ]),
-            area,
-        )
+    def draw(self, frame: Any, area: Any) -> None:
+        draw_form_page(frame, area, self.ctx, "teleop", self._body_lines(area.width),
+                       msg=self._msg, hint=self._focused_hint())
 
 
 def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001

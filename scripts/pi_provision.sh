@@ -6,7 +6,7 @@
 # of truth; this SSHes in and builds a self-contained conda env running the SAME (latest)
 # lerobot the laptop runs, so one repo drives both sides.
 #
-# Work is split into 3 idempotent STAGES, one per layer of the stack. Run them all
+# Work is split into 4 idempotent STAGES, one per layer of the stack. Run them all
 # (default) or pick a subset to re-run after a fix:
 #
 #   ./pi_provision.sh                 run every stage in order
@@ -15,6 +15,7 @@
 #   ./pi_provision.sh list            list the stages
 #
 #   system    OS layer:      apt (git, build-essential, ffmpeg, ...) + dialout/video groups  [sudo]
+#   network   OS layer:      force WiFi power-save OFF (NM dispatcher + conf) — brcmfmac freeze fix  [sudo]
 #   conda     runtime layer: Miniforge3 (aarch64) + mamba-create the python 3.12 env + uv
 #   lerobot   app layer:     delegate to sync.sh --install (mirror + editable installs), then smoke-test
 #
@@ -58,7 +59,7 @@ LOCAL_REPO="${LOCAL_REPO:-$(default_local_repo)}"
 # lerobot_robot_lekiwi_pincopen.lekiwi_host`, calibrate uses --robot.type=lekiwi_pincopen.
 LOCAL_PLUGIN="${LOCAL_PLUGIN:-$(cd "$ROOT/.." && pwd -P)/lerobot_robot_lekiwi_pincopen}"
 
-STAGES=(system conda lerobot)
+STAGES=(system network conda lerobot)
 dry="${DRY:-0}"
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -129,6 +130,52 @@ stage_system() {
         sudo usermod -aG dialout,video \"\$USER\" &&
         echo \"groups now: \$(id -nG)  (log out/in once if dialout/video were just added)\"
     "
+}
+
+stage_network() {
+    banner network "WiFi power-save OFF (brcmfmac Pi-freeze fix): NM dispatcher + conf"
+    # WHY: the Pi's brcmfmac WiFi wedges under concurrent WiFi + USB/DMA load when
+    # power-save engages (see my_robot/PI_FREEZE_RUNBOOK.md). A persistent conf alone has
+    # silently failed to apply before, so we ALSO install a NetworkManager dispatcher that
+    # re-asserts `iw ... set power_save off` on every association — surviving reconnects and
+    # roaming, covering teleop/record/rollout alike. Idempotent: both files are overwritten.
+    #
+    # The remote body is base64-encoded so its nested heredocs survive the ssh argument
+    # cleanly; `ssh -t` allocates a TTY so sudo can prompt (same interactive model as
+    # stage_system). sudo reads the password from the TTY while bash reads the script on stdin.
+    local script b64
+    script="$(cat <<'SH'
+set -eu
+install -d -m 0755 /etc/NetworkManager/dispatcher.d /etc/NetworkManager/conf.d
+# Dispatcher: NM calls it with $1=iface $2=action, as root, on every state change.
+cat > /etc/NetworkManager/dispatcher.d/50-wifi-powersave-off <<'EOF'
+#!/bin/sh
+# LeKiwi: force WiFi power-save OFF on every association (brcmfmac freeze fix).
+IFACE="$1"; ACTION="$2"
+case "$IFACE" in wlan*) ;; *) exit 0 ;; esac
+if [ "$ACTION" = "up" ] || [ "$ACTION" = "connectivity-change" ]; then
+  IW="$(command -v iw || echo /usr/sbin/iw)"
+  "$IW" dev "$IFACE" set power_save off
+fi
+EOF
+# NM ignores dispatcher scripts that are not root-owned or are group/world-writable.
+chown root:root /etc/NetworkManager/dispatcher.d/50-wifi-powersave-off
+chmod 0755 /etc/NetworkManager/dispatcher.d/50-wifi-powersave-off
+# Persistent baseline (takes effect on the next association; the dispatcher guarantees it now).
+cat > /etc/NetworkManager/conf.d/wifi-powersave-off.conf <<'EOF'
+[connection]
+wifi.powersave = 2
+EOF
+# Apply immediately on any present wifi iface (also re-asserted on the next 'up').
+for ifc in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+  iw dev "$ifc" set power_save off 2>/dev/null || true
+  printf '  %s power_save -> ' "$ifc"; iw dev "$ifc" get power_save 2>/dev/null | awk '{print $NF}' || echo '?'
+done
+echo "wifi power-save: dispatcher + conf installed"
+SH
+)"
+    b64="$(printf '%s' "$script" | base64 | tr -d '\n')"
+    ssh -t "$PI_HOST" "echo $b64 | base64 -d | sudo bash"
 }
 
 stage_conda() {

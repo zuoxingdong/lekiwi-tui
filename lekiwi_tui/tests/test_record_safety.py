@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from lekiwi_tui.screens.record import safe_delete_target, valid_dataset_name
+from lekiwi_tui.datasets import safe_delete_target, valid_dataset_name
 
 
 def test_dataset_name_rejects_dot_directories():

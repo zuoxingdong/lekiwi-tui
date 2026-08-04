@@ -104,6 +104,25 @@ def is_config_key(key: str) -> bool:
     return key in _SPEC_BY_KEY
 
 
+def collapse_home(path) -> str:  # noqa: ANN001 - str or Path
+    """~-collapse an absolute path for display (the one shared implementation —
+    seven screens used to hand-roll this)."""
+    s = str(path)
+    home = os.path.expanduser("~")
+    return "~" + s[len(home):] if s.startswith(home) else s
+
+
+def as_int(v, default: int) -> int:  # noqa: ANN001
+    """Coerce a config value (str digits or int; bool is NOT an int here) to int."""
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+        return int(v)
+    return default
+
+
 def resolve_workspace_path(value: str) -> str:
     """Resolve a LOCAL_REPO / LOCAL_PLUGIN style config value to an absolute path.
 

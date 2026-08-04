@@ -1,0 +1,268 @@
+"""The card-grid main menu: coverage, digit honesty, icon widths, and 2-D navigation.
+
+These guard the three ways this screen can silently lie: an action that no longer appears
+in any card, a row whose visible digit is not the digit that jumps to it, and an icon whose
+rendered width is not the width the layout reserved.
+"""
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+from lekiwi_tui.app_registry import ACTIONS
+from lekiwi_tui.framework import theme
+from lekiwi_tui.framework.events import DOWN, LEFT, RIGHT, UP, Key
+from lekiwi_tui.screens import menu as menu_mod
+from lekiwi_tui.screens.menu import MenuScreen, _GRID, _JUMPABLE, _STRIP
+
+from conftest import make_ctx
+
+
+def _screen() -> MenuScreen:
+    return MenuScreen(MagicMock(), make_ctx(gpu_name="RTX 4090"))
+
+
+def _press(screen: MenuScreen, name: str) -> None:
+    screen.handle_key(Key(name=name))
+
+
+# ── coverage: the grid must not lose an action ────────────────────────────────
+def test_every_action_appears_exactly_once_in_the_grid_or_strip():
+    """A card name in _LAYOUT that no action claims would silently drop those actions off
+    the menu — reachable by alias, invisible on screen. This is the test that catches it."""
+    placed = [a for row in _GRID for cell in row for a in cell] + list(_STRIP)
+
+    assert len(placed) == len(ACTIONS), "grid + strip must hold every action"
+    assert set(placed) == set(ACTIONS)
+    assert len(set(placed)) == len(placed), "an action is placed twice"
+
+
+def test_no_card_in_the_layout_is_empty():
+    for row in _GRID:
+        for cell in row:
+            assert cell, "an empty card would render as a titled box with nothing in it"
+
+
+# ── digit honesty ─────────────────────────────────────────────────────────────
+def test_displayed_digit_matches_the_digit_that_jumps_there():
+    """Cards regroup COLLECT into COLLECT + DATA, so the card order no longer matches
+    ACTIONS order. The digit a row SHOWS must still be the digit that runs it."""
+    screen = _screen()
+    for n, action in enumerate(_JUMPABLE, start=1):
+        result = screen.handle_key(Key(name=str(n)))
+        assert getattr(result, "id", None) == action.id, f"digit {n}"
+        assert screen.selected is action
+
+
+def test_setup_strip_has_no_digits():
+    for action in _STRIP:
+        assert action not in _JUMPABLE
+
+
+# ── icon widths ───────────────────────────────────────────────────────────────
+def test_no_registry_icon_carries_a_variation_selector():
+    """U+FE0F is the whole bug: the layout library measures one cell, the terminal draws
+    two, and every label after it shifts a column right."""
+    offenders = [(a.id, a.icon) for a in ACTIONS if theme.icon_unstable(a.icon)]
+
+    assert not offenders, f"variation-selector icons misalign their rows: {offenders}"
+
+
+def test_every_icon_cell_is_exactly_two_columns():
+    for action in ACTIONS:
+        cell = theme.icon_cell(action.icon)
+        cols = theme.glyph_cols(cell[0]) + (len(cell) - 1)
+
+        assert cols == theme.ICON_CELL_W, f"{action.id}: {action.icon!r} -> {cols} cols"
+
+
+def test_icon_cell_pads_a_narrow_glyph_and_leaves_a_wide_one_alone():
+    assert theme.icon_cell("⚙") == "⚙ "     # plain gear: 1 column, padded to 2
+    assert theme.icon_cell("🚀") == "🚀"     # wide emoji: already 2
+
+
+def test_icon_cell_is_two_columns_in_ascii_mode(monkeypatch):
+    """ASCII fallbacks are one column, so the cell must pad them too or the labels in a
+    no-emoji terminal sit one column left of where the cards expect them."""
+    monkeypatch.setattr(theme, "EMOJI_ENABLED", False)
+    for action in ACTIONS:
+        assert len(theme.icon_cell(action.icon)) == theme.ICON_CELL_W
+
+
+# ── navigation ────────────────────────────────────────────────────────────────
+def test_down_walks_within_a_card_then_spills_into_the_card_below():
+    screen = _screen()
+    assert screen.selected.id == "host-launch"      # HOST, first row
+
+    _press(screen, DOWN)
+    assert screen.selected.id == "host-kill"        # still HOST
+    _press(screen, DOWN)
+    assert screen.selected.id == "edit-dataset"     # spilled into DATA, same column
+
+
+def test_right_switches_column_keeping_the_index():
+    screen = _screen()
+    _press(screen, RIGHT)
+    assert screen.selected.id == "teleop"           # HOST[0] -> COLLECT[0]
+
+    _press(screen, DOWN)
+    _press(screen, LEFT)
+    assert screen.selected.id == "host-kill"        # COLLECT[1] -> HOST[1]
+
+
+def test_right_clamps_the_index_into_a_shorter_card():
+    screen = _screen()
+    screen.handle_key(Key(name="7"))                # DATA[2] = View
+    assert screen.selected.id == "view"
+
+    _press(screen, RIGHT)                           # LEARN has only two actions
+    assert screen.selected.id == "eval"
+
+
+def test_up_from_the_first_card_wraps_into_the_setup_strip():
+    screen = _screen()
+    _press(screen, UP)
+
+    assert screen.selected is _STRIP[-1]
+
+
+def test_down_from_the_last_card_enters_the_setup_strip_then_wraps_to_the_top():
+    screen = _screen()
+    screen.handle_key(Key(name="9"))                # LEARN[1] = Run policy, last card
+    _press(screen, DOWN)
+    assert screen.selected is _STRIP[0]
+
+    _press(screen, DOWN)
+    assert screen.selected.id == "host-launch"
+
+
+def test_left_right_walk_along_the_setup_strip():
+    screen = _screen()
+    _press(screen, UP)                              # into the strip, last entry
+    assert screen.selected is _STRIP[-1]
+
+    _press(screen, RIGHT)
+    assert screen.selected is _STRIP[0]             # wraps within the strip
+    _press(screen, LEFT)
+    assert screen.selected is _STRIP[-1]
+
+
+def test_down_alone_walks_one_column_and_returns():
+    """Grid semantics: ↓ stays in its column. Recorded deliberately — with the old flat
+    list ↓ reached everything, and it no longer does, which is why ←→ are in the hints."""
+    screen = _screen()
+    walk = [screen.selected.id]
+    for _ in range(6):
+        _press(screen, DOWN)
+        walk.append(screen.selected.id)
+
+    assert walk == ["host-launch", "host-kill", "edit-dataset", "replay", "view",
+                    "setup-pi", "host-launch"]
+
+
+def test_every_action_is_reachable_with_the_arrows_alone():
+    """The reachability guarantee that matters: no action may be stranded behind a digit.
+    Breadth-first over all four moves from the default selection."""
+    frontier, seen = [_screen().selected.id], set()
+    while frontier:
+        start = frontier.pop()
+        if start in seen:
+            continue
+        seen.add(start)
+        for key in (UP, DOWN, LEFT, RIGHT):
+            screen = _screen()
+            screen._sel = next(i for i, a in enumerate(ACTIONS) if a.id == start)
+            _press(screen, key)
+            frontier.append(screen.selected.id)
+
+    assert seen == {a.id for a in ACTIONS}
+
+
+def test_hjkl_mirror_the_arrows():
+    a, b = _screen(), _screen()
+    for key_a, key_b in ((DOWN, "j"), (RIGHT, "l"), (UP, "k"), (LEFT, "h")):
+        _press(a, key_a)
+        _press(b, key_b)
+        assert a.selected is b.selected
+
+
+# ── descriptions ──────────────────────────────────────────────────────────────
+def test_card_description_prefers_the_short_brief():
+    screen = _screen()
+    record = next(a for a in ACTIONS if a.id == "record")
+
+    assert screen._desc(record, 45) == record.brief
+
+
+def test_card_description_marks_truncation_instead_of_clipping_silently():
+    screen = _screen()
+    setup = next(a for a in ACTIONS if a.id == "setup-pi")   # long hint, no brief
+
+    text = screen._desc(setup, 30)
+
+    assert text.endswith("…")
+    assert len(text) <= 30 - MenuScreen._DESC_INDENT
+
+
+def test_every_daily_action_has_a_brief_that_fits_a_card():
+    """Cards are half-width; a daily action without a short description would render
+    truncated on the screen you look at most."""
+    for action in _JUMPABLE:
+        assert action.brief, f"{action.id} has no brief"
+        assert len(action.brief) <= 39, f"{action.id} brief is too long for a card"
+
+
+# ── the small-terminal fallback ───────────────────────────────────────────────
+def test_a_short_terminal_falls_back_to_the_flat_list(monkeypatch):
+    """The card grid needs ~27 rows. A launcher still has to render below that."""
+    screen = _screen()
+    drawn: list[str] = []
+    monkeypatch.setattr(MenuScreen, "_draw_cards",
+                        lambda self, f, a: drawn.append("cards"))
+    monkeypatch.setattr(MenuScreen, "_flat_body",
+                        lambda self: drawn.append("flat") or MagicMock())
+
+    import pyratatui as p
+
+    frame = MagicMock()
+    screen.draw(frame, p.Rect(0, 0, 100, 40))
+    assert drawn == ["cards"]
+
+    drawn.clear()
+    screen.draw(frame, p.Rect(0, 0, 100, menu_mod._MIN_CARD_H - 1))
+    assert drawn == ["flat"]
+
+    drawn.clear()
+    screen.draw(frame, p.Rect(0, 0, menu_mod._MIN_CARD_W - 1, 40))
+    assert drawn == ["flat"]
+
+
+def test_the_real_card_draw_path_renders_every_panel():
+    """Exercises _draw_cards for real (the fallback test stubs it out): five panels — the
+    status card plus four section cards — and no exception from the layout arithmetic."""
+    import pyratatui as p
+
+    screen = _screen()
+    panels: list[tuple[str, int]] = []
+    original = MenuScreen._draw_panel
+    MenuScreen._draw_panel = lambda self, f, a, t, ls: panels.append((t, len(ls)))
+    try:
+        screen.draw(MagicMock(), p.Rect(0, 0, 100, 40))
+    finally:
+        MenuScreen._draw_panel = original
+
+    assert [t for t, _ in panels] == ["ROBOT", "HOST", "COLLECT", "DATA", "LEARN"]
+    # Two lines per action in a section card; the status card is robot / laptop / identity.
+    assert dict(panels)["ROBOT"] == 3
+    assert dict(panels)["DATA"] == 6
+    assert dict(panels)["LEARN"] == 4
+
+
+def test_status_card_identity_row_reads_real_config():
+    """robot type and conda env replaced the leader port and base state by request, so
+    they must come from the config rather than being hard-coded."""
+    screen = _screen()
+
+    text = "".join(sp.content for sp in screen._identity_spans())
+
+    assert text.startswith("robot ")
+    assert " env " in text

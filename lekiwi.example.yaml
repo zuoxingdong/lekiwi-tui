@@ -1,18 +1,38 @@
 ################################################################################
-# lekiwi.example.yaml
+# lekiwi.example.yaml — the template for lekiwi.yaml, the single source of truth
+# for every lerobot command the TUI (and lekiwi.sh) drives.
 #
-# Copy this file to lekiwi.yaml before first use:
+# Copy it before first use:
 #
 #   cp lekiwi.example.yaml lekiwi.yaml
 #
-# Then edit lekiwi.yaml for your robot, laptop, dataset paths, policy paths, and
-# network. lekiwi.yaml is intentionally ignored by Git so local hostnames, IPs,
-# usernames, serial ports, dataset names, and model paths do not get published.
+# Then edit lekiwi.yaml for your robot, laptop, dataset paths, policy paths and
+# network. lekiwi.yaml is ignored by Git on purpose, so local hostnames, IPs,
+# usernames, serial ports, dataset names and model paths never get published.
+#
+# Layout:
+#   • The _-prefixed keys at the top are SHARED BUILDING BLOCKS (YAML anchors).
+#     They are never passed to a CLI; they exist only to be reused below.
+#   • Each remaining top-level key (host / teleop / record / replay / rollout /
+#     train) is ONE command's full config. The launcher slices out the matching
+#     block and hands it to the lerobot-* CLI via --config_path, so a block must
+#     contain only that command's valid fields (draccus rejects unknown keys).
+#
+# Sharing uses core YAML: anchors (&name), aliases (*name) and merge (<<: *name),
+# which every loader resolves (no plugins, no !include). Edit a shared value once
+# (remote_ip, the dataset root, the task) and every command picks it up.
 ################################################################################
 
-# Shared launcher and ops knobs. These configure the TUI and local launcher
-# scripts, not a lerobot command block. Keep values quoted so YAML loads them as
-# strings; the Settings screen preserves that shape when saving lekiwi.yaml.
+# ============================================================================
+# Shared building blocks (anchors — not commands)
+# ============================================================================
+
+# Launcher / ops knobs (NOT a lerobot command block). These configure the TUI and
+# the bootstrap shim, never a CLI: the key is `_`-prefixed so cfg_for never slices
+# it. Every value is QUOTED so it loads as a string (an unquoted off/on/600 would
+# become a bool/int and break the enum/int knobs). Edit via the Settings screen,
+# the `e` editor, or by hand. Precedence: env var at launch > these > built-in
+# default. Value lines are kept comment-free so the bootstrap awk reads them.
 _launcher:
   LAPTOP_ENV: 'lekiwi'
   MAMBA_ROOT: '/home/YOUR_USER/miniforge3'
@@ -24,73 +44,125 @@ _launcher:
   CONNECTION_TIME: '600'
   CONDA_ENV: 'lekiwi'
   PI_REPO: 'lekiwi/lerobot'
-  LOCAL_REPO: ''                  # laptop lerobot checkout shipped to the Pi; empty = sibling of this checkout
-  LOCAL_PLUGIN: ''  # laptop PincOpen plugin dir; empty = sibling
+  LOCAL_REPO: ''                   # laptop lerobot checkout shipped to the Pi; empty = sibling of this checkout
+  LOCAL_PLUGIN: ''                 # laptop PincOpen plugin dir; empty = sibling
   POLICY_PATH: ''
   POLICY_ROOT: '../../models'
   INFERENCE: 'sync'
   EXECUTION_HORIZON: '20'
   DISPLAY_DATA: 'off'
 
-# Cameras shared by the host and client. Adjust device paths, sizes, FPS, and
-# rotations for your robot.
+# Cameras — single source for BOTH the host and the client. The host captures and
+# applies `rotation`; the client only reads width/height for dataset feature shapes
+# and never rotates, so the rotations here are inert on the client side.
+#
+# Two hard-won details worth keeping:
+#   • fourcc: MJPG on every camera. Without it OpenCV can auto-negotiate
+#     uncompressed YUYV (~150 Mbps per camera), and that USB load combined with
+#     WiFi TX is enough to hard-freeze a Pi.
+#   • a bare /dev/videoN is not reboot/replug-stable, and adding a camera can
+#     renumber the others. Prefer /dev/v4l/by-path/...-video-index0 once the
+#     hardware is settled.
 _cameras: &cameras
   front:
     type: opencv
     index_or_path: /dev/video0
+    fourcc: MJPG
     width: 640
     height: 480
     fps: 30
     rotation: NO_ROTATION
   wrist:
     type: opencv
-    index_or_path: /dev/video2
+    index_or_path: /dev/video4   # the rotation below belongs to the LOGICAL camera, so
+    fourcc: MJPG                 # re-check the node when USB enumeration shifts
     width: 640
     height: 480
     fps: 30
     rotation: ROTATE_180
   top:
     type: opencv
-    index_or_path: /dev/video4
+    index_or_path: /dev/video2
+    fourcc: MJPG
     width: 640
     height: 480
     fps: 30
     rotation: NO_ROTATION
 
-# Laptop-side client connection to the LeKiwi host running on the robot.
+# LeKiwi connection. The laptop runs the client; the host runs on the robot.
 _robot: &robot
-  type: lekiwi_client
-  remote_ip: 192.168.0.123
+  type: lekiwi_pincopen_client   # plugin client: adds the `cameras` property stock
+                                 # lekiwi_client lacks, so record can size its image
+                                 # writer instead of crashing on len(robot.cameras)
+  remote_ip: 192.168.0.123       # LeKiwi host IP — change when your network changes
   id: lekiwi
-  polling_timeout_ms: 40
+  polling_timeout_ms: 40         # give the host time to stream each obs (default 15)
   cameras: *cameras
 
-# SO101 leader arm used during teleop and recording.
+# SO101 leader arm (drives the follower arm during teleop / record).
+# One teleoperator drives both the arm and the base: it wraps a sprung leader plus a
+# keyboard, so the CLIs see a single device and the base moves without needing any
+# multi-teleop support in lerobot. Arm settings live under `arm_config`.
+# calibration_dir must be ABSOLUTE — lerobot does not expand `~`.
 _leader_arm: &leader_arm
-  type: so101_leader
-  port: /dev/ttyACM0
+  type: lekiwi_pincopen_leader
   id: lekiwi_leader
+  calibration_dir:
+    /home/YOUR_USER/.cache/huggingface/lerobot/calibration/teleoperators/so101_leader
+  arm_config:
+    port: /dev/ttyACM0           # SO101 leader-arm serial port — changes per machine
 
-# Local dataset location. The root is resolved from this checkout directory.
+# Local dataset location. Shared by record (writes), replay + train (read).
 _dataset: &dataset
-  repo_id: local/lekiwi-example
-  root: ../../datasets/lekiwi-example  # ../../ = the workspace data root (checkout lives under <workspace>/projects/)
+  repo_id: local/lekiwi-demo     # local-only; the `local/` namespace is cosmetic (push_to_hub off)
+  root: ../../datasets/lekiwi-demo  # on-disk path, relative to this checkout
 
-# Language instruction shared by record and rollout/eval.
-_task: &task "Pick up the object and place it in the target container."
+# The language instruction. record stamps it onto the dataset; rollout sends it to
+# the policy. They MUST match what the policy was trained on, so share one string.
+# The TUI rewrites this + record.single_task + rollout.task together
+# (persist_record_defaults); add any new *task consumer there.
+_task: &task "Pick up the cube and place it in the box."
 
 
-# Host process run on the robot/Pi.
+# ============================================================================
+# host — the LeKiwi host process (runs ON the robot)
+# The launcher ships this block to the Pi and starts the host with
+# --config_path <this block>, so camera/host config lives here, NOT in lerobot
+# source. Schema = LeKiwiServerConfig {robot: LeKiwiConfig, host: LeKiwiHostConfig}.
+# --robot.id and --host.connection_time_s are set per launch and override this.
+# ============================================================================
 host:
   robot:
+    # host captures + applies the rotations above
     cameras: *cameras
-    use_degrees: true
+    use_degrees: true            # latest lerobot default; keep in sync with training
+    # Servo tuning for a PincOpen arm whose load-bearing joints are STS3250s. The
+    # "heavy" set tracks WHICH SERVO sits in the slot, not the load it carries: those
+    # joints want a softer position loop (lower P) than the arm-wide default, or they
+    # jitter and trip "no status packet" bus shutdowns at full reach.
+    # The gripper is softened and torque-capped separately: closing on a rigid object
+    # stalls it, and a stalled servo pulls max current until Protection_Time backs it
+    # off, so the cap bounds that spike at its source. Capping the ARM joints made a
+    # far reach WORSE (a saturating joint sits further from target and drives a bigger
+    # error), so only the gripper stays capped. Retune for your own arm; this is a
+    # starting point, not a universal default.
+    heavy_joints: [arm_shoulder_lift, arm_elbow_flex, arm_wrist_flex]
+    heavy_p_coefficient: 10
+    heavy_d_coefficient: 32
+    joint_p_overrides: {arm_shoulder_pan: 6, arm_gripper: 12, arm_wrist_roll: 12}
+    joint_d_overrides: {arm_shoulder_pan: 32}
+    joint_acceleration_overrides: {arm_shoulder_pan: 200, arm_wrist_roll: 200}
+    joint_torque_limits: {arm_gripper: 800}
   host:
-    max_loop_freq_hz: 30
-    watchdog_timeout_ms: 500
+    max_loop_freq_hz: 30         # lower if the robot jitters (watch `top` on the Pi)
+    watchdog_timeout_ms: 500     # stop the base if no command arrives within this
 
 
-# Teleoperation without recording.
+# ============================================================================
+# teleop — lerobot-teleoperate
+# Leader arm drives the arm; the attached keyboard drives the base. No recording.
+# Ctrl+C to stop (or add --teleop_time_s=N for a fixed duration).
+# ============================================================================
 teleop:
   robot: *robot
   teleop: *leader_arm
@@ -98,9 +170,14 @@ teleop:
   display_data: true
 
 
-# Teleoperation while recording a dataset.
+# ============================================================================
+# record — lerobot-record
+# Teleoperate while writing a dataset to disk. Override on the CLI as needed,
+# e.g. --dataset.num_episodes=10 --resume=true.
+# ============================================================================
 record:
   robot: *robot
+  # leader arm only; the base keyboard rides along inside the composite teleoperator
   teleop: *leader_arm
   dataset:
     <<: *dataset
@@ -109,55 +186,95 @@ record:
     num_episodes: 5
     episode_time_s: 60
     reset_time_s: 8
+    # Encoding: streaming = encode in real time → near-instant saves.
     streaming_encoding: true
-    encoder_threads: 1
-    video_encoding_batch_size: 1
-    num_image_writer_threads_per_camera: 3
+    encoder_threads: 1           # software-codec threads only; NVENC ignores this
+    video_encoding_batch_size: 1 # KEEP AT 1 — batching has crashed at session end,
+                                 # which loses the whole recording
+    num_image_writer_threads_per_camera: 3  # x3 cameras = 9 total; raise if frames drop
     push_to_hub: false
-  resume: false
-  display_data: false
+    # Optional GPU encode (NVIDIA NVENC), near-zero CPU. bf: 0 is REQUIRED: lerobot's
+    # g=2 GOP cannot fit NVENC's default B-frames and the encoder fails to open.
+    # Delete this block to fall back to the software codec.
+    rgb_encoder:
+      vcodec: h264_nvenc         # or `hevc_nvenc` = smaller files
+      extra_options:
+        bf: 0
+  resume: false                  # true → append to the existing dataset
+  display_data: false            # live camera / Rerun view while recording
 
 
-# Replay a recorded episode back to the robot.
+# ============================================================================
+# replay — lerobot-replay
+# Stream one recorded episode's actions back to the robot (no teleop, no cameras).
+# The episode index is passed on the CLI as --dataset.episode.
+# ============================================================================
 replay:
   robot: *robot
   dataset:
     <<: *dataset
-    episode: 0
+    episode: 0                   # which episode to replay (the launcher overrides this)
     fps: 30
 
 
-# Autonomous policy rollout/eval.
+# ============================================================================
+# rollout — lerobot-rollout
+# A policy drives the robot autonomously (real-robot eval). --policy.path comes from
+# the CLI / the Run policy screen.
+# ============================================================================
 rollout:
   robot: *robot
+  # No `teleop:` — the policy generates every action, including base velocities.
   strategy:
-    type: base
+    type: base                   # autonomous, nothing recorded
   inference:
-    type: sync
+    type: sync                   # one policy forward per tick; for slow VLAs use rtc
+  # Robot camera key → the policy's trained input slot.
+  #
+  # This pairing is NOT a convention you can guess: it is whatever the training run
+  # happened to use, and the checkpoint records it in train_config.json (and in its
+  # saved policy_preprocessor.json). A PERMUTATION is the dangerous case, because
+  # both sides still use the same slot NAMES while the policy silently receives two
+  # of its three views swapped.
+  #
+  # So treat this block as a fallback. The Run policy screen's default `auto`
+  # camera-slots mode reads the mapping out of the checkpoint and sends that, and
+  # warns when the checkpoint disagrees with what is written here. Set it to match
+  # YOUR checkpoint, or leave it alone if your policy trained on the raw
+  # front/wrist/top keys and let `auto` resolve to native.
   rename_map:
     observation.images.front: observation.images.camera1
     observation.images.wrist: observation.images.camera2
     observation.images.top: observation.images.camera3
   fps: 30
-  duration: 60
+  duration: 60                   # seconds; 0 = run until Ctrl-C
   task: *task
-  display_data: false
+  display_data: false            # live camera / action view in Rerun
 
 
-# Local SmolVLA fine-tune.
+# ============================================================================
+# train — lerobot-train
+# A local SmolVLA fine-tune sized for a small (4 GB) laptop GPU: vision encoder
+# frozen, only the ~100M action expert trains. --policy.path / --output_dir /
+# --job_name come from the CLI.
+# ============================================================================
 train:
   dataset:
+    # same dataset record wrote
     <<: *dataset
   policy:
+    # `path:` is REQUIRED so the sibling fields survive draccus's from_pretrained
+    # merge (it pops path, loads the checkpoint config, re-applies the siblings on
+    # top). CLI --policy.path overrides this default.
     path: lerobot/smolvla_base
-    freeze_vision_encoder: true
-    train_expert_only: true
-    push_to_hub: false
-  batch_size: 8
+    freeze_vision_encoder: true  # light recipe: VLM frozen...
+    train_expert_only: true      # ...only the action expert trains (fits 4 GB)
+    push_to_hub: false           # never publish from this machine
+  batch_size: 8                  # lower this first on CUDA OOM
   steps: 20000
-  save_freq: 5000
+  save_freq: 5000                # checkpoint often — a crash never loses much
   log_freq: 100
-  num_workers: 4
+  num_workers: 4                 # dataloader video-decode workers
   seed: 1000
   wandb:
-    enable: false
+    enable: false                # local-only training — no cloud logging

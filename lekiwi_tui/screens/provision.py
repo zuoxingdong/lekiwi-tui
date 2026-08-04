@@ -38,15 +38,15 @@ from typing import TYPE_CHECKING, Any
 
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 
-from pathlib import Path
 
 from .. import ROOT
 from ..config import resolve_workspace_path
+from ..workspace import checkout_provenance, local_checkout, pyproject_version
 from ..framework import runner, theme
 from ..framework.events import DOWN, ENTER, ESC, LEFT, RIGHT, UP, Key
 from ..framework.screen import Invoke, Nothing, Pop, ScreenState
 from ..remote import RemoteValueError, validate_remote_name, validate_ssh_host
-from .chrome import LABEL_W_FIELD, keycap_hint_line, option_line, runtime_chips
+from .chrome import draw_slim_header, hint_slot_line, plan_row, section_line, seg
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -58,7 +58,6 @@ HEADLESS_HOOK = "run_headless"
 
 PROVISION_SCRIPT = ROOT / "scripts" / "pi_provision.sh"
 
-RULE = "─" * 54
 
 # (stage id, one-line what, note). Order = pi_provision.sh STAGES (system→conda→lerobot).
 # Ported VERBATIM from the Textual original.
@@ -105,48 +104,6 @@ def provision_env(cfg, *, py_ver="", recreate=False) -> dict[str, str]:  # noqa:
     if recreate:
         env["RECREATE_ENV"] = "1"
     return env
-
-
-def local_checkout(cfg, key: str, fallback: str) -> "Path":  # noqa: ANN001
-    """The laptop dir a LOCAL_REPO / LOCAL_PLUGIN config value points at (resolved;
-    empty = the sibling-of-this-checkout default the scripts also use)."""
-    return Path(resolve_workspace_path(str(cfg[key])) or str(ROOT.parent / fallback))
-
-
-def pyproject_version(project_dir: "Path") -> str:
-    """The `version = "…"` of a checkout's pyproject.toml, or '?' when unreadable."""
-    try:
-        for line in (project_dir / "pyproject.toml").read_text().splitlines():
-            if line.startswith("version"):
-                return line.split('"')[1]
-    except (OSError, IndexError):
-        pass
-    return "?"
-
-
-def checkout_provenance(project_dir: "Path") -> str:
-    """`<version> · <branch> @ <sha>` for a checkout — the at-a-glance answer to "what
-    exactly would land on the robot?". '✗ not found' when the dir is missing; the git
-    fields degrade to '?' for non-repos (a plain export still shows its version)."""
-    import subprocess
-
-    if not project_dir.is_dir():
-        return "✗ not found"
-
-    def _git(*args: str) -> str:
-        try:
-            out = subprocess.run(
-                ["git", "-C", str(project_dir), *args],
-                capture_output=True, text=True, check=False, timeout=5,
-            )
-            return out.stdout.strip() or "?"
-        except (OSError, subprocess.TimeoutExpired):
-            return "?"
-
-    return (
-        f"{pyproject_version(project_dir)} · "
-        f"{_git('rev-parse', '--abbrev-ref', 'HEAD')} @ {_git('rev-parse', '--short', 'HEAD')}"
-    )
 
 
 def shipping_summary(cfg) -> str:  # noqa: ANN001
@@ -285,145 +242,83 @@ class ProvisionScreen(ScreenState):
         )
 
     # ── view (rebuilt fresh each frame) ────────────────────────────────────────
+    _LABEL_W = 12
+
+    def _lab(self, text: str, focused: bool) -> Span:
+        return Span(f"{text:<{self._LABEL_W}}",
+                    theme.TITLE_STYLE if focused else theme.MUTED_STYLE)
+
+    def _gutter(self, *fields: str) -> Span:
+        on = self.FIELDS[self._fpos] in fields
+        return Span(theme.selector(on), theme.TITLE_STYLE if on else theme.BASE_STYLE)
+
+    def _focused_hint(self) -> str:
+        cur = self.FIELDS[self._fpos]
+        for sid, what, note in STAGES:
+            if cur == sid:
+                return f"{what}{' · ' + note if note else ''} · ←→/⏎ toggle"
+        if cur == "python":
+            return "Pi env python (conda stage) · ←→ cycle"
+        if cur == "recreate":
+            return "rebuild the env if its python does not match · ←→/⏎ toggle"
+        return "steps run in order over SSH; rerun any subset safely (idempotent)"
+
+    def _body_lines(self, width: int = 100) -> list[Line]:
+        cur = self.FIELDS[self._fpos]
+        host = self.ctx.cfg["LEKIWI_HOST"]
+        lines: list[Line] = [section_line("STAGES")]
+        # The three stages as one multi-select pill row (filled = will run). The
+        # focused stage's pill gets the label treatment via the gutter + hint slot.
+        stage_spans: list[Span] = [self._gutter(*_STAGE_IDS),
+                                   self._lab("stages", cur in _STAGE_IDS)]
+        for sid in _STAGE_IDS:
+            stage_spans.append(seg(f"{sid}{'*' if cur == sid else ''}", self._on[sid]))
+            stage_spans.append(Span(" ", theme.BASE_STYLE))
+        stage_spans.append(Span("   all three = first-time bring-up", theme.FAINT_STYLE))
+        lines.append(Line(stage_spans))
+        lines.append(Line([]))
+        lines.append(section_line("PI ENVIRONMENT"))
+        lines.append(Line([
+            self._gutter("python", "recreate"),
+            self._lab("python", cur == "python"),
+            Span(f"{self.PY_CHOICES[self._py_idx]:<8}",
+                 theme.HIGHLIGHT_TEXT_STYLE if cur == "python" else theme.TEXT_STYLE),
+            Span("  ", theme.BASE_STYLE),
+            self._lab("recreate", cur == "recreate"),
+            seg("yes" if self._recreate else "no", self._recreate),
+            Span("   conda env " + str(self.ctx.cfg["CONDA_ENV"]), theme.FAINT_STYLE),
+        ]))
+        lines.append(Line([]))
+        focused = cur == "run"
+        chosen = self.chosen
+        if chosen:
+            plan = (f"{' + '.join(chosen)} on {host} · idempotent · "
+                    "system may ask the Pi password")
+        else:
+            plan = "select at least one stage"
+        lines.append(plan_row("Run setup", plan, focused=focused))
+        if self._shipping:
+            lines.append(Line([]))
+            lines.append(Line([Span(f"  {self._shipping}", theme.FAINT_STYLE)]))
+        return lines
+
     def draw(self, frame: Any, area: Any) -> None:
         frame.render_widget(Paragraph.from_string("").style(theme.BASE_STYLE), area)
-        rows = (
-            Layout()
-            .direction(Direction.Vertical)
-            .constraints([
-                Constraint.length(1),                 # 0 header
-                Constraint.length(1),                 # 1 heavy rule
-                Constraint.length(1),                 # 2 runtime chips
-                Constraint.length(2),                 # 3 info (2 lines)
-                Constraint.length(1),                 # 4 gap
-                Constraint.length(len(_STAGE_IDS)),   # 5 stage rows
-                Constraint.length(1),                 # 6 gap
-                Constraint.length(2),                 # 7 python + recreate rows
-                Constraint.length(1),                 # 8 gap
-                Constraint.length(1),                 # 9 shipping provenance
-                Constraint.length(1),                 # 10 run row
-                Constraint.length(1),                 # 11 msg
-                Constraint.fill(1),                    # 12 spacer
-                Constraint.length(1),                 # 13 hint
-            ])
-            .split(area)
-        )
-
+        rows = (Layout().direction(Direction.Vertical).constraints(
+            [Constraint.length(1), Constraint.length(1), Constraint.fill(1),
+             Constraint.length(1), Constraint.length(1)]).split(area))
+        draw_slim_header(frame, rows[0], self.ctx, "set up Pi")
         frame.render_widget(
-            Paragraph(Text([Line([
-                Span(f"{theme.title_mark()} LEKIWI", theme.TITLE_STYLE),
-                Span("  set up Pi", theme.SUBTITLE_STYLE),
-            ])])).style(theme.BASE_STYLE),
-            rows[0],
-        )
-        frame.render_widget(
-            Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1]
-        )
-        frame.render_widget(runtime_chips(self.ctx), rows[2])
-        frame.render_widget(self._info(), rows[3])
-        self._stage_rows(frame, rows[5])
-        self._option_rows(frame, rows[7])
-        if self._shipping:
-            frame.render_widget(
-                Paragraph(Text([Line([Span(self._shipping, theme.MUTED_STYLE)])]))
-                .style(theme.BASE_STYLE),
-                rows[9],
-            )
-        self._run_row(frame, rows[10])
+            Paragraph.from_string(theme.rule(rows[1].width)).style(theme.RULE_HEAVY_STYLE), rows[1])
+        frame.render_widget(Paragraph(Text(self._body_lines(rows[2].width))
+                                      ).style(theme.BASE_STYLE), rows[2])
         if self._msg:
             frame.render_widget(
-                Paragraph(Text([Line([Span(self._msg, theme.MUTED_STYLE)])]))
-                .style(theme.BASE_STYLE),
-                rows[11],
-            )
-        self._hint(frame, rows[13])
-
-    def _info(self) -> Paragraph:
-        host = self.ctx.cfg["LEKIWI_HOST"]
-        return Paragraph(Text([
-            Line([Span(
-                f"prepare {host} for LeKiwi control (laptop → Pi over SSH)",
-                theme.MUTED_STYLE,
-            )]),
-            Line([Span(
-                "⚠ system setup may ask for the Pi password in the terminal",
-                theme.STATUS_VALUE_STYLE,
-            )]),
-        ])).style(theme.BASE_STYLE)
-
-    def _stage_rows(self, frame: Any, area: Any) -> None:
-        """Render one row per stage into *area* (a multi-line Paragraph). The focused row
-        gets the accent ``▌`` left-bar + bold accent label/value (the menu highlight idiom);
-        the value is ``‹ on ›`` / ``‹ off ›`` and the stage's one-line ``what`` trails."""
-        cur = self.FIELDS[self._fpos]
-        lines: list[Line] = []
-        for sid, what, _note in STAGES:
-            val = theme.choice("on") if self._on[sid] else theme.choice("off")
-            focused = cur == sid
-            lines.append(option_line(
-                sid,
-                val,
-                what,
-                focused=focused,
-                label_width=LABEL_W_FIELD,
-                width=area.width,
-            ))
-        frame.render_widget(
-            Paragraph(Text(lines)).style(theme.BASE_STYLE), area
-        )
-
-    def _option_rows(self, frame: Any, area: Any) -> None:
-        """The two conda-stage knobs, rendered like the stage rows: python version
-        (‹ 3.12 ›, cycles) and recreate-env (‹ yes/no ›, rebuilds on python mismatch)."""
-        cur = self.FIELDS[self._fpos]
-        lines = [
-            option_line(
-                "python",
-                theme.choice(self.PY_CHOICES[self._py_idx]),
-                "Pi env python (conda stage)",
-                focused=cur == "python",
-                label_width=LABEL_W_FIELD,
-                width=area.width,
-            ),
-            option_line(
-                "recreate",
-                theme.choice("yes" if self._recreate else "no"),
-                "rebuild the env if its python does not match",
-                focused=cur == "recreate",
-                label_width=LABEL_W_FIELD,
-                width=area.width,
-            ),
-        ]
-        frame.render_widget(Paragraph(Text(lines)).style(theme.BASE_STYLE), area)
-
-    def _run_row(self, frame: Any, area: Any) -> None:
-        """The Run row: ``▶ Run  (chosen · stages)`` (or ``select a stage`` when empty),
-        bold accent when focused."""
-        focused = self.FIELDS[self._fpos] == "run"
-        chosen = self.chosen
-        label = f"{theme.play_mark()} Run setup  ({' · '.join(chosen) if chosen else 'select a stage'})"
-        frame.render_widget(
-            Paragraph(Text([option_line(
-                label,
-                "prepare the Pi over SSH",
-                focused=focused,
-                label_width=42,
-                width=area.width,
-                label_unfocused_style=theme.TEXT_STYLE,
-            )])).style(theme.BASE_STYLE),
-            area,
-        )
-
-    def _hint(self, frame: Any, area: Any) -> None:
-        frame.render_widget(
-            keycap_hint_line([
-                ("↑↓/jk", "move"),
-                ("←→/hl", "toggle"),
-                ("⏎", "toggle/run"),
-                ("q", "back"),
-            ]),
-            area,
-        )
+                Paragraph(Text([Line([Span(f"  {self._msg}", theme.MUTED_STYLE)])]))
+                .style(theme.BASE_STYLE), rows[3])
+        frame.render_widget(hint_slot_line(self._focused_hint(), rows[4].width,
+                                           keys=(("↑↓/jk", "move"), ("←→", "toggle"),
+                                                 ("⏎", "toggle·run"), ("q", "back"))), rows[4])
 
 
 def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001

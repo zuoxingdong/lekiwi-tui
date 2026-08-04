@@ -81,6 +81,43 @@ _DELETE = "Delete"
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def wrap_words(text: str, width: int) -> list[str]:
+    """Word-wrap *text* to *width* columns for DISPLAY, honouring explicit newlines.
+
+    The three char-wrappers this replaces split words in half ("second" became "se" /
+    "cond") and stranded a trailing full stop on its own line. Character wrapping is only
+    correct for an EDITOR, where a caret index has to map to a screen cell; every
+    display-only wrap wants words kept whole.
+
+    A word longer than *width* (a path, a checkpoint id) is hard-split rather than allowed
+    to overflow the panel.
+    """
+    if width < 1:
+        width = 1
+    out: list[str] = []
+    for para in text.split("\n"):
+        if not para:
+            out.append("")
+            continue
+        line = ""
+        for word in para.split(" "):
+            while len(word) > width:                 # unbreakable run: split it
+                if line:
+                    out.append(line)
+                    line = ""
+                out.append(word[:width])
+                word = word[width:]
+            if not line:
+                line = word
+            elif len(line) + 1 + len(word) <= width:
+                line += " " + word
+            else:
+                out.append(line)
+                line = word
+        out.append(line)
+    return out or [""]
+
+
 class TextField:
     """A single-line text editor that owns its ``value`` and ``cursor`` and edits them
     in response to a normalized :class:`Key`.
@@ -146,6 +183,56 @@ class TextField:
         if self.cursor < len(self.value):
             self.cursor += 1
 
+    # ── word-level motion + kills ──
+    # A "word" here is a run of non-space characters, and a move skips the whitespace it
+    # starts in first. That is the readline/editor convention: from mid-sentence, ctrl+←
+    # lands on the start of the word you are in, and again on the one before it.
+    def _word_start(self) -> int:
+        i = self.cursor
+        while i > 0 and self.value[i - 1].isspace():
+            i -= 1
+        while i > 0 and not self.value[i - 1].isspace():
+            i -= 1
+        return i
+
+    def _word_end(self) -> int:
+        i, n = self.cursor, len(self.value)
+        while i < n and self.value[i].isspace():
+            i += 1
+        while i < n and not self.value[i].isspace():
+            i += 1
+        return i
+
+    def word_left(self) -> None:
+        """Move the cursor to the start of the previous word."""
+        self.cursor = self._word_start()
+
+    def word_right(self) -> None:
+        """Move the cursor past the end of the next word."""
+        self.cursor = self._word_end()
+
+    def delete_word_left(self) -> None:
+        """Delete from the start of the previous word up to the cursor."""
+        start = self._word_start()
+        if start != self.cursor:
+            self.value = self.value[:start] + self.value[self.cursor:]
+            self.cursor = start
+
+    def delete_word_right(self) -> None:
+        """Delete from the cursor to the end of the next word."""
+        end = self._word_end()
+        if end != self.cursor:
+            self.value = self.value[: self.cursor] + self.value[end:]
+
+    def kill_to_start(self) -> None:
+        """Delete everything before the cursor (readline ctrl+u)."""
+        self.value = self.value[self.cursor:]
+        self.cursor = 0
+
+    def kill_to_end(self) -> None:
+        """Delete everything from the cursor on (readline ctrl+k)."""
+        self.value = self.value[: self.cursor]
+
     def home(self) -> None:
         """Move the cursor to the start of the line."""
         self.cursor = 0
@@ -159,11 +246,43 @@ class TextField:
         """Apply one :class:`Key`; return ``True`` iff it was consumed.
 
         Consumed: a printable char (inserted, modifier-free — Ctrl/Alt chars are left for
-        the screen), Backspace, Left, Right, Home, End, Delete. NOT consumed (returns
-        ``False`` so the screen / focus ring can act): Up, Down, Enter, Esc, Tab, BackTab,
-        and any key with Ctrl/Alt held that is not a bare printable.
+        the screen), Backspace, Left, Right, Home, End, Delete, and the word-level Ctrl/Alt
+        combinations below. NOT consumed (returns ``False`` so the screen / focus ring can
+        act): Up, Down, Enter, Esc, Tab, BackTab, and any other Ctrl/Alt key.
+
+        Word keys accept BOTH ctrl and alt: ctrl+← is the common terminal binding, ⌥← is
+        the macOS habit, and honouring both costs nothing. ctrl+backspace also arrives as
+        ctrl+h from many terminals (the multiline Task editor learned this the hard way),
+        so both spellings are handled here rather than per-screen.
         """
         name = key.name
+        word = key.ctrl or key.alt
+        if word:
+            if name == LEFT or name == "b":
+                self.word_left()
+                return True
+            if name == RIGHT or name == "f":
+                self.word_right()
+                return True
+            if name in (BACKSPACE, "h", "w"):
+                self.delete_word_left()
+                return True
+            if name == _DELETE or name == "d":
+                self.delete_word_right()
+                return True
+            if name == "u":
+                self.kill_to_start()
+                return True
+            if name == "k":
+                self.kill_to_end()
+                return True
+            if name == "a":
+                self.home()
+                return True
+            if name == "e":
+                self.end()
+                return True
+            return False
         if name == BACKSPACE:
             self.backspace()
             return True
@@ -340,6 +459,24 @@ class NumberField:
         """Reset the editor buffer to the current committed value (call when (re)focusing
         the field so a stale half-typed buffer from a previous visit is cleared)."""
         self._ensure_editor().set_value(str(self.value))
+
+    def type_key(self, key: "Key", *, fresh: bool) -> bool:
+        """The screens' shared type-to-set grammar in one place: when *fresh* (first
+        printable key after a focus move / step / commit) a printable REPLACES the
+        mirrored buffer; edits then live-commit whenever the buffer parses as digits.
+        Returns True iff the key was consumed (the caller clears its fresh flag)."""
+        from .events import is_char
+
+        ed = self.editor
+        if not (is_char(key) or key.name == "Backspace"):
+            return False
+        if fresh and is_char(key):
+            ed.clear()
+        if ed.handle_key(key):
+            if ed.value.strip().isdigit():
+                self.set_text(ed.value.strip())
+            return True
+        return False
 
     def handle_key(self, key: "Key") -> bool:
         """Apply one :class:`Key`; return ``True`` iff consumed.

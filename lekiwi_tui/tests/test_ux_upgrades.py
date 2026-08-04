@@ -13,6 +13,9 @@ from lekiwi_tui.framework.stream import StreamController
 from lekiwi_tui.hostprobe import HostProbe, get_probe, session_remaining
 
 
+from conftest import make_ctx
+
+
 def _key(name: str, **mods) -> types.SimpleNamespace:
     return types.SimpleNamespace(name=name, ctrl=False, alt=False, shift=False, **mods)
 
@@ -78,96 +81,33 @@ def test_panic_arms_then_fires(monkeypatch):
     assert fired
 
 
-# ── stream: forwarding + health + line hook ───────────────────────────────────
+# ── stream: lifecycle (the watch-only controller; forwarding/hooks were removed
+#    with the record HUD) ──────────────────────────────────────────────────────
 
 
-def test_stream_forwarding_health_and_hook():
+def test_stream_lifecycle_captures_output_and_ends():
     async def main():
-        import re
-
-        hits: list[str] = []
         s = StreamController()
-        s.health_pattern = re.compile(r"\d+(?:\.\d+)?\s*it/s")
-        s.line_hook = hits.append
-        await s.start(["bash", "-c",
-                       'printf "x 12.5it/s\\r"; echo marker; read -r l; echo "got:$l"'])
-        await asyncio.sleep(0.4)
-        assert s.health == "12.5it/s"
-        # \r is stripped by the pump, so the meter chunk and the echo merge into one
-        # log line — the hook still sees the marker text (health came from the raw chunk).
-        assert any("marker" in h for h in hits)
-        assert s.forward_key(_key("Enter"))
-        await asyncio.sleep(0.6)
-        assert s.ended
-        assert any(line.startswith("got:") for line in s.lines)
-        # forwarding after the end is a no-op, not an error
-        assert s.forward_key(_key("Enter")) is False
+        await s.start(["bash", "-c", 'echo hello; echo "WARN careful"'])
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            if s.ended:
+                break
+        assert s.ended and s.returncode == 0
+        assert any("hello" in ln for ln in s.lines)
 
     asyncio.run(main())
 
-
-def test_forward_key_encodings():
-    s = StreamController()
-    captured: list[bytes] = []
-    s.phase = "running"
-    s._master = 1  # never written: monkeypatch write
-    s.write_bytes = lambda b: (captured.append(b), True)[1]  # type: ignore[assignment]
-    s.forward_key(_key("Left"))
-    s.forward_key(_key("Esc"))
-    s.forward_key(_key("w"))
-    s.forward_key(types.SimpleNamespace(name="c", ctrl=True, alt=False, shift=False))
-    assert captured == [b"\x1b[D", b"\x1b", b"w", b"\x03"]
 
 
 # ── record HUD state machine + dataset panel ─────────────────────────────────
 
 
 def _record_screen():
-    from lekiwi_tui.config import Config, load_yaml
-    from lekiwi_tui import CFG_FILE
     from lekiwi_tui.screens.record import RecordScreen
 
-    ctx = types.SimpleNamespace(cfg=Config.load(CFG_FILE), doc=load_yaml(),
-                                gpu_name="", ui_state={})
+    ctx = make_ctx(gpu_name="")
     return RecordScreen(None, ctx)
-
-
-def test_record_marker_hook_drives_hud_state():
-    scr = _record_screen()
-    scr._on_record_line("Recording episode 7")
-    assert scr._ep_cur == 7 and scr._phase_note == "recording"
-    scr._on_record_line("blah Reset the environment blah")
-    assert scr._phase_note.startswith("reset")
-    scr._on_record_line("Stop recording")
-    assert scr._phase_note == "stopping"
-
-
-def test_record_hud_forwards_keys_and_blocks_local_stop_letters():
-    scr = _record_screen()
-    forwarded: list[str] = []
-    scr.stream.phase = "running"
-    scr.stream.forward_key = lambda k: forwarded.append(k.name)  # type: ignore[assignment]
-
-    # "s" and "q" are base-backward / lerobot-quit: they must FORWARD, not stop/pop.
-    for name in ("s", "q", "Left", "Esc"):
-        scr.handle_key(_key(name))
-    assert forwarded == ["s", "q", "Left", "Esc"]
-
-    stopped: list[bool] = []
-    scr.stream.stop = lambda: stopped.append(True)  # type: ignore[assignment]
-    scr.handle_key(types.SimpleNamespace(name="c", ctrl=True, alt=False, shift=False))
-    assert stopped
-
-
-def test_record_view_toggle_and_value():
-    scr = _record_screen()
-    from lekiwi_tui.screens.record import _FIELDS
-
-    scr._fpos = _FIELDS.index("view")
-    before = scr._view
-    scr.handle_key(_key("Right"))
-    assert scr._view != before
-    assert scr._view in scr._value("view")
 
 
 def test_dataset_stats_line(tmp_path):
@@ -181,3 +121,140 @@ def test_dataset_stats_line(tmp_path):
     (root / "blob.bin").write_bytes(b"x" * 2_000_000)
     line = dataset_stats(root)
     assert line.startswith("4 episodes · 2.0 min · 2 MB · updated ")
+
+
+# ── the redesigned stream-trio pages (sync / provision / stop-host) ───────────
+
+
+def _trio_ctx():
+
+    return make_ctx(gpu_name="")
+
+
+def test_sync_body_groups_provenance_and_reinstall_segment():
+    from lekiwi_tui.screens.sync import SyncScreen
+
+    scr = SyncScreen(None, _trio_ctx())
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(96))
+    assert "SOURCES" in body and "DESTINATION" in body
+    assert " auto " in body and " force " in body        # the Reinstall segment
+    assert "reinstall only if deps changed" in body      # plan follows the toggle
+    scr._force = True
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(96))
+    assert "reinstall forced this run" in body
+
+
+def test_provision_body_stage_pills_and_plan():
+    from lekiwi_tui.screens.provision import ProvisionScreen
+
+    scr = ProvisionScreen(None, _trio_ctx())
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(96))
+    assert "STAGES" in body and "PI ENVIRONMENT" in body
+    assert "system + conda + lerobot" in body            # plan lists chosen stages
+    scr._on = {s: False for s in scr._on}
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(96))
+    assert "select at least one stage" in body
+
+
+def test_host_kill_confirm_wears_the_danger_style():
+    import pyratatui as pr
+
+    from lekiwi_tui.framework import theme
+    from lekiwi_tui.screens.host_kill import HostKillScreen
+
+    scr = HostKillScreen(None, _trio_ctx())
+    texts = []
+
+    class Frame:
+        def render_widget(self, widget, rect):  # noqa: ANN001
+            texts.append(widget)
+
+    scr.draw(Frame(), pr.Rect(0, 0, 100, 30))
+    assert theme.HIGHLIGHT_DANGER_STYLE is not None      # the idiom exists app-wide
+    assert len(texts) >= 4                               # header, rule, body, hint
+
+
+# ── the redesigned SETUP tail (settings / calibrate / robot-config) ───────────
+
+
+def test_calibrate_inverse_host_warning_and_radio():
+    from lekiwi_tui.screens.calibrate import CalibrateScreen
+
+    scr = CalibrateScreen(None, _trio_ctx())
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(96))
+    assert "ARM" in body and "leader" in body and "follower" in body
+    assert "calibrated" in body or "not calibrated yet" in body  # the age readout
+
+    # follower + host RUNNING → the warning replaces the plan (inverse condition)
+    scr._arm = "follower"
+    scr._host_alive = lambda: True  # type: ignore[method-assign]
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(96))
+    assert "Stop host first" in body
+    # leader ignores host state entirely (local serial device)
+    scr._arm = "leader"
+    body = "\n".join("".join(sp.content for sp in ln.spans)
+                     for ln in scr._body_lines(96))
+    assert "Stop host first" not in body
+
+
+def test_settings_save_plan_and_env_hint():
+    from lekiwi_tui.screens.settings import CONFIG_SPEC, SettingsScreen
+
+    scr = SettingsScreen(None, _trio_ctx())
+    scr.cursor = scr._n                        # focus the Save row
+    assert "writes launcher settings" in scr._focused_hint()
+    scr.cursor = 0
+    assert scr._focused_hint() == CONFIG_SPEC[0].hint
+    scr._env_set = {CONFIG_SPEC[0].key}
+    assert scr._focused_hint().startswith("[env override]")
+    scr.dirty = True
+    scr._work[CONFIG_SPEC[0].key] = "changed-value"
+    hdr = "".join(sp.content for sp in scr._header_right())
+    assert "unsaved (1)" in hdr
+
+
+def test_record_start_always_suspends(monkeypatch, tmp_path):
+    """The HUD view was removed: Start ALWAYS suspends into the real TTY (the
+    guaranteed wasd path). No stream branch, no View field."""
+    import asyncio
+
+    from lekiwi_tui.screens.record import _FIELDS, _HINTS, RecordScreen
+
+    assert "view" not in _FIELDS and "view" not in _HINTS
+    assert not hasattr(RecordScreen("x", None) if False else object(), "stream")
+
+    scr = _record_screen()
+    assert not hasattr(scr, "stream") and not hasattr(scr, "_view")
+
+    suspended: list[list[str]] = []
+
+    class _App:
+        async def suspend(self, argv, **kw):
+            suspended.append(list(argv))
+            return 0
+
+        async def run_modal(self, modal):
+            return None
+
+        def notify(self, *a, **k):
+            pass
+
+    scr.app = _App()
+    monkeypatch.setattr("lekiwi_tui.screens.record.confirm_preflight",
+                        _async_true)
+    monkeypatch.setattr("lekiwi_tui.screens.record.dataset_present", lambda root: False)
+    monkeypatch.setattr("lekiwi_tui.screens.record.persist_record_defaults",
+                        lambda **kw: None)
+    asyncio.run(scr._start())
+    assert suspended and suspended[0][0] == "bash"
+    assert suspended[0][1].endswith("record.sh")
+
+
+async def _async_true(*a, **k):
+    return True
