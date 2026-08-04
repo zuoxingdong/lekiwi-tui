@@ -54,7 +54,7 @@ class _SharedBaseKeyListener(KeyListener):
 
 # (2) BASE NAVIGATION — patch the pynput Listener CLASS (KeyboardTeleop resolves
 # keyboard.Listener at connect() time, so this is picked up). Guard the import like the
-# teleop/rollout shims: a headless run (no DISPLAY) raises ImportError acquiring an X
+# teleop shim does: a headless run (no DISPLAY) raises ImportError acquiring an X
 # connection — skip the patch and let lerobot's own PYNPUT_AVAILABLE path degrade as stock.
 #
 # lerobot 0.6 note: upstream's new pynput_can_capture() gate returns False on Wayland and

@@ -233,18 +233,20 @@ PY
 # cfg_slice writes the slice and echoes its absolute path; the $() strips the
 # trailing newline so the path is a single clean token.
 slice="$(cfg_slice rollout)"
-# We front lerobot-rollout through lerobot_rollout_kbd.py, a thin shim that swaps
-# pynput's keyboard Listener (a silent no-op on Wayland: episodic arrows / highlight
-# save+push / dagger space+tab+enter and ESC never reach the rollout loop, only Ctrl+C
-# does) for a stdin reader emitting real pynput key objects, then calls lerobot's own
-# main() with this exact argv. lerobot's repo is untouched; the only change vs
-# `lerobot-rollout` is the first two tokens (`python <shim>`). NOTE: the shim only
-# delivers keys when the child inherits a real TTY — which now holds on EVERY path:
-# direct `bash eval.sh`, direct-mode `python -m lekiwi_tui eval`, AND the
-# interactive TUI EvalScreen (which suspends into the child via runner.suspend_run,
-# like record).
+# lerobot-rollout is invoked directly. It used to be fronted by a keyboard shim
+# (lerobot_rollout_kbd.py) because on lerobot 0.5.x the rollout strategies built pynput
+# listeners themselves, which are a silent no-op on Wayland: episodic arrows, highlight
+# save+push, dagger space/tab/enter and ESC never reached the loop, only Ctrl+C did.
+# Since 0.6 those keys go through lerobot's own init_keyboard_listener, which falls back
+# to a TTY reader when pynput cannot capture, so the shim had nothing left to patch and
+# is gone. Rollout keys are discrete taps, which a press-only TTY reader serves fine;
+# record and teleop still need their shims because hold-to-move base teleop needs key
+# RELEASE, which no terminal reports.
+# Either way the child needs a real TTY, and gets one on every path: direct
+# `bash eval.sh`, direct-mode `python -m lekiwi_tui eval`, and the TUI EvalScreen
+# (which suspends into it via runner.suspend_run, like record).
 argv=(
-  python "$SCRIPT_DIR/lerobot_rollout_kbd.py"
+  lerobot-rollout
   --config_path "$slice"
   "--policy.path=${policy}"
   "--inference.type=${backend}"
@@ -302,9 +304,9 @@ fi
 
 # ── dry-run vs exec ──────────────────────────────────────────────────────────
 # --dry-run / DRY=1: print the argv one token per line and exit 0 (the parity gate
-# captures these lines). Otherwise exec, so the rollout shim inherits this script's
-# real TTY (the TUI suspends into it; the shim reads arrow keys / ESC straight from
-# that stdin — see lerobot_rollout_kbd.py).
+# captures these lines). Otherwise exec, so lerobot-rollout inherits this script's real
+# TTY (the TUI suspends into it; lerobot's own keyboard fallback reads the episode keys
+# straight from that stdin).
 if [[ "$dry" == "1" ]]; then
   printf '%s\n' "${argv[@]}"
   exit 0

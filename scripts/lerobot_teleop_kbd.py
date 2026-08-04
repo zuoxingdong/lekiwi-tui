@@ -31,7 +31,7 @@ if _PKG_ROOT not in sys.path:
 from lekiwi_tui.kbd_listener import KeyListener  # noqa: E402
 
 # Patch the pynput Listener CLASS (KeyboardTeleop resolves keyboard.Listener at connect()
-# time, so this is picked up). Guard the import like the rollout shim: a headless run (no
+# time, so this is picked up). Guard the import like the record shim does: a headless run (no
 # DISPLAY) raises ImportError acquiring an X connection — skip the patch and let lerobot's
 # own PYNPUT_AVAILABLE path degrade exactly as stock.
 #

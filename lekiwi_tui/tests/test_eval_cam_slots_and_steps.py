@@ -248,6 +248,15 @@ def test_eval_sh_native_emits_the_identity_rename_map_token(tmp_path):
     assert "--policy.n_action_steps=10" in tokens
 
 
+def test_eval_sh_invokes_lerobot_rollout_directly(tmp_path):
+    """No keyboard shim in front of it: since lerobot 0.6 the rollout's own
+    init_keyboard_listener falls back to a TTY reader, so there is nothing to patch."""
+    tokens = _dry_run(_script_workspace(tmp_path))
+    assert tokens[0] == "lerobot-rollout"
+    assert tokens[1] == "--config_path"
+    assert not [t for t in tokens if t.endswith("_kbd.py")]
+
+
 def test_eval_sh_map_and_zero_steps_emit_no_extra_tokens(tmp_path):
     tokens = _dry_run(_script_workspace(tmp_path), "--cam-slots", "map", "--action-steps", "0")
     assert not [t for t in tokens if t.startswith("--rename_map=")]
