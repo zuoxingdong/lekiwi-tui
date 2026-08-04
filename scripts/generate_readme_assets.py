@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Generate the README workflow GIF (one asset; its first frame is the hero).
 
+SYNTHETIC BY DESIGN, for sanitisation: nothing here is captured from a live terminal, so a
+recording can never carry a hostname, an IP, a home path, a private checkpoint name — or, in
+the camera-preview frame, a photograph of somebody's room. Every value is a PUBLIC_* constant
+below and every camera tile is drawn from shapes.
+
 These are faithful static renders of the current terminal style: plain dark terminal,
 runtime chips, colorful action icons, keycap footer hints, and focused-row highlighting.
 They are not screenshots from a live TTY, but they intentionally avoid decorative window
@@ -24,7 +29,7 @@ FONT_BOLD = "/usr/share/fonts/truetype/noto/NotoSansMono-Bold.ttf"
 KEY_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
 EMOJI_FONT = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
 
-W, H = 1180, 760
+W, H = 1180, 668
 PAD_X = 16
 LINE_H = 22
 FONT_SIZE = 17
@@ -50,6 +55,15 @@ PUBLIC_GPU = "CUDA"
 PUBLIC_ROBOT = "lekiwi_pincopen"
 PUBLIC_POLICY = "models/lekiwi-policy/checkpoints/latest/pretrained_model"
 PUBLIC_TASK = "Pick up the object and place it in the tray"
+PUBLIC_LEROBOT = "0.6.1"
+PUBLIC_DATASET = "local/demo-plate"
+PUBLIC_IP = "192.168.0.123"          # the same placeholder lekiwi.example.yaml ships
+#: (name, device node, rotation) — generic Linux device nodes, no machine identity in them.
+PUBLIC_CAMS = (("front", "/dev/video0", "no rot"),
+               ("wrist", "/dev/video2", "180°"),
+               ("top", "/dev/video4", "no rot"))
+#: Laptop vitals for the status card. Plausible, and nothing here identifies a machine.
+PUBLIC_VITALS = "cpu 21%   ram 9.4/31 GB   RTX GPU 12%   vram 1.2/8 GB"
 
 
 def font(bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -192,59 +206,238 @@ class Canvas:
 JUMPABLE = [a.id for a in ACTIONS if a.section != "SETUP"]
 
 
+# ── the current chrome: cards, a status card, and the hint slot ───────────────
+
+
 def section(c: Canvas, y: int, label: str) -> None:
+    """A quiet group header with a hairline, as the screens draw it."""
     c.text((PAD_X, y), label, PURPLE, bold=True)
-    c.line((PAD_X + 72, y + 13, PAD_X + 470, y + 13), HAIRLINE)
-
-
-def action_row(c: Canvas, y: int, action_id: str, *, selected: bool = False) -> None:
-    action = next(a for a in ACTIONS if a.id == action_id)
-    x0, x1 = PAD_X, 618
-    if selected:
-        c.rect((x0 - 10, y - 1, x1, y + LINE_H - 1), HIGHLIGHT_BG)
-        c.rect((x0 - 10, y - 1, x0 - 5, y + LINE_H - 1), ACCENT)
-        c.text((x0, y), "▌", ACCENT, bold=True)
-    if action_id in JUMPABLE:
-        c.text((PAD_X + 16, y), str(JUMPABLE.index(action_id) + 1), ACCENT, bold=selected)
-    icon_x = PAD_X + 38
-    c.emoji((icon_x, y + 1), action.icon)
-    label_color = ACCENT if selected else TEXT
-    hint_color = TEXT if selected else MUTED
-    c.text((PAD_X + 77, y), f"{action.label:<13}", label_color, bold=selected)
-    c.text((PAD_X + 227, y), action.hint, hint_color)
+    c.line((PAD_X + 130, y + 13, W - PAD_X, y + 13), HAIRLINE)
 
 
 def footer(c: Canvas, y: int, *, eval_page: bool = False) -> None:
-    c.line((0, y - 12, W, y - 12), HAIRLINE)
-    pairs = (
-        [("↑↓/jk", "move"), ("←→/hl", "change"), ("↵", "edit/run"), ("s", "run"), ("q", "back")]
-        if eval_page
-        else [("↑↓/jk", "move"), ("↵", "select"), (f"1-{len(JUMPABLE)}", "jump"), ("d", "preview"), ("q", "quit")]
-    )
-    x = PAD_X
-    for key, label in pairs:
+    """Back-compat wrapper for the frames that predate hint_row."""
+    keys = ([("↑↓/jk", "move"), ("←→", "change"), ("↵", "edit/run"), ("s", "run"), ("q", "back")]
+            if eval_page else
+            [("↑↓/jk", "move"), ("↵", "select"), ("d", "preview"), ("q", "quit")])
+    hint_row(c, y, "", keys)
+
+
+def card(c: Canvas, box: tuple[int, int, int, int], title: str) -> None:
+    """A titled panel: hairline border with the title breaking the top edge."""
+    x0, y0, x1, y1 = box
+    c.rect((x0, y0, x1, y1), SURFACE, outline=HAIRLINE)
+    c.text((x0 + 12, y0 - 9), f" {title} ", PURPLE, bold=True)
+
+
+def status_card(c: Canvas, y: int, *, mode: str = "REAL") -> int:
+    """The ROBOT card: is the robot reachable, can this laptop take another run, and which
+    hardware/env/lerobot is about to be driven."""
+    box = (PAD_X, y, W - PAD_X, y + 3 * LINE_H + 18)
+    card(c, box, "ROBOT")
+    row = y + 12
+    c.text((PAD_X + 14, row), "●", SUCCESS, bold=True)
+    c.text((PAD_X + 34, row), "host up", SUCCESS)
+    c.text((PAD_X + 130, row), "session 27:41 left", MUTED)
+    x = W - PAD_X - 130
+    c.rect((x, row - 1, W - PAD_X - 14, row + LINE_H - 3), PANEL)
+    c.text((x + 8, row), "mode", MUTED)
+    c.text((x + 58, row), mode, SUCCESS if mode == "REAL" else WARNING, bold=True)
+    row += LINE_H
+    c.text((PAD_X + 14, row), "laptop", MUTED)
+    c.text((PAD_X + 104, row), PUBLIC_VITALS, TEXT)
+    row += LINE_H
+    c.text((PAD_X + 14, row), "robot", MUTED)
+    c.text((PAD_X + 104, row), PUBLIC_ROBOT, TEXT)
+    c.text((PAD_X + 320, row), "env", MUTED)
+    c.text((PAD_X + 368, row), PUBLIC_ENV, TEXT)
+    c.text((PAD_X + 520, row), "lerobot", MUTED)
+    c.text((PAD_X + 608, row), PUBLIC_LEROBOT, TEXT)
+    return box[3] + 26
+
+
+def card_row(c: Canvas, x: int, y: int, width: int, action_id: str, *, selected: bool) -> int:
+    """One action inside a card: icon, digit, label, then its description underneath."""
+    action = next(a for a in ACTIONS if a.id == action_id)
+    if selected:
+        c.rect((x + 4, y - 2, x + width - 6, y + LINE_H - 2), HIGHLIGHT_BG)
+        c.rect((x + 4, y - 2, x + 8, y + LINE_H - 2), ACCENT)
+    c.emoji((x + 16, y + 1), action.icon)
+    if action_id in JUMPABLE:
+        c.text((x + 44, y), str(JUMPABLE.index(action_id) + 1), ACCENT, bold=selected)
+    c.text((x + 66, y), action.label, ACCENT if selected else TEXT, bold=selected)
+    c.text((x + 66, y + LINE_H - 2), c.fit_end(action.hint, width - 84), MUTED)
+    return y + 2 * LINE_H - 2
+
+
+def hint_row(c: Canvas, y: int, hint: str, keys: list[tuple[str, str]]) -> None:
+    """The footer hint slot: the sentence on the left, keycaps right-aligned."""
+    c.line((0, y - 14, W, y - 14), HAIRLINE)
+    width = sum(int(c.d.textlength(f" {k} ", font=KEY)) + int(c.d.textlength(lab, font=FONT)) + 23
+                for k, lab in keys)
+    x = W - PAD_X - width
+    # the sentence gets whatever the keycaps leave; the real screen sheds labels here, and an
+    # asset that overlaps its own text is worse than one that says less
+    c.text((PAD_X, y), c.fit_end(hint, max(0, x - PAD_X - 24)), MUTED)
+    for key, label in keys:
         x = c.keycap(x, y, key, label)
 
 
 def draw_menu(selected: str = "record", *, mode: str = "REAL") -> Image.Image:
+    """The card-grid menu: status card, then four cards two across, then the SETUP strip."""
     c = Canvas()
     c.header("mobile-manipulator control")
-    c.runtime_chips(52, mode=mode)
-    y = 96
-    groups = [
-        ("HOST", ["host-launch", "host-kill"]),
-        ("COLLECT", ["teleop", "record", "replay", "view"]),
-        ("LEARN", ["train", "eval"]),
-        ("SETUP", ["setup-pi", "sync", "calibrate", "robot-config", "settings"]),
-    ]
-    for title, ids in groups:
-        section(c, y, title)
+    y = status_card(c, 56, mode=mode)
+
+    # Membership comes from the registry (menu.py's own source), so a new action appears here
+    # instead of being silently missing from the asset — which is exactly what happened when
+    # this was a hand-written map and `edit-dataset` did not match the id it guessed.
+    grid = [["HOST", "COLLECT"], ["DATA", "LEARN"]]
+    members: dict[str, list[str]] = {}
+    for a in ACTIONS:
+        members.setdefault(getattr(a, "card", None) or a.section, []).append(a.id)
+    known = {a.id for a in ACTIONS}
+    col_w = (W - 2 * PAD_X - 18) // 2
+    for row_titles in grid:
+        rows = max(len(members[t]) for t in row_titles)
+        height = rows * (2 * LINE_H - 2) + 22
+        for i, title in enumerate(row_titles):
+            x0 = PAD_X + i * (col_w + 18)
+            card(c, (x0, y, x0 + col_w, y + height), title)
+            ry = y + 14
+            for action_id in members[title]:
+                if action_id not in known:      # a card member that no longer exists
+                    continue
+                ry = card_row(c, x0, ry, col_w, action_id, selected=action_id == selected)
+        y += height + 26
+
+    strip = [a.id for a in ACTIONS if a.section == "SETUP"]
+    card(c, (PAD_X, y, W - PAD_X, y + LINE_H + 16), "SETUP")
+    x = PAD_X + 16
+    for action_id in strip:
+        action = next(a for a in ACTIONS if a.id == action_id)
+        c.emoji((x, y + 13), action.icon)
+        c.text((x + 26, y + 12), action.label, TEXT)
+        x += 26 + int(c.d.textlength(action.label, font=FONT)) + 28
+    hint_row(c, H - 40, "↓ walks a column · a digit runs that action",
+             [("↑↓/jk", "move"), ("←→", "column"), ("↵", "select"), ("d", "preview"), ("q", "quit")])
+    return c.img
+
+
+def setting_row(c: Canvas, y: int, label: str, value: str, hint: str = "", *,
+                selected: bool = False, kind: str = "plain") -> int:
+    """One setting per row. `stepper` renders ‹ value ›, `toggle` renders two pills."""
+    if selected:
+        c.rect((PAD_X - 6, y - 2, W - PAD_X, y + LINE_H - 2), HIGHLIGHT_BG)
+        c.rect((PAD_X - 6, y - 2, PAD_X - 2, y + LINE_H - 2), ACCENT)
+    c.text((PAD_X + 16, y), label, ACCENT if selected else MUTED, bold=selected)
+    vx = PAD_X + 190
+    if kind == "stepper":
+        c.text((vx, y), "‹", MUTED)
+        c.text((vx + 20, y), value, ACCENT if selected else TEXT, bold=True)
+        c.text((vx + 26 + int(c.d.textlength(value, font=BOLD)), y), "›", MUTED)
+    elif kind == "toggle":
+        on, off = value.split("|")
+        w_on = int(c.d.textlength(f" {on} ", font=BOLD))
+        c.rect((vx, y - 1, vx + w_on, y + LINE_H - 3), PANEL)
+        c.text((vx + 6, y), on, SUCCESS, bold=True)
+        c.text((vx + w_on + 14, y), off, MUTED)
+    else:
+        c.text((vx, y), c.fit_middle(value, 640, bold=selected), ACCENT if selected else TEXT,
+               bold=selected)
+    if hint:
+        c.text((PAD_X + 700, y), c.fit_end(hint, W - PAD_X - (PAD_X + 700)), MUTED)
+    return y + LINE_H + 4
+
+
+def camera_tile(c: Canvas, box: tuple[int, int, int, int], name: str, device: str, rot: str,
+                *, selected: bool, kind: str) -> None:
+    """A preview tile. The image is DRAWN from shapes — never a real capture, so this asset
+    cannot leak a photograph of the room the robot happens to be in."""
+    x0, y0, x1, y1 = box
+    head = f"{'▸ ' if selected else '  '}{name}   {device}   {rot}"
+    c.rect((x0, y0, x1, y0 + LINE_H - 2), HIGHLIGHT_BG if selected else BG)
+    c.text((x0 + 6, y0), head, ACCENT if selected else MUTED, bold=selected)
+    top = y0 + LINE_H + 3
+    bottom = y1 - 4                          # inset, so no shape touches the tile border
+    # floor gradient, warm and obviously synthetic
+    for i, yy in enumerate(range(top, bottom + 1)):
+        shade = 120 + int(40 * (yy - top) / max(1, bottom - top))
+        c.line((x0 + 2, yy, x1 - 2, yy),
+               f"#{shade:02x}{max(0, shade - 40):02x}{max(0, shade - 80):02x}")
+    if kind == "front":                       # horizon + the stand, low and level
+        c.rect((x0 + 2, top, x1 - 2, top + (bottom - top) // 3), "#1b2233")
+        c.rect((x0 + 90, bottom - 58, x0 + 210, bottom - 50), "#c9a227")
+        c.rect((x0 + 96, bottom - 50, x0 + 104, bottom - 12), "#c9a227")
+        c.rect((x0 + 196, bottom - 50, x0 + 204, bottom - 12), "#c9a227")
+    elif kind == "wrist":                     # looking down: two jaws and the plate rim
+        c.d.ellipse((x0 + 14, top + 8, x0 + 92, top + 62), fill="#b91c1c", outline="#f1f5f9")
+        c.d.polygon([(x0 + 70, bottom), (x0 + 96, bottom - 54), (x0 + 122, bottom)], fill="#111827")
+        c.d.polygon([(x1 - 122, bottom), (x1 - 96, bottom - 54), (x1 - 70, bottom)], fill="#111827")
+        c.rect((x0 + (x1 - x0) // 2 - 26, bottom - 16, x0 + (x1 - x0) // 2 + 26, bottom), "#0b1220")
+    else:                                     # the wide view: desk, plate, the arm itself
+        c.rect((x0 + 2, top, x1 - 2, top + (bottom - top) // 2), "#161d2c")
+        c.d.ellipse((x1 - 150, top + 60, x1 - 60, top + 110), fill="#b91c1c", outline="#f1f5f9")
+        c.rect((x0 + 40, bottom - 88, x0 + 96, bottom), "#38bdf8")
+        c.rect((x0 + 56, bottom - 126, x0 + 80, bottom - 82), "#38bdf8")
+    c.d.rectangle((x0, y0, x1, y1), outline=HAIRLINE)      # border last, over the art
+
+
+def header_note(c: Canvas, text: str, color: str = MUTED, *, bold: bool = False) -> None:
+    """Right-aligned header text, measured rather than guessed."""
+    c.text((W - PAD_X - int(c.d.textlength(text, font=BOLD if bold else FONT)), 12), text, color,
+           bold=bold)
+
+
+def draw_camera_preview() -> Image.Image:
+    """Every configured camera at once, with the rotation the robot would apply."""
+    c = Canvas()
+    c.header("camera preview")
+    header_note(c, "3 cameras · unsaved rotation", WARNING, bold=True)
+    tile_w = (W - 2 * PAD_X - 20) // 2
+    tile_h = 250
+    spots = [(PAD_X, 62), (PAD_X + tile_w + 20, 62), (PAD_X, 62 + tile_h + 24)]
+    kinds = ("front", "wrist", "top")
+    for i, ((name, device, rot), (x0, y0)) in enumerate(zip(PUBLIC_CAMS, spots)):
+        camera_tile(c, (x0, y0, x0 + tile_w, y0 + tile_h), name, device, rot,
+                    selected=i == 2, kind=kinds[i])
+    c.text((PAD_X + tile_w + 20, 62 + tile_h + 24 + 40),
+           "a tile whose node is gone shows the reason,", MUTED)
+    c.text((PAD_X + tile_w + 20, 62 + tile_h + 24 + 64),
+           "and the robot's real capture nodes beside it.", MUTED)
+    hint_row(c, H - 40,
+             "[ ] rotates the selected camera · w writes it to lekiwi.yaml · 5.0 fps",
+             [("tab", "select"), ("[ ]", "rotate"), ("w", "save"), ("q", "back")])
+    return c.img
+
+
+def draw_robot_config() -> Image.Image:
+    """The read-only config view — the screen the preview hangs off."""
+    c = Canvas()
+    c.header("robot config")
+    header_note(c, "lekiwi.yaml · read-only")
+    y = 70
+    for title, rows in (
+        ("CONNECTION", [("remote ip", PUBLIC_IP), ("robot id", "lekiwi"), ("loop freq", "30 Hz")]),
+        ("DATASET", [("repo id", PUBLIC_DATASET), ("root", "datasets/demo-plate")]),
+    ):
+        c.text((PAD_X, y), title, PURPLE, bold=True)
+        c.line((PAD_X + 130, y + 13, W - PAD_X, y + 13), HAIRLINE)
         y += 28
-        for action_id in ids:
-            action_row(c, y, action_id, selected=action_id == selected)
-            y += 24
-        y += 20
-    footer(c, H - 46)
+        for label, value in rows:
+            c.text((PAD_X + 16, y), f"{label:<14}", MUTED)
+            c.text((PAD_X + 190, y), value, TEXT)
+            y += LINE_H + 2
+        y += 14
+    c.text((PAD_X, y), "CAMERAS", PURPLE, bold=True)
+    c.line((PAD_X + 130, y + 13, W - PAD_X, y + 13), HAIRLINE)
+    y += 28
+    for name, device, rot in PUBLIC_CAMS:
+        c.text((PAD_X + 16, y), f"{name:<14}", MUTED)
+        c.text((PAD_X + 190, y), f"640×480 @30   {device:<12} {rot}", TEXT)
+        y += LINE_H + 2
+    hint_row(c, H - 40, "read-only — e edits lekiwi.yaml, r reloads, p previews the robot cameras",
+             [("e", "edit"), ("r", "reload"), ("p", "preview"), ("q", "back")])
     return c.img
 
 
@@ -325,6 +518,36 @@ def draw_eval(*, mode: str = "PREVIEW", selected: str = "policy") -> Image.Image
     return c.img
 
 
+def draw_record_new() -> Image.Image:
+    """Record on the shared chrome: one setting per row, steppers, pill toggles."""
+    c = Canvas()
+    c.header("record")
+    header_note(c, f"{PUBLIC_DATASET} · 60 episodes · 1.4 GB")
+    y = 70
+    c.text((PAD_X, y), "DATASET", PURPLE, bold=True)
+    c.line((PAD_X + 110, y + 13, W - PAD_X, y + 13), HAIRLINE)
+    y += 30
+    y = setting_row(c, y, "Name", "demo-plate", "saves under datasets/<name>")
+    y = setting_row(c, y, "Task", PUBLIC_TASK, "enter to edit")
+    y = setting_row(c, y, "Episodes", "10", "←→ ±1 · enter to type", kind="stepper")
+    y = setting_row(c, y, "Episode length", "60 s", "←→ ±5", kind="stepper", selected=True)
+    y += 12
+    c.text((PAD_X, y), "CAPTURE", PURPLE, bold=True)
+    c.line((PAD_X + 110, y + 13, W - PAD_X, y + 13), HAIRLINE)
+    y += 30
+    y = setting_row(c, y, "Resume", "append|fresh", "nothing to resume → starts new", kind="toggle")
+    y = setting_row(c, y, "View", "hud|log", "in-page HUD + key forwarding", kind="toggle")
+    y = setting_row(c, y, "Encoder", "h264_nvenc · gpu", "the dataset's codec")
+    y += 16
+    c.rect((PAD_X - 6, y - 2, W - PAD_X, y + LINE_H - 2), HIGHLIGHT_BG)
+    c.rect((PAD_X - 6, y - 2, PAD_X - 2, y + LINE_H - 2), SUCCESS)
+    c.text((PAD_X + 16, y), "▶ Start", SUCCESS, bold=True)
+    c.text((PAD_X + 190, y), "10 episodes × 60 s → appends after episode 60", TEXT)
+    hint_row(c, H - 40, "one setting per row · ←→ changes the focused one",
+             [("↑↓/jk", "move"), ("←→", "change"), ("↵", "edit"), ("s", "start"), ("q", "back")])
+    return c.img
+
+
 def draw_record() -> Image.Image:
     c = Canvas()
     c.header("record")
@@ -379,10 +602,12 @@ def draw_preview() -> Image.Image:
 def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
     frames = [
-        draw_menu("record", mode="REAL"),
-        draw_record(),
+        draw_menu("record", mode="REAL"),      # hero: the card grid + status card
+        draw_record_new(),
+        draw_menu("robot-config", mode="REAL"),
+        draw_robot_config(),
+        draw_camera_preview(),
         draw_menu("eval", mode="PREVIEW"),
-        draw_eval(mode="PREVIEW", selected="policy"),
         draw_eval(mode="PREVIEW", selected="start"),
         draw_preview(),
     ]
@@ -390,7 +615,7 @@ def main() -> None:
         GIF,
         save_all=True,
         append_images=frames[1:],
-        duration=[1100, 1300, 900, 1100, 1100, 1400],
+        duration=[1400, 1300, 900, 1200, 1800, 900, 1200, 1400],
         loop=0,
         optimize=True,
     )
