@@ -48,8 +48,12 @@ QUALITY = 50
 
 #: Cell budget for the image. Beyond this the span count starts to cost more than the
 #: extra detail is worth, and a camera is identifiable long before that.
-MAX_COLS = 96
-MAX_ROWS = 40
+MAX_COLS = 120
+MAX_ROWS = 56
+
+#: A half-block cell is one pixel wide and two tall, and the frame is 4:3, so the cell grid
+#: has to be ~2.67x wider than it is tall or the picture comes out stretched.
+CELL_ASPECT = (WIDTH / HEIGHT) * 2
 
 _ROT_DEGREES = {"NO_ROTATION": 0, "ROTATE_90": 90, "ROTATE_180": 180, "ROTATE_270": 270}
 
@@ -85,9 +89,15 @@ def configured_cameras(doc: Any) -> list[dict[str, Any]]:
 
 
 def build_stream_argv(ctx: "Context", camera: dict[str, Any]) -> list[str]:
-    """`ssh <host> "<emit-stream remote bash>"` for one camera.
+    """`ssh -n <host> "<emit-stream remote bash>"` for one camera.
 
-    No ``-t``: a PTY would translate the raw JPEG bytes this reads off stdout.
+    ``-n`` is load-bearing, not hygiene: without it ssh reads the TERMINAL's stdin — the
+    same fd the TUI reads keys from — and forwards those bytes to the remote shell. The
+    screen then looks frozen, because every keypress goes to the robot instead (observed:
+    a live preview that would not answer q, tab or Ctrl+C). The spawn also passes
+    stdin=DEVNULL, so neither layer can claim the keyboard.
+
+    No ``-t`` either: a PTY would translate the raw JPEG bytes this reads off stdout.
     """
     from ..remote import validate_remote_name, validate_ssh_host
 
@@ -100,7 +110,15 @@ def build_stream_argv(ctx: "Context", camera: dict[str, Any]) -> list[str]:
          "--quality", str(QUALITY), "--rotation", str(camera["rotation"])],
         text=True,
     )
-    return ["ssh", "-o", "ConnectTimeout=5", host, remote]
+    return ["ssh", "-n", "-o", "ConnectTimeout=5", host, remote]
+
+
+def fit_grid(width: int, height: int) -> tuple[int, int]:
+    """The largest 4:3-correct cell grid that fits *width* x *height*, within the caps."""
+    rows = max(1, min(MAX_ROWS, height))
+    cols = max(1, min(MAX_COLS, width, int(rows * CELL_ASPECT)))
+    rows = max(1, min(rows, int(cols / CELL_ASPECT)))
+    return cols, rows
 
 
 class CameraPreviewScreen(ScreenState):
@@ -137,6 +155,7 @@ class CameraPreviewScreen(ScreenState):
         camera = self.cameras[self.index]
         spawn = self._spawn or (lambda: subprocess.Popen(
             build_stream_argv(self.ctx, camera),
+            stdin=subprocess.DEVNULL,          # never let ssh read the TUI's keyboard
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
         self._stream = CameraStream(spawn=spawn)
         self._stream.start(now=time.monotonic())
@@ -209,8 +228,7 @@ class CameraPreviewScreen(ScreenState):
             Paragraph.from_string(theme.rule(bands[1].width)).style(theme.RULE_HEAVY_STYLE),
             bands[1])
 
-        cols = max(1, min(MAX_COLS, bands[2].width))
-        rows = max(1, min(MAX_ROWS, bands[2].height))
+        cols, rows = fit_grid(bands[2].width, bands[2].height)
         frame.render_widget(Paragraph(Text(self._image_lines(cols, rows))), bands[2])
 
         fps = self._stream.fps(now=time.monotonic()) if self._stream else 0.0

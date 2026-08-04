@@ -21,6 +21,7 @@ from lekiwi_tui.screens.camera_preview import (
     CameraPreviewScreen,
     build_stream_argv,
     configured_cameras,
+    fit_grid,
     rotation_degrees,
 )
 from lekiwi_tui.screens.robot_config import RobotConfigScreen
@@ -276,3 +277,62 @@ def test_p_says_so_when_no_camera_has_a_device(monkeypatch):
 def test_the_hint_line_advertises_both_keys():
     source = Path(ROOT / "lekiwi_tui" / "screens" / "robot_config.py").read_text()
     assert '("f", "detect cameras")' in source and '("p", "preview cameras")' in source
+
+
+# ── the keyboard must stay with the TUI ────────────────────────────────────────
+
+
+def test_ssh_is_told_not_to_read_our_stdin():
+    """Without -n, ssh reads the terminal's stdin — the same fd the TUI reads keys from —
+    and forwards it to the remote shell, so the screen stops answering q/tab/Ctrl+C."""
+    argv = build_stream_argv(make_ctx(gpu_name=""),
+                            {"name": "front", "device": "/dev/video0", "rotation": 0})
+    assert argv[:2] == ["ssh", "-n"]
+
+
+def test_the_real_spawn_detaches_stdin(monkeypatch):
+    """Belt and braces at the process layer: neither ssh nor its child may claim the
+    keyboard, whatever the argv says."""
+    captured = {}
+    real_popen = subprocess.Popen
+
+    class _Popen:
+        """Intercepts only the ssh spawn; the emitter's own check_output still runs for
+        real, so this exercises the actual argv-building path rather than a stub of it."""
+
+        def __new__(cls, argv, **kwargs):
+            if not (argv and argv[0] == "ssh"):
+                return real_popen(argv, **kwargs)
+            captured["argv"], captured["kwargs"] = argv, kwargs
+            return super().__new__(cls)
+
+        def __init__(self, argv, **kwargs):
+            self.stdout = io.BytesIO(b"")
+
+        def terminate(self): pass
+
+        def wait(self, timeout=None): return 0  # noqa: ANN001
+
+        def kill(self): pass
+
+    monkeypatch.setattr(subprocess, "Popen", _Popen)
+    ctx = make_ctx(gpu_name="")
+    ctx.doc = _doc(front={"index_or_path": "/dev/video0"})
+    screen = CameraPreviewScreen(None, ctx)          # no injected spawn: the real path
+    screen.on_enter()
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["stdout"] is subprocess.PIPE
+    screen.on_exit()
+
+
+# ── geometry ──────────────────────────────────────────────────────────────────
+
+
+def test_the_grid_keeps_the_frame_from_being_stretched():
+    """A cell is 1 pixel wide and 2 tall and the frame is 4:3, so the grid must be ~2.67x
+    wider than tall; a naive fill would squash a face into a rectangle."""
+    cols, rows = fit_grid(200, 80)
+    assert abs(cols / rows - 320 / 240 * 2) < 0.2
+    # never larger than the pane it was given
+    cols, rows = fit_grid(40, 10)
+    assert cols <= 40 and rows <= 10
