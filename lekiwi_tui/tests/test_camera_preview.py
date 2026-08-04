@@ -8,13 +8,15 @@ un-fakeable piece (`decode_jpeg`) is deliberately tiny and reports None rather t
 from __future__ import annotations
 
 import io
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from lekiwi_tui import ROOT
-from lekiwi_tui.camstream import CameraStream, frames, half_blocks
+from lekiwi_tui.camstream import CameraStream, frames, half_blocks, named_frames
 from lekiwi_tui.framework.events import ESC, TAB, Key
 from lekiwi_tui.framework.screen import Nothing, Pop, Push
 from lekiwi_tui.screens.camera_preview import (
@@ -532,3 +534,69 @@ def test_the_footer_says_how_to_rotate_and_save():
     """The two things a first-time user cannot guess."""
     source = Path(ROOT / "lekiwi_tui" / "screens" / "camera_preview.py").read_text()
     assert "[ ] rotate the selected camera, w writes it to lekiwi.yaml" in source
+
+
+# ── the emitted payload must actually be valid python ─────────────────────────
+
+
+def _remote_python(*camera_args: str) -> str:
+    """The python heredoc out of the emitted bash."""
+    out = subprocess.run(["bash", str(FIND_SH), "emit-stream-all", "--conda-env", "lekiwi",
+                          *camera_args], capture_output=True, text=True, check=True).stdout
+    body = out.split("python - <<'PY'", 1)[1]
+    return body.split("\nPY", 1)[0]
+
+
+def test_the_multi_camera_payload_compiles():
+    """It broke on the robot with SyntaxError at line 12: a \\n inside the printf format
+    lost an escaping level and became a REAL newline inside a string literal. Emitting
+    remote source through printf makes that a standing hazard, so compile it here."""
+    src = _remote_python("--camera", "front=/dev/video0", "--camera", "wrist=/dev/video4@180")
+    compile(src, "<emitted>", "exec")
+    assert r'\n" % (name, dev)' in src, "the escape survived as two characters, not a newline"
+
+
+def test_the_single_camera_payload_compiles():
+    out = subprocess.run(["bash", str(FIND_SH), "emit-stream", "--conda-env", "lekiwi",
+                          "--device", "/dev/video0"], capture_output=True, text=True, check=True)
+    src = out.stdout.split("python - <<'PY'", 1)[1].split("\nPY", 1)[0]
+    compile(src, "<emitted>", "exec")
+
+
+def test_the_payload_runs_and_frames_arrive(tmp_path):
+    """Run the emitted python for real against a fake cv2, so the wire format the TUI parses
+    is the wire format the robot writes — protocol drift between the two would be invisible
+    in a unit test of either half."""
+    src = _remote_python("--camera", "front=/dev/video0", "--camera", "wrist=/dev/video4@180")
+    fake_cv2 = tmp_path / "cv2.py"
+    fake_cv2.write_text(
+        "ROTATE_90_CLOCKWISE, ROTATE_180, ROTATE_90_COUNTERCLOCKWISE = 0, 1, 2\n"
+        "CAP_PROP_FOURCC, IMWRITE_JPEG_QUALITY, INTER_AREA = 6, 1, 3\n"
+        "def VideoWriter_fourcc(*a): return 0\n"
+        "def rotate(frame, how): return frame + [('rot', how)]\n"
+        "def resize(frame, size, interpolation=None): return frame + [('size', size)]\n"
+        "class _Cap:\n"
+        "    def __init__(self, dev): self.dev, self.n = dev, 0\n"
+        "    def isOpened(self): return self.dev != '/dev/video4'\n"   # one bad device
+        "    def set(self, *a): pass\n"
+        "    def read(self):\n"
+        "        self.n += 1\n"
+        "        if self.n > 2: raise SystemExit(0)\n"
+        "        return True, [self.dev]\n"
+        "    def release(self): pass\n"
+        "def VideoCapture(dev): return _Cap(dev)\n"
+        "def imencode(ext, frame, params):\n"
+        "    class _B:\n"
+        "        def __init__(self, f): self.f = f\n"
+        "        def tobytes(self): return repr(self.f).encode()\n"
+        "    return True, _B(frame)\n")
+    script = tmp_path / "remote.py"
+    script.write_text(src)
+    out = subprocess.run([sys.executable, str(script)], capture_output=True,
+                         env=dict(os.environ, PYTHONPATH=str(tmp_path)), timeout=30, check=False)
+
+    # the bad device is reported and skipped, the good one still streams
+    assert b"could not open" in out.stderr and b"/dev/video4" in out.stderr
+    parsed = list(named_frames(io.BytesIO(out.stdout)))
+    assert parsed and all(name == "front" for name, _ in parsed), "only the openable camera"
+    assert b"/dev/video0" in parsed[0][1] and b"'size', (320, 240)" in parsed[0][1]

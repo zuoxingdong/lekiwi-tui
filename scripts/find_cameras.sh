@@ -198,6 +198,77 @@ PY
 #
 #   Tiles are small, so the frames are small: 320x240 q50 is ~12 KB, and three of them at
 #   5 fps is ~180 KB/s, the same budget one full-size single preview used.
+# emit_stream <conda_env> <device> <fps> <width> <height> <quality> <rotation>
+#   Print the remote STREAM bash: capture one device and write length-prefixed JPEG
+#   frames to stdout, forever, until the ssh channel closes.
+#
+#   The list from emit-detect says which device nodes exist; it cannot say which LENS is
+#   which, and that is the question after a replug renumbers them. Hence a preview.
+#
+#   DOWNSCALE AND COMPRESS ON THE PI. A 320x240 q50 frame is ~12 KB, so 5 fps is ~60 KB/s
+#   — two orders below the USB+WiFi load that used to hard-freeze the Pi. Shipping full
+#   frames to downscale locally would spend the bandwidth we deliberately protect.
+#
+#   Rotation is applied here so the preview matches what the robot actually sends (a
+#   wrist camera configured ROTATE_180 should look upright), which also makes a wrong
+#   rotation visible instead of confusing.
+emit_stream() {
+  local conda_env="$1" device="$2" fps="$3" width="$4" height="$5" quality="$6" rotation="$7"
+  printf '
+        eval "$(~/miniforge3/bin/mamba shell hook --shell bash)" || exit 1
+        mamba activate %s || { echo '\''✗ could not activate %s'\'' >&2; exit 1; }
+
+        python - <<'\''PY'\''
+import sys, time
+import cv2
+
+cap = cv2.VideoCapture("%s")
+if not cap.isOpened():
+    sys.stderr.write("✗ could not open %s (is the host stopped?)\\n")
+    raise SystemExit(1)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+rot = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+period = 1.0 / %s
+out = sys.stdout.buffer
+try:
+    while True:
+        start = time.monotonic()
+        ok, frame = cap.read()
+        if not ok:
+            sys.stderr.write("✗ capture ended\\n")
+            break
+        if %s in rot:
+            frame = cv2.rotate(frame, rot[%s])
+        frame = cv2.resize(frame, (%s, %s), interpolation=cv2.INTER_AREA)
+        ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), %s])
+        if ok:
+            payload = jpeg.tobytes()
+            out.write(b"FRAME %%d\\n" %% len(payload))
+            out.write(payload)
+            out.flush()
+        time.sleep(max(0.0, period - (time.monotonic() - start)))
+finally:
+    cap.release()
+PY
+    ' "$conda_env" "$conda_env" "$device" "$device" "$fps" "$rotation" "$rotation" \
+      "$width" "$height" "$quality"
+}
+
+
+# emit_stream_all <conda_env> <specs> <fps> <width> <height> <quality>
+#   Print the remote bash that previews EVERY configured camera over ONE ssh channel.
+#
+#   One process, not one per camera: three ssh sessions would mean three logins, three
+#   pythons and three chances to leave a camera open. Frames are tagged with the camera
+#   name (`FRAME <name> <bytes>`) and interleaved round-robin, so a slow device delays
+#   only its own tile.
+#
+#   A device that will not open is REPORTED and SKIPPED rather than fatal — with three
+#   cameras, one bad node is exactly when you want to see the other two, and the tile
+#   for the missing one then carries the reason.
+#
+#   Tiles are small, so the frames are small: 320x240 q50 is ~12 KB, and three of them at
+#   5 fps is ~180 KB/s, the same budget one full-size single preview used.
 emit_stream_all() {
   local conda_env="$1" specs="$2" fps="$3" width="$4" height="$5" quality="$6"
   printf '
@@ -216,14 +287,14 @@ caps = []
 for name, dev, rot in specs:
     cap = cv2.VideoCapture(dev)
     if not cap.isOpened():
-        sys.stderr.write("✗ %%s %%s: could not open (is the host stopped?)\n" %% (name, dev))
+        sys.stderr.write("✗ %%s %%s: could not open (is the host stopped?)\\n" %% (name, dev))
         sys.stderr.flush()
         continue
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     caps.append((name, rot, cap))
 
 if not caps:
-    sys.stderr.write("✗ no camera could be opened\n")
+    sys.stderr.write("✗ no camera could be opened\\n")
     raise SystemExit(1)
 
 period = 1.0 / %s
@@ -242,7 +313,7 @@ try:
             if not ok:
                 continue
             payload = jpeg.tobytes()
-            out.write(b"FRAME %%s %%d\n" %% (name.encode(), len(payload)))
+            out.write(b"FRAME %%s %%d\\n" %% (name.encode(), len(payload)))
             out.write(payload)
             out.flush()
         time.sleep(max(0.0, period - (time.monotonic() - start)))
