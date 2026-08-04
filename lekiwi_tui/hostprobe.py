@@ -121,3 +121,10 @@ def session_remaining(ctx: Any) -> int | None:
 
 
 __all__ = ["HostProbe", "get_probe", "session_remaining", "DEFAULT_PORT"]
+
+
+def host_alive(ctx: Any) -> bool | None:
+    """The probe's live verdict for slim headers / warning-as-plan rows: True/False,
+    or None while unknown (no probe configured, or first poll still in flight)."""
+    probe = get_probe(ctx)
+    return probe.alive if probe is not None else None
