@@ -28,6 +28,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The TUI drives lerobot through the scripts/*.sh launchers, in whatever env `python`
+# resolves to, which is often NOT the env the TUI itself was installed into. So lerobot
+# is not a hard dependency: naming it here would install a second copy into the wrong
+# place. This extra exists for the single-env case (`pip install -e .[robot]`), and the
+# floor matches lekiwi_tui.lerobot_env.FLOOR, which is what the status card checks.
+robot = [
+    "lerobot>=0.6.1",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6.0",

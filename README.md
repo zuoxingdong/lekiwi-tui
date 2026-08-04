@@ -24,7 +24,11 @@ train, evaluate, keep the Pi in sync. Runs real `lerobot` commands through the
 ## Requirements
 
 - Linux, Python 3.10+
-- LeRobot in the active Python/conda environment
+- LeRobot **0.6.1 or newer** in the active Python/conda environment. Older ones are
+  missing the LeKiwi rollout/replay CLIs and config fields the launchers pass, so the
+  failure lands mid-launch inside `draccus` rather than at startup. The menu's status
+  card names the installed version and flags it when it is too old, including the case
+  where a checkout reports `0.6.1` without actually carrying its fields.
 - The default robot type `lekiwi_pincopen` needs the
   [lerobot_robot_lekiwi_pincopen](https://github.com/zuoxingdong/lerobot_robot_lekiwi_pincopen)
   plugin on the Pi. Set up Pi / Sync to Pi install and ship it automatically.

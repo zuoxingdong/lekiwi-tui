@@ -252,8 +252,15 @@ class MenuScreen(ScreenState):
 
     def _identity_spans(self) -> list[Span]:
         """Which hardware and which environment you are about to drive. Machine constants,
-        so they come from the config snapshot rather than a probe."""
+        so they come from the config snapshot rather than a probe.
+
+        The lerobot cell is the exception: it is what every screen here actually launches,
+        and a too-old one does not fail early — it fails inside draccus mid-launch, with
+        the robot already involved. Cheap enough for a per-frame call (metadata lookup,
+        cached for the process) and it flags a pre-release checkout too, since the version
+        string alone cannot tell those apart."""
         from ..config import cfg_get
+        from ..lerobot_env import summary
 
         out: list[Span] = []
         for label, key in (("robot ", "_launcher.ROBOT_TYPE"),
@@ -263,6 +270,16 @@ class MenuScreen(ScreenState):
                 if out:
                     out.append(Span("     ", theme.BASE_STYLE))
                 out += [Span(label, theme.MUTED_STYLE), Span(str(value), theme.TEXT_STYLE)]
+
+        value, suffix, level = summary()
+        if out:
+            out.append(Span("     ", theme.BASE_STYLE))
+        warn = level == "warn"
+        out += [Span("lerobot ", theme.MUTED_STYLE),
+                Span(("⚠ " if warn else "") + value, theme.WARN_STYLE if warn else theme.TEXT_STYLE)]
+        if suffix:
+            # muted, so a pre-release marker informs without competing with the vitals
+            out.append(Span(suffix, theme.WARN_STYLE if warn else theme.MUTED_STYLE))
         return out
 
     def _badge(self, action: Action) -> tuple[str, Any] | None:
