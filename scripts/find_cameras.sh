@@ -46,11 +46,20 @@ emit_detect() {
         mamba activate %s || { echo '\''✗ could not activate %s'\'' >&2; exit 1; }
 
         echo "▸ probing cameras on $(hostname) (record-time %ss)"
+        # --warmup-s only exists in lerobot with the find-cameras lifecycle fix; the Pi is
+        # often older than the laptop, and an unknown flag makes argparse exit 2 instead of
+        # probing. Ask the installed CLI rather than assuming a version (the remote twin of
+        # lerobot_declares in lib.sh). Unquoted on purpose: empty must expand to no argument.
+        WARMUP=""
+        if lerobot-find-cameras --help 2>&1 | grep -q -- "--warmup-s"; then
+            WARMUP="--warmup-s %s"
+        fi
+        # shellcheck disable=SC2086
         lerobot-find-cameras %s \
             --output-dir %s \
             --record-time-s %s \
-            --warmup-s %s
-    ' "$conda_env" "$conda_env" "$record_time" "$type_arg" "$out_dir" "$record_time" "$warmup"
+            $WARMUP
+    ' "$conda_env" "$conda_env" "$record_time" "$warmup" "$type_arg" "$out_dir" "$record_time"
 }
 
 # emit_stream <conda_env> <device> <fps> <width> <height> <quality> <rotation>

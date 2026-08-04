@@ -8,6 +8,7 @@ holds the cameras, since then it would report failures for the devices that work
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -137,3 +138,49 @@ def test_the_hint_line_advertises_the_key(monkeypatch):
     _, screen = _screen(monkeypatch, False)
     source = Path(ROOT / "lekiwi_tui" / "screens" / "robot_config.py").read_text()
     assert '("f", "detect cameras")' in source
+
+
+# ── the Pi is often older than the laptop ─────────────────────────────────────
+
+
+def _fake_cli(tmp_path: Path, *, supports_warmup: bool) -> Path:
+    """A stand-in `lerobot-find-cameras`: the older one exits 2 on an unknown flag,
+    exactly as argparse does, which is how this bug showed up on the robot."""
+    bin_dir = tmp_path / ("new" if supports_warmup else "old")
+    bin_dir.mkdir(parents=True)
+    cli = bin_dir / "lerobot-find-cameras"
+    help_line = ("usage: lerobot-find-cameras [--output-dir DIR] [--record-time-s N]"
+                 + (" [--warmup-s N]" if supports_warmup else ""))
+    reject = ("" if supports_warmup else
+              'for a in "$@"; do [[ "$a" == "--warmup-s" ]] && '
+              '{ echo "error: unrecognized arguments: --warmup-s" >&2; exit 2; }; done\n')
+    cli.write_text("#!/usr/bin/env bash\n"
+                   f'if [[ "$1" == "--help" ]]; then echo "{help_line}"; exit 0; fi\n'
+                   f"{reject}"
+                   'echo "PROBED: $*"\n')
+    cli.chmod(0o755)
+    return bin_dir
+
+
+def _run_remote_body(tmp_path: Path, *, supports_warmup: bool) -> subprocess.CompletedProcess:
+    """Execute the emitted payload locally, minus the mamba lines, against a fake CLI."""
+    emitted = _emit("emit-detect", "--conda-env", "lekiwi").stdout
+    body = "\n".join(ln for ln in emitted.splitlines()
+                     if "mamba" not in ln and 'eval "' not in ln)
+    env = dict(os.environ, PATH=f"{_fake_cli(tmp_path, supports_warmup=supports_warmup)}:{os.environ['PATH']}")
+    return subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env)
+
+
+def test_an_older_pi_is_probed_without_the_flag_it_lacks(tmp_path):
+    """--warmup-s arrived with the find-cameras lifecycle fix; the robot is often behind,
+    and argparse exits 2 on an unknown flag instead of probing (observed on the robot)."""
+    out = _run_remote_body(tmp_path, supports_warmup=False)
+    assert out.returncode == 0, out.stderr
+    assert "PROBED: opencv --output-dir /tmp/lekiwi-find-cameras --record-time-s 0" in out.stdout
+    assert "--warmup-s" not in out.stdout
+
+
+def test_a_newer_pi_gets_the_warmup(tmp_path):
+    out = _run_remote_body(tmp_path, supports_warmup=True)
+    assert out.returncode == 0, out.stderr
+    assert "--warmup-s 1" in out.stdout
