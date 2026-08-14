@@ -180,7 +180,7 @@ class HostKillScreen(ScreenState):
             Line([]),
             # The destructive action wears RED (the plan_row danger accent).
             plan_row("Stop host",
-                     f"ssh {host} · kill the host group · session chip clears",
+                     f"ssh {host} · graceful stop, kill -9 fallback · session chip clears",
                      focused=True, accent="danger", label_pad=4),
         ]
         frame.render_widget(Paragraph(Text(lines)).style(theme.BASE_STYLE), rows[2])
