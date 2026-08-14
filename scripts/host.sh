@@ -9,8 +9,8 @@
 # where "<bash>" is a single argv token executed ON THE PI. That remote bash is
 # the riskiest, most-tuned piece of the whole port (the graceful-INT→SIGKILL
 # cleanup, the host backgrounded under `wait`, the CONNECTION_TIME+60 overrun
-# net for launch; the pgrep/kill-9 sweep for kill). Keeping it here as shell
-# makes it inspectable and forkable on its own.
+# net for launch; the pgrep INT→kill-9 escalation for kill). Keeping it here as
+# shell makes it inspectable and forkable on its own.
 #
 # It does NOT build the ssh argv and does NOT spawn ssh. The Python side keeps
 # the load-bearing seam explicit: HostLaunchScreen and HostKillScreen build the
@@ -43,7 +43,8 @@
 #
 #   host.sh emit-kill --robot-id R
 #       Print the remote KILL bash: pgrep the lekiwi_host for this robot id,
-#       kill -9, then a ps|grep|awk sweep.
+#       SIGINT it (the host's finally-block then disables torque + releases the
+#       cameras), wait up to 10s, kill -9 the stragglers, then a ps|grep|awk sweep.
 #
 # A leading --dry-run (or DRY=1) is accepted and IGNORED: this script only ever
 # prints the remote bash (it never spawns anything), so --dry-run and a plain run
@@ -125,16 +126,30 @@ emit_launch() {
 }
 
 # emit_kill <robot_id>
-#   Print the remote KILL bash. The pgrep/grep `\.id` regex escapes are literal
-#   backslash-dot (doubled in the printf format so a single `\.` is emitted), and
-#   awk's `$2` is literal. robot_id substitutes into all four %s positions. This
-#   emission DOES end with a trailing newline.
+#   Print the remote KILL bash: SIGINT first so the host's finally-block runs
+#   (robot.disconnect() → torque OFF + cameras released — a straight kill -9 skips
+#   that and leaves the arm holding stiff in the air), poll up to 10s for a clean
+#   exit, then kill -9 whatever is left, plus the ps|grep|awk sweep as the last
+#   resort. The `\.id` regex escapes are literal backslash-dot (doubled in the
+#   printf format so a single `\.` is emitted) — this also keeps the pattern from
+#   matching the kill script's OWN bash -c cmdline, which contains the pattern
+#   text with the backslash intact. awk's `$2` is literal. robot_id substitutes
+#   into all four %s positions. This emission DOES end with a trailing newline.
 emit_kill() {
   local robot_id="$1"
-  printf 'PIDS=$(pgrep -f '\''python.*lekiwi_host.*--robot\\.id=%s'\'' || true)
+  printf 'PAT='\''python.*lekiwi_host.*--robot\\.id=%s'\''
+PIDS=$(pgrep -f "$PAT" || true)
 if [ -n "$PIDS" ]; then
-    echo "Found processes: $PIDS"; echo $PIDS | xargs -r kill -9
-    echo '\''✅ Killed lekiwi_host for ROBOT_ID=%s'\''
+    echo "Found processes: $PIDS"; echo "$PIDS" | xargs -r kill -INT
+    echo "Sent SIGINT — waiting for graceful stop (torque off + cameras released)…"
+    i=0; while [ "$i" -lt 20 ] && pgrep -f "$PAT" >/dev/null; do sleep 0.5; i=$(( i + 1 )); done
+    LEFT=$(pgrep -f "$PAT" || true)
+    if [ -n "$LEFT" ]; then
+        echo "⚠️  host did not exit in 10s — forcing kill -9 (arm may stay stiff; power-cycle to relax): $LEFT"
+        echo "$LEFT" | xargs -r kill -9
+    else
+        echo '\''✅ Stopped lekiwi_host gracefully for ROBOT_ID=%s (torque off)'\''
+    fi
 else echo '\''ℹ️  No lekiwi_host processes for ROBOT_ID=%s'\''; fi
 ps aux | grep '\''[p]ython.*lekiwi_host.*robot\\.id=%s'\'' | awk '\''{print $2}'\'' | xargs -r kill -9 2>/dev/null || true
 ' "$robot_id" "$robot_id" "$robot_id" "$robot_id"

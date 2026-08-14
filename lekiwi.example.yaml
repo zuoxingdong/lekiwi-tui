@@ -146,12 +146,15 @@ host:
     # far reach WORSE (a saturating joint sits further from target and drives a bigger
     # error), so only the gripper stays capped. Retune for your own arm; this is a
     # starting point, not a universal default.
-    heavy_joints: [arm_shoulder_lift, arm_elbow_flex, arm_wrist_flex]
-    heavy_p_coefficient: 10
+    # Which joints physically carry an STS3250 (drives the model declared on the bus;
+    # connect() rejects a model-number mismatch, so keep this matching the hardware).
+    sts3250_joints: [arm_shoulder_pan, arm_shoulder_lift, arm_elbow_flex, arm_wrist_flex]
+    heavy_joints: [arm_shoulder_pan, arm_shoulder_lift, arm_elbow_flex, arm_wrist_flex]
+    heavy_p_coefficient: 9
     heavy_d_coefficient: 32
-    joint_p_overrides: {arm_shoulder_pan: 6, arm_gripper: 12, arm_wrist_roll: 12}
-    joint_d_overrides: {arm_shoulder_pan: 32}
-    joint_acceleration_overrides: {arm_shoulder_pan: 200, arm_wrist_roll: 200}
+    joint_p_overrides: {arm_gripper: 10, arm_wrist_roll: 10}
+    joint_d_overrides: {}
+    joint_acceleration_overrides: {arm_wrist_roll: 200}
     joint_torque_limits: {arm_gripper: 800}
   host:
     max_loop_freq_hz: 30         # lower if the robot jitters (watch `top` on the Pi)
