@@ -19,6 +19,7 @@ import difflib
 import importlib
 import os
 import sys
+from typing import Any
 
 from . import CFG_FILE, EXAMPLE_CFG_FILE, ROOT
 from .app_registry import ACTIONS, ACTIONS_BY_ID, ALIASES, resolve_action
@@ -138,6 +139,32 @@ def _workspace_ready(*, require_private_config: bool) -> bool:
     return False
 
 
+def _stop_backgrounded_host(ctx: Any) -> None:
+    """After the TUI loop exits, gracefully stop a still-running backgrounded host.
+
+    Reached from EVERY way out of the app — menu quit (which confirms first via its
+    modal) and Ctrl+C straight out of the TUI (the ``finally`` runs while the
+    KeyboardInterrupt propagates). Without this, interpreter exit closes the PTY
+    master and the remote ``lekiwi_host`` dies on SIGHUP with no cleanup: torque
+    stays on and the cameras stay claimed, which is exactly what the SIGINT-first
+    ``host.sh emit-kill`` path was built to avoid. Prints to the real terminal —
+    the alt-screen is already gone by the time this runs.
+    """
+    stream = ctx.ui_state.get("host_stream")
+    if not getattr(stream, "running", False):
+        return
+    print("host session still running — sending Ctrl+C…", flush=True)
+    try:
+        outcome = stream.shutdown_sync()
+    except KeyboardInterrupt:
+        # An impatient second Ctrl+C during the grace wait: skip straight to SIGKILL.
+        outcome = stream.shutdown_sync(grace=0)
+    if outcome == "killed":
+        print("⚠️  host ignored Ctrl+C — killed; the arm may stay stiff (power-cycle to relax)")
+    elif outcome is not None:
+        print("✓ host stopped gracefully (torque off, cameras released)")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     # Global --dry-run / -n opt-in: PREVIEW the argv each action would run instead of
@@ -161,7 +188,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         ctx = load_context(is_tty=True)
         app, _ = _make_app(ctx, MenuScreen(None, ctx))
-        asyncio.run(app.run())
+        try:
+            asyncio.run(app.run())
+        finally:
+            _stop_backgrounded_host(ctx)
         return 0
 
     action_name, *extra = args
@@ -219,7 +249,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     screen_cls = getattr(module, cls_name)
     app, _ = _make_app(ctx, screen_cls(None, ctx))
-    asyncio.run(app.run())
+    try:
+        asyncio.run(app.run())
+    finally:
+        _stop_backgrounded_host(ctx)
     return 0
 
 

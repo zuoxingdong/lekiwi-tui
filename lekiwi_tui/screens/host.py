@@ -205,7 +205,9 @@ class HostLaunchScreen(ScreenState):
         # App-lifetime, NOT per-screen: the pump runs on the asyncio loop, so a running
         # host survives leaving this screen (q backgrounds it — go record!) and a fresh
         # HostLaunchScreen RE-ATTACHES to the same live log by adopting the shared
-        # controller from ui_state.
+        # controller from ui_state. It does NOT survive quitting the app: the menu
+        # confirms first, and __main__ then stops it gracefully via shutdown_sync
+        # (otherwise the dropped PTY would SIGHUP the remote host past its cleanup).
         self.stream = ctx.ui_state.setdefault("host_stream", StreamController())
         self._area = None                         # last drawn area (for the PTY winsize)
         self._session_total_s = self.minutes.value * 60

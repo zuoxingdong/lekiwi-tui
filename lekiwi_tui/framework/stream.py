@@ -23,6 +23,7 @@ import re
 import signal
 import struct
 import termios
+import time
 from collections import deque
 from typing import Any
 
@@ -185,6 +186,57 @@ class StreamController:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
+
+    def shutdown_sync(self, grace: float | None = None) -> str | None:
+        """Gracefully stop a still-running child WITHOUT the asyncio loop.
+
+        :meth:`stop` cannot run once ``asyncio.run`` has returned — its escalation
+        timer (``call_later``) and the ``_reap`` task need the loop. Yet the app can
+        exit while a backgrounded session is still live: quitting from the menu with
+        a running host, or Ctrl+C straight out of the TUI. If nothing intervenes,
+        interpreter exit closes the PTY master and the child chain dies on SIGHUP,
+        which on the remote side skips the host's finally-block (torque stays on,
+        cameras stay claimed) — the exact ungraceful stop ``host.sh emit-kill``
+        exists to avoid.
+
+        Same escalation as :meth:`stop`, done synchronously with os-level waits:
+        Ctrl+C down the PTY, poll up to *grace* seconds (default: this controller's
+        grace), SIGKILL the process group if it wedged. Returns ``None`` when there
+        was nothing to stop, ``'stopped'`` on a graceful exit, ``'killed'`` when it
+        took the SIGKILL.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return None
+        pid = proc.pid
+        if self._master is not None:
+            try:
+                os.write(self._master, b"\x03")
+            except OSError:
+                pass
+        deadline = time.monotonic() + (self._grace if grace is None else grace)
+        while time.monotonic() < deadline:
+            if self._reaped(pid):
+                self.phase = "ended"
+                return "stopped"
+            time.sleep(0.1)
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            self.phase = "ended"
+            return "stopped"      # exited between the last poll and the kill
+        self._reaped(pid, block=True)
+        self.phase = "ended"
+        return "killed"
+
+    @staticmethod
+    def _reaped(pid: int, *, block: bool = False) -> bool:
+        """os-level child reap check — asyncio's child watcher is gone with the loop."""
+        try:
+            done, _ = os.waitpid(pid, 0 if block else os.WNOHANG)
+        except ChildProcessError:  # already reaped elsewhere
+            return True
+        return done == pid
 
     def handle_stop_key(self, key: Any) -> bool:
         """Route a Stop key (``s`` or Ctrl+C) while running. Returns True iff it handled
