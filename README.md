@@ -8,10 +8,15 @@ train, evaluate, keep the Pi in sync. Runs real `lerobot` commands through the
 
 ## Features
 
-- **Live status everywhere.** The robot chip shows host up/down and remaining
-  session time on every screen.
+- **Live status everywhere.** The home page opens on a 2×2 status grid —
+  HARDWARE (leader arm plugged in? calibration age? which cameras?), SESSION
+  (host up/down with the session countdown as a meter), SOFTWARE (lerobot
+  version, conda env) and COMPUTE (CPU/RAM/GPU/VRAM bar meters) — and the robot
+  chip shows host up/down and remaining session time on every other screen.
 - **One-terminal flow.** Start the host, hit `q`, it keeps running while you
-  record or teleoperate. Come back and the live log re-attaches.
+  record or teleoperate. Come back and the live log re-attaches. Quitting the
+  app with the host still up asks first, then stops it gracefully (torque off,
+  cameras released) instead of letting it die on SIGHUP.
 - **Dataset editor.** Browse episodes with anomaly flags, view them in Rerun,
   delete or retag in place — every edit keeps a timestamped backup.
 - **Smart sync.** Mirrors the laptop checkouts to the Pi, re-installs only when
@@ -26,8 +31,8 @@ train, evaluate, keep the Pi in sync. Runs real `lerobot` commands through the
 - Linux, Python 3.10+
 - LeRobot **0.6.1 or newer** in the active Python/conda environment. Older ones are
   missing the LeKiwi rollout/replay CLIs and config fields the launchers pass, so the
-  failure lands mid-launch inside `draccus` rather than at startup. The menu's status
-  card names the installed version and flags it when it is too old, including the case
+  failure lands mid-launch inside `draccus` rather than at startup. The menu's SOFTWARE
+  status card names the installed version and flags it when it is too old, including the case
   where a checkout reports `0.6.1` without actually carrying its fields.
 - The default robot type `lekiwi_pincopen` needs the
   [lerobot_robot_lekiwi_pincopen](https://github.com/zuoxingdong/lerobot_robot_lekiwi_pincopen)
@@ -60,10 +65,10 @@ lekiwi --dry-run       # preview commands
 | Key | Action |
 |---|---|
 | arrows / `j` `k` | move |
-| `1`-`8` | jump and run a menu action (setup rows have no shortcut) |
+| `1`-`9` | jump and run a menu action (setup rows have no shortcut) |
 | left/right / `h` `l` | adjust fields |
 | Enter | edit / pick / start |
-| `q` | back (a running host stays up) |
+| `q` | back (a running host stays up; quitting the app offers a graceful stop) |
 | `d` | toggle preview mode (menu) |
 | `K` `K` | emergency host stop, from any screen |
 | `?` | help |

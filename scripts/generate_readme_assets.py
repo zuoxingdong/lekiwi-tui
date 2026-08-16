@@ -35,19 +35,22 @@ LINE_H = 22
 FONT_SIZE = 17
 EMOJI_SIZE = 18
 
-BG = "#0b101f"
-SURFACE = "#111827"
-PANEL = "#1f2937"
-TEXT = "#e5edf7"
-MUTED = "#94a3b8"
-ACCENT = "#38bdf8"
-SAND = "#fbbf24"
-SUCCESS = "#34d399"
-WARNING = "#f59e0b"
-ERROR = "#fb7185"
-HAIRLINE = "#334155"
-PURPLE = "#a78bfa"
-HIGHLIGHT_BG = "#0e354a"
+# The Nord palette, mirroring framework/theme.py (frost cyan accent, frost blue
+# sections, aurora semantics on a darkened polar-night ground).
+BG = "#232831"
+SURFACE = "#2a313d"
+PANEL = "#3b4252"
+TEXT = "#eceff4"
+MUTED = "#9aa5b5"
+ACCENT = "#88c0d0"
+SAND = "#ebcb8b"
+SUCCESS = "#a3be8c"
+WARNING = "#ebcb8b"
+ERROR = "#bf616a"
+HAIRLINE = "#434c5e"
+PURPLE = "#81a1c1"
+HIGHLIGHT_BG = "#2c3b47"
+TRACK = "#39424f"       # meter troughs (theme SURFACE_LIGHTEN_2)
 
 PUBLIC_HOST = "robot-pi"
 PUBLIC_ENV = "lerobot"
@@ -57,8 +60,6 @@ PUBLIC_POLICY = "models/lekiwi-policy/checkpoints/latest/pretrained_model"
 PUBLIC_TASK = "Pick up the object and place it in the tray"
 PUBLIC_LEROBOT = "0.6.1"
 PUBLIC_DATASET = "local/demo-plate"
-#: Laptop vitals for the status card. Plausible, and nothing here identifies a machine.
-PUBLIC_VITALS = "cpu 21%   ram 9.4/31 GB   RTX GPU 12%   vram 1.2/8 GB"
 
 
 def font(bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -225,34 +226,92 @@ def card(c: Canvas, box: tuple[int, int, int, int], title: str) -> None:
     c.text((x0 + 12, y0 - 9), f" {title} ", PURPLE, bold=True)
 
 
-def status_card(c: Canvas, y: int, *, mode: str = "REAL") -> int:
-    """The ROBOT card: is the robot reachable, can this laptop take another run, and which
-    hardware/env/lerobot is about to be driven."""
-    box = (PAD_X, y, W - PAD_X, y + 3 * LINE_H + 18)
-    card(c, box, "ROBOT")
+def meter(c: Canvas, x: int, y: int, w: int, frac: float, *, h: int = 12) -> None:
+    """A gradient bar meter as the menu draws it: fill colored by position (green low,
+    amber 60-85%, red top) over a faint track."""
+    c.rect((x, y, x + w, y + h), TRACK)
+    fill_w = int(w * max(0.0, min(frac, 1.0)))
+    cut1, cut2 = int(w * 0.60), int(w * 0.85)
+    for x0, x1, color in ((0, min(fill_w, cut1), SUCCESS),
+                          (cut1, min(fill_w, cut2), WARNING),
+                          (cut2, fill_w, ERROR)):
+        if x1 > x0:
+            c.rect((x + x0, y, x + x1, y + h), color)
+
+
+def labeled_meter(c: Canvas, x: int, y: int, cell_w: int, label: str, frac: float,
+                  value: str) -> None:
+    """One COMPUTE cell: ``LABEL  ▮▮▮▯▯  value``. The label column is fixed, the value
+    right-aligns to the cell's right edge, and the bar takes whatever is left."""
+    label_w, value_col = 86, 96
+    c.text((x, y), label, MUTED)
+    meter(c, x + label_w, y + 4, cell_w - label_w - value_col - 10, frac)
+    c.text((x + cell_w - int(c.d.textlength(value, font=FONT)), y), value, TEXT)
+
+
+def status_grid(c: Canvas, y: int) -> int:
+    """The 2x2 status grid: HARDWARE | SESSION over SOFTWARE | COMPUTE, on the same
+    column split as the action cards below."""
+    col_w = (W - 2 * PAD_X - 18) // 2
+    lx, rx = PAD_X, PAD_X + col_w + 18
+    label_col = 150
+
+    # ── row 1: HARDWARE | SESSION (4 content lines) ──
+    h1 = 4 * LINE_H + 16
+    card(c, (lx, y, lx + col_w, y + h1), "HARDWARE")
     row = y + 12
-    c.text((PAD_X + 14, row), "●", SUCCESS, bold=True)
-    c.text((PAD_X + 34, row), "host up", SUCCESS)
-    c.text((PAD_X + 130, row), "session 27:41 left", MUTED)
-    x = W - PAD_X - 130
-    c.rect((x, row - 1, W - PAD_X - 14, row + LINE_H - 3), PANEL)
-    c.text((x + 8, row), "mode", MUTED)
-    c.text((x + 58, row), mode, SUCCESS if mode == "REAL" else WARNING, bold=True)
+    for label, check, value in (
+        ("robot type", False, PUBLIC_ROBOT),
+        ("leader arm", True, "/dev/ttyACM0"),
+        ("calibration", True, "leader · 3d ago"),
+        ("cameras", False, "front · wrist · top"),
+    ):
+        c.text((lx + 14, row), label, MUTED)
+        x = lx + label_col
+        if check:
+            # DejaVu (the keycap font) carries U+2713; NotoSansMono renders it as tofu.
+            c.d.text((x, row), "✓", font=KEY, fill=SUCCESS)
+            x += 22
+        c.text((x, row), value, TEXT)
+        row += LINE_H
+
+    card(c, (rx, y, rx + col_w, y + h1), "SESSION")
+    row = y + 12
+    c.text((rx + 14, row), "●", SUCCESS, bold=True)
+    c.text((rx + 34, row), "host up", SUCCESS)
+    c.text((rx + 122, row), f"· {PUBLIC_HOST}", MUTED)
+    row += LINE_H + 6
+    # the countdown meter fills as the session elapses; 27:41 of 60:00 left
+    meter(c, rx + 14, row + 4, col_w - 160, 1 - 27.7 / 60)
+    c.text((rx + col_w - 132, row), "27:41 left", TEXT)
+
+    # ── row 2: SOFTWARE | COMPUTE (2 content lines) ──
+    y2 = y + h1 + 22
+    h2 = 2 * LINE_H + 16
+    card(c, (lx, y2, lx + col_w, y2 + h2), "SOFTWARE")
+    row = y2 + 12
+    c.text((lx + 14, row), "lerobot", MUTED)
+    c.text((lx + label_col, row), PUBLIC_LEROBOT, TEXT)
     row += LINE_H
-    c.text((PAD_X + 14, row), "laptop", MUTED)
-    c.text((PAD_X + 104, row), PUBLIC_VITALS, TEXT)
+    c.text((lx + 14, row), "conda env", MUTED)
+    c.text((lx + label_col, row), PUBLIC_ENV, TEXT)
+
+    card(c, (rx, y2, rx + col_w, y2 + h2), "COMPUTE")
+    row = y2 + 12
+    cell_w = (col_w - 28 - 24) // 2
+    left_x, right_x = rx + 14, rx + 14 + cell_w + 24
+    labeled_meter(c, left_x, row, cell_w, "CPU", 0.21, "21%")
+    labeled_meter(c, right_x, row, cell_w, "RAM", 9.4 / 31, "9.4/31 GB")
     row += LINE_H
-    c.text((PAD_X + 14, row), "robot", MUTED)
-    c.text((PAD_X + 104, row), PUBLIC_ROBOT, TEXT)
-    c.text((PAD_X + 320, row), "env", MUTED)
-    c.text((PAD_X + 368, row), PUBLIC_ENV, TEXT)
-    c.text((PAD_X + 520, row), "lerobot", MUTED)
-    c.text((PAD_X + 608, row), PUBLIC_LEROBOT, TEXT)
-    return box[3] + 26
+    labeled_meter(c, left_x, row, cell_w, "RTX GPU", 0.12, "12%")
+    labeled_meter(c, right_x, row, cell_w, "VRAM", 1.2 / 8, "1.2/8 GB")
+
+    return y2 + h2 + 26
 
 
 def card_row(c: Canvas, x: int, y: int, width: int, action_id: str, *, selected: bool) -> int:
-    """One action inside a card: icon, digit, label, then its description underneath."""
+    """One action inside a card: icon, digit, label — one line per action (the
+    description lines were dropped from the menu; the asset must not advertise them)."""
     action = next(a for a in ACTIONS if a.id == action_id)
     if selected:
         c.rect((x + 4, y - 2, x + width - 6, y + LINE_H - 2), HIGHLIGHT_BG)
@@ -261,8 +320,7 @@ def card_row(c: Canvas, x: int, y: int, width: int, action_id: str, *, selected:
     if action_id in JUMPABLE:
         c.text((x + 44, y), str(JUMPABLE.index(action_id) + 1), ACCENT, bold=selected)
     c.text((x + 66, y), action.label, ACCENT if selected else TEXT, bold=selected)
-    c.text((x + 66, y + LINE_H - 2), c.fit_end(action.hint, width - 84), MUTED)
-    return y + 2 * LINE_H - 2
+    return y + LINE_H + 2
 
 
 def hint_row(c: Canvas, y: int, hint: str, keys: list[tuple[str, str]]) -> None:
@@ -279,10 +337,16 @@ def hint_row(c: Canvas, y: int, hint: str, keys: list[tuple[str, str]]) -> None:
 
 
 def draw_menu(selected: str = "record", *, mode: str = "REAL") -> Image.Image:
-    """The card-grid menu: status card, then four cards two across, then the SETUP strip."""
+    """The card-grid menu: the 2x2 status grid, four action cards two across, then the
+    SETUP strip. The mode chip sits in the header, as the real screen draws it."""
     c = Canvas()
     c.header("mobile-manipulator control")
-    y = status_card(c, 56, mode=mode)
+    chip_txt = f" {mode} "
+    chip_w = int(c.d.textlength(chip_txt, font=BOLD))
+    c.rect((W - PAD_X - chip_w, 10, W - PAD_X, 10 + LINE_H - 2),
+           SUCCESS if mode == "REAL" else PANEL)
+    c.text((W - PAD_X - chip_w + 6, 11), mode, BG if mode == "REAL" else MUTED, bold=True)
+    y = status_grid(c, 60)
 
     # Membership comes from the registry (menu.py's own source), so a new action appears here
     # instead of being silently missing from the asset — which is exactly what happened when
@@ -295,7 +359,7 @@ def draw_menu(selected: str = "record", *, mode: str = "REAL") -> Image.Image:
     col_w = (W - 2 * PAD_X - 18) // 2
     for row_titles in grid:
         rows = max(len(members[t]) for t in row_titles)
-        height = rows * (2 * LINE_H - 2) + 22
+        height = rows * (LINE_H + 2) + 22
         for i, title in enumerate(row_titles):
             x0 = PAD_X + i * (col_w + 18)
             card(c, (x0, y, x0 + col_w, y + height), title)
