@@ -4,11 +4,15 @@ The canonical EXEMPLAR every other screen copies: it takes ``(app, ctx)``, subcl
 ``ScreenState``, rebuilds its whole view each frame in :meth:`draw`, and turns keys into
 :class:`Action` s in :meth:`handle_key` (pure → unit-testable with synthetic ``Key``).
 
-LAYOUT (agreed design, 2026-08-03): a "◆ LEKIWI" header, an accent rule, then a full-width
-**ROBOT status card**, then four **section cards two across** (HOST / COLLECT · DATA /
-LEARN), then SETUP as a single strip, a light rule, and the hint line. Each action row is
-``icon-cell + digit + label`` with an optional right-aligned live badge, over a muted
-description line.
+LAYOUT (agreed design, 2026-08-03; status grid 2026-08-15): a "◆ LEKIWI" header, an
+accent rule, then a **2×2 status grid** — HARDWARE (robot, leader plug state, calibration
+age, cameras) | SESSION (host up/down + a countdown meter) over SOFTWARE (lerobot, env) |
+COMPUTE (gradient resource meters, 2×2) — on the same column split as the grid below, then four
+**section cards two across** (HOST / COLLECT · DATA / LEARN), then SETUP as a single
+strip, a light rule, and the hint line. Each action row is ``icon-cell + digit + label`` with an optional
+right-aligned live badge (the per-action description line was dropped 2026-08-15: the
+labels are self-explanatory to a daily user, and the full hints remain in the flat list
+and the ``?`` help).
 
 The card grid needs room. Below ``_MIN_CARD_W`` columns or ``_MIN_CARD_H`` rows the screen
 falls back to the classic flat sectioned list, which is why :meth:`_flat_body` is still here
@@ -22,6 +26,9 @@ position is DERIVED from it each time, never stored alongside it and never allow
 """
 from __future__ import annotations
 
+import os
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
@@ -29,7 +36,8 @@ from pyratatui import Constraint, Direction, Layout, Line, Paragraph, Span, Text
 from ..app_registry import ACTIONS, Action
 from ..framework import theme
 from ..framework.events import DOWN, ENTER, ESC, LEFT, RIGHT, UP, Key
-from ..framework.screen import Nothing, Quit, RunAction, ScreenState
+from ..framework.modals import ConfirmModalState
+from ..framework.screen import Invoke, Nothing, Quit, RunAction, ScreenState
 
 if TYPE_CHECKING:
     from ..context import Context
@@ -58,13 +66,115 @@ _GRID: list[list[list[Action]]] = [[_GROUPS.get(n, []) for n in row] for row in 
 _STRIP: list[Action] = _GROUPS.get(_STRIP_CARD, [])
 _ROWS = len(_GRID)          # the SETUP strip lives at row index _ROWS
 
-#: Status card: three content rows (robot / laptop / identity) plus its border.
-_STATUS_H = 5
+#: Status grid: 2×2 cards — HARDWARE | SESSION (4 content rows) over SOFTWARE | COMPUTE
+#: (2 content rows; the meters pack 2×2 inside COMPUTE). Spacious puts a blank between
+#: rows for breathing room; compact drops ONLY the blanks — never the cards — so a short
+#: terminal keeps the grid instead of falling back to the flat list.
+_ROW1_COMPACT, _ROW1_SPACIOUS = 4 + 2, 7 + 2
+_ROW2_COMPACT, _ROW2_SPACIOUS = 2 + 2, 3 + 2
 
-#: Smallest terminal the card grid is legible in; below either, fall back to the flat list.
-#: Height = header + rule + gap + status card + 2 card rows with gaps + strip + rule + hint.
+#: Body height (the fill row of draw()) each layout needs: two status rows + gap +
+#: action rows with gaps + strip.
+_GRID_TAIL_H = 1 + (2 + 2) + 1 + (3 + 2) + 1 + 1
+_COMPACT_BODY_H = _ROW1_COMPACT + _ROW2_COMPACT + _GRID_TAIL_H
+_SPACIOUS_BODY_H = _ROW1_SPACIOUS + _ROW2_SPACIOUS + _GRID_TAIL_H
+
+#: Smallest terminal the card grid is legible in; below either, fall back to the flat
+#: list. Height = the compact body + header/rule/gap above and rule/hint below (5).
 _MIN_CARD_W = 72
-_MIN_CARD_H = 28
+_MIN_CARD_H = _COMPACT_BODY_H + 5
+
+#: Eighth-block tips give the meters sub-cell resolution (index = eighths minus one).
+_EIGHTHS = "▏▎▍▌▋▊▉█"
+
+#: Meters wider than this read as decoration, not data; the slack goes to the value column.
+_MAX_BAR_W = 28
+
+
+def _grad_style(cell_frac: float) -> Any:
+    """Bar-POSITION gradient: cells low in the track render green, the 60–85% band amber,
+    the top red — so where the tip sits tells low/high at a glance, before the number."""
+    if cell_frac >= 0.85:
+        return theme.ERR_STYLE
+    if cell_frac >= 0.60:
+        return theme.WARN_STYLE
+    return theme.OK_STYLE
+
+
+def meter_spans(label: str, frac: float | None, value: str, *,
+                label_w: int, value_w: int, bar_w: int,
+                value_style: Any = None) -> list[Span]:
+    """One meter row: ``label  ▮▮▮▯▯▯▯  value``.
+
+    *frac* is 0..1 (clamped; ``None`` draws an empty track for a metric whose value
+    exists but could not be read, e.g. a GPU whose utilisation query failed). The fill
+    is colored by position (:func:`_grad_style`), the track is faint, and *value* is
+    right-aligned into a fixed column so the numbers line up across rows. ASCII mode
+    swaps the blocks for ``#``/``.`` and drops the sub-cell tip.
+    """
+    fill_ch, track_ch = ("#", ".") if theme.ASCII_MODE else ("█", "░")
+    spans = [Span(label.ljust(label_w), theme.MUTED_STYLE), Span("  ", theme.BASE_STYLE)]
+    f = 0.0 if frac is None else min(max(frac, 0.0), 1.0)
+    if theme.ASCII_MODE:
+        full, tip = round(f * bar_w), 0
+    else:
+        full, tip = divmod(round(f * bar_w * 8), 8)
+    # Contiguous same-color runs, split at the gradient boundaries (cell counts).
+    cut1, cut2 = int(bar_w * 0.60), int(bar_w * 0.85)
+    for n, style in ((min(full, cut1), theme.OK_STYLE),
+                     (min(full, cut2) - min(full, cut1), theme.WARN_STYLE),
+                     (full - min(full, cut2), theme.ERR_STYLE)):
+        if n > 0:
+            spans.append(Span(fill_ch * n, style))
+    used = full
+    if tip:
+        spans.append(Span(_EIGHTHS[tip - 1], _grad_style((full + 0.5) / bar_w if bar_w else 0.0)))
+        used += 1
+    if bar_w - used > 0:
+        spans.append(Span(track_ch * (bar_w - used), theme.FAINT_STYLE))
+    spans += [Span("  ", theme.BASE_STYLE),
+              Span(value.rjust(value_w), value_style or theme.TEXT_STYLE)]
+    return spans
+
+
+# ── tiny TTL cache for the status cards' file-system probes ─────────────────────
+# draw() runs every frame; an os.stat per frame is cheap but not free, and the values
+# only matter at human timescales. Same pattern as datasets._STATS_CACHE.
+_PROBE_CACHE: dict[str, tuple[float, Any]] = {}
+
+
+def _probe_cached(key: str, ttl: float, fn: Any) -> Any:
+    now = time.monotonic()
+    hit = _PROBE_CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    value = fn()
+    _PROBE_CACHE[key] = (now, value)
+    return value
+
+
+def _leader_port_present(port: str) -> bool:
+    """Is the leader arm's serial device plugged in right now? THE classic teleop
+    no-start, surfaced before the launch instead of inside its traceback."""
+    return bool(port) and _probe_cached(f"leader:{port}", 2.0,
+                                        lambda: os.path.exists(port))
+
+
+def _leader_calib_age_days(leader_id: str) -> int | None:
+    """Days since the LOCAL leader calibration file was written, or None when it does
+    not exist. Same file calibrate.py stats for its age line; the follower's file lives
+    on the Pi, so there is nothing local to stat for it."""
+    from .calibrate import _calib_base
+
+    path = Path(_calib_base()) / "teleoperators" / "so101_leader" / f"{leader_id}.json"
+
+    def stat() -> int | None:
+        try:
+            return max(0, int((time.time() - path.stat().st_mtime) / 86400))
+        except OSError:
+            return None
+
+    return _probe_cached(f"calib:{path}", 5.0, stat)
 
 Pos = tuple[int, int, int]  # (grid row, column, index within that card)
 
@@ -161,8 +271,35 @@ class MenuScreen(ScreenState):
             )
             return Nothing
         if name == "q" or name == ESC:
-            return Quit()
+            return self._quit_action()
         return Nothing
+
+    #: The confirm choice that stops the host — a class attribute so tests pin the exact label.
+    STOP_AND_QUIT = "Stop the host gracefully, then quit"
+
+    def _quit_action(self) -> Any:
+        """Quit, gating on a live backgrounded host session.
+
+        ``q`` on the host screen deliberately BACKGROUNDS a running session (see
+        host.py) — but quitting the whole app would close the PTY master and the
+        remote host would die on SIGHUP, skipping its finally-block (torque left on,
+        cameras left claimed). So a live session gets a confirm modal first. The
+        actual graceful stop runs AFTER the loop exits (``__main__`` calls
+        ``shutdown_sync``): waiting here inside the Invoke flow would freeze the
+        draw loop for the whole grace window, and the loop-bound ``stop()`` timers
+        would not survive the quit anyway.
+        """
+        stream = self.ctx.ui_state.get("host_stream")
+        if getattr(stream, "running", False):
+            return Invoke(self._confirm_quit_with_host)
+        return Quit()
+
+    async def _confirm_quit_with_host(self) -> None:
+        choice = await self.app.run_modal(ConfirmModalState(
+            "The Pi host session is still running. Quit anyway?",
+            [self.STOP_AND_QUIT, "Cancel"]))
+        if choice == self.STOP_AND_QUIT:
+            self.app.quit()
 
     def _go(self, *, dr: int = 0, dc: int = 0) -> None:
         target = _action_at(_move(_pos_of(ACTIONS[self._sel]), dr=dr, dc=dc))
@@ -173,72 +310,175 @@ class MenuScreen(ScreenState):
         """The currently-highlighted Action (used by tests / the dispatcher)."""
         return ACTIONS[self._sel]
 
-    # ── live facts for the status card ────────────────────────────────────────
-    def _live_spans(self) -> list[Span]:
-        """Host reachability, session countdown, GPU. Everything here is already polled or
-        cached elsewhere: nothing in this method may touch the disk, because draw() runs
-        every frame."""
+    # ── the four status cards (draw() runs every frame: cached/polled sources only) ──
+    @staticmethod
+    def _spaced(rows: list[Line], spacious: bool) -> list[Line]:
+        """Interleave blank lines between *rows* when the terminal has the height (the
+        shared rhythm of all four status cards); compact returns them packed."""
+        if not spacious:
+            return rows
+        out: list[Line] = []
+        for i, row in enumerate(rows):
+            if i:
+                out.append(Line([Span("", theme.BASE_STYLE)]))
+            out.append(row)
+        return out
+
+    #: Label column inside the HARDWARE card, sized to its widest label.
+    _HW_LABEL_W = 13
+
+    def _hardware_lines(self, width: int = 60, *, spacious: bool = True) -> list[Line]:
+        """The HARDWARE card: the physical kit this laptop is about to drive — robot
+        model, leader arm plug state, leader calibration age, the configured cameras BY
+        NAME. One item per line, label column + value, plain glyphs only (no emoji).
+        *width* bounds the cameras row so it elides ("front · wrist +1") instead of
+        letting the panel clip a name mid-word."""
+        from ..config import cfg_get
+
+        ok_g, bad_g = ("+", "x") if theme.ASCII_MODE else ("✓", "✗")
+        w = self._HW_LABEL_W
+        rows: list[Line] = []
+
+        robot = cfg_get("_launcher.ROBOT_TYPE", doc=self.ctx.doc)
+        rows.append(Line([Span("robot type".ljust(w), theme.MUTED_STYLE),
+                          Span(str(robot or "?"), theme.TEXT_STYLE)]))
+
+        port = str(self.ctx.cfg["LEADER_PORT"])
+        if _leader_port_present(port):
+            rows.append(Line([Span("leader arm".ljust(w), theme.MUTED_STYLE),
+                              Span(f"{ok_g} ", theme.OK_STYLE),
+                              Span(port, theme.TEXT_STYLE)]))
+        else:
+            rows.append(Line([Span("leader arm".ljust(w), theme.MUTED_STYLE),
+                              Span(f"{bad_g} ", theme.ERR_STYLE),
+                              Span(f"{port} · unplugged", theme.ERR_STYLE)]))
+
+        days = _leader_calib_age_days(str(self.ctx.cfg["LEADER_ID"]))
+        if days is None:
+            rows.append(Line([Span("calibration".ljust(w), theme.MUTED_STYLE),
+                              Span(f"{bad_g} ", theme.ERR_STYLE),
+                              Span("leader not calibrated", theme.ERR_STYLE)]))
+        else:
+            age = "today" if days == 0 else f"{days}d ago"
+            rows.append(Line([Span("calibration".ljust(w), theme.MUTED_STYLE),
+                              Span(f"{ok_g} ", theme.OK_STYLE),
+                              Span(f"leader · {age}", theme.TEXT_STYLE)]))
+
+        cams = cfg_get("_cameras", doc=self.ctx.doc)
+        names = list(cams) if isinstance(cams, dict) else []
+        if not names:
+            rows.append(Line([Span("cameras".ljust(w), theme.MUTED_STYLE),
+                              Span("none configured", theme.WARN_STYLE)]))
+        else:
+            # The names themselves, on one line; drop tail names into a "+N" before
+            # the panel border would clip one mid-word.
+            room = max(0, width - w)
+            shown = list(names)
+            text = " · ".join(shown)
+            while shown and len(text) > room:
+                shown.pop()
+                text = " · ".join(shown) + f" +{len(names) - len(shown)}"
+            if not shown:
+                text = f"{len(names)} configured"   # no room for even one name
+            rows.append(Line([Span("cameras".ljust(w), theme.MUTED_STYLE),
+                              Span(text, theme.TEXT_STYLE)]))
+        return self._spaced(rows, spacious)
+
+    def _session_lines(self, width: int, *, spacious: bool = True) -> list[Line]:
+        """The SESSION card: is the Pi host up, and how much session clock is left.
+
+        The countdown renders as a gradient meter that FILLS as time elapses, so the
+        tip crossing into amber/red is the "wrap up the take" signal. The probe and the
+        session announcement are both already cached (hostprobe / ui_state)."""
+        from ..config import cfg_get
         from ..hostprobe import get_probe, session_remaining
 
-        spans: list[Span] = []
         probe = get_probe(self.ctx)
         alive = None
         if probe is not None:
             probe.poll()
             alive = probe.alive
+        ip = cfg_get("_robot.remote_ip", doc=self.ctx.doc) or self.ctx.cfg["LEKIWI_HOST"]
+
+        rows: list[Line] = []
         if alive is True:
-            spans += [Span(f"{theme.status_dot()} ", theme.OK_STYLE),
-                      Span("host up", theme.OK_STYLE)]
+            rows.append(Line([Span(f"{theme.status_dot()} host up", theme.OK_STYLE),
+                              Span(f" · {ip}", theme.MUTED_STYLE)]))
+            info = self.ctx.ui_state.get("host_session")
             left = session_remaining(self.ctx)
-            if left is not None:
-                # Amber: the countdown is advisory, and a session lapsing mid-take is
-                # exactly what is worth noticing BEFORE you start one.
-                spans += [Span("  ·  ", theme.MUTED_STYLE),
-                          Span(f"{left // 60}:{left % 60:02d} remaining", theme.WARN_STYLE)]
+            total = info.get("total_s") if isinstance(info, dict) else None
+            if left is not None and isinstance(total, (int, float)) and total > 0:
+                value = f"{left // 60}:{left % 60:02d} left"
+                bar_w = max(4, min(_MAX_BAR_W, width - len(value) - 4))
+                rows.append(Line(meter_spans("", 1.0 - left / total, value, label_w=0,
+                                             value_w=len(value), bar_w=bar_w,
+                                             value_style=theme.TEXT_STYLE)))
+            else:
+                rows.append(Line([Span("no session clock", theme.FAINT_STYLE)]))
         elif alive is False:
-            spans += [Span("○ " if not theme.ASCII_MODE else "o ", theme.MUTED_STYLE),
-                      Span("host down", theme.MUTED_STYLE)]
+            rows.append(Line([Span("○ " if not theme.ASCII_MODE else "o ", theme.MUTED_STYLE),
+                              Span("host down", theme.MUTED_STYLE)]))
+            rows.append(Line([Span(str(ip), theme.FAINT_STYLE)]))
         else:
-            spans.append(Span("host unknown", theme.FAINT_STYLE))
-        return spans
+            rows.append(Line([Span("host unknown", theme.FAINT_STYLE)]))
+        return self._spaced(rows, spacious)
 
-    def _machine_spans(self) -> list[Span]:
-        """Laptop resources: CPU, RAM, GPU, VRAM.
+    def _compute_lines(self, width: int, *, spacious: bool = True) -> list[Line]:
+        """The COMPUTE card: this machine's resources as gradient meters, packed 2×2
+        (CPU | RAM over GPU | VRAM) so the card stays two rows tall.
 
-        Labelled "laptop" on purpose. This card's other two rows are about the ROBOT, and an
-        unlabelled percentage sitting under "host up" would read as the robot's. Sampling is
-        throttled onto a background thread by :mod:`~lekiwi_tui.sysstat`; each field is
-        omitted rather than faked when it cannot be read.
+        Its own card on purpose: an unlabelled percentage sitting under "host up" would
+        read as the robot's. Sampling is throttled onto a background thread by
+        :mod:`~lekiwi_tui.sysstat`; each meter is omitted rather than faked when it
+        cannot be read — except a named GPU whose utilisation query failed, which keeps
+        its cell (empty track, no number) so the hardware stays visible. The GPU's own
+        FULL name is its label (e.g. "RTX 2050", never truncated).
         """
         from ..sysstat import get_sysstat
 
         stat = get_sysstat(self.ctx)
         stat.poll()
         s = stat.sample
-        spans: list[Span] = [Span("laptop  ", theme.MUTED_STYLE)]
+        cells: list[tuple[str, float | None, str]] = []
         if s.cpu_pct is not None:
-            spans += [Span("cpu ", theme.MUTED_STYLE),
-                      Span(f"{s.cpu_pct:.0f}%", self._load_style(s.cpu_pct))]
+            cells.append(("CPU", s.cpu_pct / 100.0, f"{s.cpu_pct:.0f}%"))
         if s.ram_used_gb is not None and s.ram_total_gb:
-            frac = 100.0 * s.ram_used_gb / s.ram_total_gb
-            spans += [Span("   ram ", theme.MUTED_STYLE),
-                      Span(f"{s.ram_used_gb:.1f}", self._load_style(frac)),
-                      Span(f"/{s.ram_total_gb:.0f} GB", theme.MUTED_STYLE)]
-        # The GPU's own name doubles as the label for its two numbers.
-        gpu_label = self.ctx.gpu_name or "gpu"
+            cells.append(("RAM", s.ram_used_gb / s.ram_total_gb,
+                          f"{s.ram_used_gb:.1f}/{s.ram_total_gb:.0f} GB"))
+        gpu_label = self.ctx.gpu_name or "GPU"
         if s.gpu_pct is not None:
-            spans += [Span(f"   {gpu_label} ", theme.MUTED_STYLE),
-                      Span(f"{s.gpu_pct}%", self._load_style(s.gpu_pct))]
+            cells.append((gpu_label, s.gpu_pct / 100.0, f"{s.gpu_pct}%"))
         elif self.ctx.gpu_name:
-            spans += [Span("   ", theme.MUTED_STYLE), Span(gpu_label, theme.TEXT_STYLE)]
+            cells.append((gpu_label, None, ""))
         if s.vram_used_gb is not None and s.vram_total_gb:
-            frac = 100.0 * s.vram_used_gb / s.vram_total_gb
-            spans += [Span("   vram ", theme.MUTED_STYLE),
-                      Span(f"{s.vram_used_gb:.1f}", self._load_style(frac)),
-                      Span(f"/{s.vram_total_gb:.0f} GB", theme.MUTED_STYLE)]
-        if len(spans) == 1:                      # nothing readable — say so, do not lie
-            spans.append(Span("resources unavailable", theme.FAINT_STYLE))
-        return spans
+            cells.append(("VRAM", s.vram_used_gb / s.vram_total_gb,
+                          f"{s.vram_used_gb:.1f}/{s.vram_total_gb:.0f} GB"))
+        if not cells:                            # nothing readable — say so, do not lie
+            return [Line([Span("resources unavailable", theme.FAINT_STYLE)])]
+
+        # Per-COLUMN label/value widths (left column carries the long GPU name, right
+        # column the long GB values — a shared max would starve the bars), one shared
+        # bar width so the meters read as one instrument.
+        gap = 3
+        cols = (cells[0::2], cells[1::2])
+        label_ws = [max((len(c[0]) for c in col), default=0) for col in cols]
+        value_ws = [max((len(c[2]) for c in col), default=0) for col in cols]
+        fixed = sum(label_ws) + sum(value_ws) + 4 * len([c for c in cols if c])
+        n_bars = 2 if cols[1] else 1
+        bar_w = max(4, min(_MAX_BAR_W,
+                           (width - (gap if cols[1] else 0) - fixed) // n_bars))
+        lines: list[Line] = []
+        for i in range(0, len(cells), 2):
+            spans: list[Span] = []
+            for j, (label, frac, value) in enumerate(cells[i:i + 2]):
+                if j:
+                    spans.append(Span(" " * gap, theme.BASE_STYLE))
+                style = (self._load_style(100.0 * frac) if frac is not None
+                         else theme.FAINT_STYLE)
+                spans += meter_spans(label, frac, value, label_w=label_ws[j],
+                                     value_w=value_ws[j], bar_w=bar_w, value_style=style)
+            lines.append(Line(spans))
+        return self._spaced(lines, spacious)
 
     @staticmethod
     def _load_style(pct: float) -> Any:
@@ -250,37 +490,35 @@ class MenuScreen(ScreenState):
             return theme.WARN_STYLE
         return theme.OK_STYLE
 
-    def _identity_spans(self) -> list[Span]:
-        """Which hardware and which environment you are about to drive. Machine constants,
-        so they come from the config snapshot rather than a probe.
+    #: Label column inside the SOFTWARE card, sized to its widest label ("conda env ").
+    _SW_LABEL_W = 11
 
-        The lerobot cell is the exception: it is what every screen here actually launches,
-        and a too-old one does not fail early — it fails inside draccus mid-launch, with
-        the robot already involved. Cheap enough for a per-frame call (metadata lookup,
-        cached for the process) and it flags a pre-release checkout too, since the version
-        string alone cannot tell those apart."""
+    def _software_lines(self, *, spacious: bool = True) -> list[Line]:
+        """The SOFTWARE card: what every launch here actually runs — the lerobot version
+        and the conda env. Machine constants from the config snapshot, except the lerobot
+        row: a too-old lerobot does not fail early, it fails inside draccus mid-launch
+        with the robot already involved. Cheap enough for a per-frame call (metadata
+        lookup, cached for the process) and it flags a pre-release checkout too, since
+        the version string alone cannot tell those apart."""
         from ..config import cfg_get
         from ..lerobot_env import summary
 
-        out: list[Span] = []
-        for label, key in (("robot ", "_launcher.ROBOT_TYPE"),
-                           ("env ", "_launcher.LAPTOP_ENV")):
-            value = cfg_get(key, doc=self.ctx.doc)
-            if value:
-                if out:
-                    out.append(Span("     ", theme.BASE_STYLE))
-                out += [Span(label, theme.MUTED_STYLE), Span(str(value), theme.TEXT_STYLE)]
-
+        out: list[Line] = []
         value, suffix, level = summary()
-        if out:
-            out.append(Span("     ", theme.BASE_STYLE))
         warn = level == "warn"
-        out += [Span("lerobot ", theme.MUTED_STYLE),
-                Span(("⚠ " if warn else "") + value, theme.WARN_STYLE if warn else theme.TEXT_STYLE)]
+        spans = [Span("lerobot".ljust(self._SW_LABEL_W), theme.MUTED_STYLE),
+                 Span(("⚠ " if warn else "") + value,
+                      theme.WARN_STYLE if warn else theme.TEXT_STYLE)]
         if suffix:
             # muted, so a pre-release marker informs without competing with the vitals
-            out.append(Span(suffix, theme.WARN_STYLE if warn else theme.MUTED_STYLE))
-        return out
+            spans.append(Span(suffix, theme.WARN_STYLE if warn else theme.MUTED_STYLE))
+        out.append(Line(spans))
+
+        env = cfg_get("_launcher.LAPTOP_ENV", doc=self.ctx.doc)
+        if env:
+            out.append(Line([Span("conda env".ljust(self._SW_LABEL_W), theme.MUTED_STYLE),
+                             Span(str(env), theme.TEXT_STYLE)]))
+        return self._spaced(out, spacious)
 
     def _badge(self, action: Action) -> tuple[str, Any] | None:
         """The optional right-aligned live number on an action row, or None.
@@ -342,22 +580,43 @@ class MenuScreen(ScreenState):
         frame.render_widget(self._hint_line(), rows[5])
 
     def _draw_cards(self, frame: Any, area: Any) -> None:
-        # Two content lines per action, plus the card's own borders.
-        heights = [max((len(c) for c in row), default=0) * 2 + 2 for row in _GRID]
-        constraints = [Constraint.length(_STATUS_H), Constraint.length(1)]  # status card, gap
+        # The blank lines inside the status cards are a luxury: keep them only when the
+        # terminal has the height, and shed them BEFORE shedding the card grid itself.
+        spacious = area.height >= _SPACIOUS_BODY_H
+        row1_h = _ROW1_SPACIOUS if spacious else _ROW1_COMPACT
+        row2_h = _ROW2_SPACIOUS if spacious else _ROW2_COMPACT
+        # One content line per action, plus the card's own borders.
+        heights = [max((len(c) for c in row), default=0) + 2 for row in _GRID]
+        # Two status rows adjacent (their borders separate them), then the action grid.
+        constraints = [Constraint.length(row1_h), Constraint.length(row2_h),
+                       Constraint.length(1)]
         for h in heights:
             constraints += [Constraint.length(h), Constraint.length(1)]
         constraints += [Constraint.length(1), Constraint.fill(1)]    # setup strip, slack
         band = Layout().direction(Direction.Vertical).constraints(constraints).split(area)
 
-        self._draw_panel(frame, band[0], "ROBOT", [
-            Line(self._live_spans()),       # the robot: reachable? session left?
-            Line(self._machine_spans()),    # this laptop: can it take another run?
-            Line(self._identity_spans()),   # which hardware, which environment
-        ])
+        # The 2×2 status grid — HARDWARE | SESSION over SOFTWARE | COMPUTE — on the same
+        # column split as the action-card rows below, so all card edges line up.
+        def split(row_area: Any) -> Any:
+            return (Layout()
+                    .direction(Direction.Horizontal)
+                    .constraints([Constraint.fill(1), Constraint.length(2),
+                                  Constraint.fill(1)])
+                    .split(row_area))
+
+        top, bottom = split(band[0]), split(band[1])
+        self._draw_panel(frame, top[0], "HARDWARE",
+                         self._hardware_lines(max(0, top[0].width - 4),
+                                              spacious=spacious))
+        self._draw_panel(frame, top[2], "SESSION",
+                         self._session_lines(max(0, top[2].width - 4), spacious=spacious))
+        self._draw_panel(frame, bottom[0], "SOFTWARE",
+                         self._software_lines(spacious=spacious))
+        self._draw_panel(frame, bottom[2], "COMPUTE",
+                         self._compute_lines(max(0, bottom[2].width - 4), spacious=spacious))
         for r, row in enumerate(_GRID):
-            self._draw_card_row(frame, band[2 + r * 2], r, row)
-        frame.render_widget(self._strip_line(), band[2 + len(_GRID) * 2])
+            self._draw_card_row(frame, band[3 + r * 2], r, row)
+        frame.render_widget(self._strip_line(), band[3 + len(_GRID) * 2])
 
     def _draw_card_row(self, frame: Any, area: Any, r: int, row: list[list[Action]]) -> None:
         cols = (
@@ -377,28 +636,12 @@ class MenuScreen(ScreenState):
         frame.render_widget(blk, area)
         frame.render_widget(Paragraph(Text(lines)).style(theme.BASE_STYLE), inner)
 
-    #: Column the description text starts at inside a card, matching the label column.
-    _DESC_INDENT = 6
-
     def _card_lines(self, cell: list[Action], width: int) -> list[Line]:
-        """Two lines per action: the row itself, then its muted description."""
-        out: list[Line] = []
-        for action in cell:
-            out.append(self._card_row(action, selected=action is ACTIONS[self._sel],
-                                      width=width))
-            out.append(Line([Span(" " * self._DESC_INDENT + self._desc(action, width),
-                                  theme.FAINT_STYLE)]))
-        return out
-
-    def _desc(self, action: Action, width: int) -> str:
-        """The card description: the short ``brief`` when the registry has one, else the
-        full hint. Ends in "…" when it still does not fit, because a description that
-        stops mid-word without saying so is the same bug the delete modal had."""
-        text = action.brief or action.hint
-        room = max(0, width - self._DESC_INDENT)
-        if len(text) <= room:
-            return text
-        return text[: max(0, room - 1)].rstrip() + "…" if room else ""
+        """One line per action: the row itself. The muted description line was dropped by
+        request (2026-08-15) — a daily driver does not need "Teleoperate" explained, and
+        the full hint still shows in the flat list and the ``?`` help."""
+        return [self._card_row(action, selected=action is ACTIONS[self._sel], width=width)
+                for action in cell]
 
     def _card_row(self, action: Action, *, selected: bool, width: int) -> Line:
         digit = _JUMPABLE.index(action) + 1 if action in _JUMPABLE else 0

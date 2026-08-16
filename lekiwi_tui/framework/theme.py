@@ -59,16 +59,20 @@ def _style(
     return style
 
 # ── core palette ──────────────────────────────────────────────────────────────
-BG = Color.rgb(0x0B, 0x10, 0x1F)        # #0b101f  deep app background
-SURFACE = Color.rgb(0x11, 0x18, 0x27)   # #111827  raised panels
-PANEL = Color.rgb(0x1F, 0x29, 0x37)     # #1f2937  chips and active controls
-TEXT = Color.rgb(0xE5, 0xED, 0xF7)      # #e5edf7  primary text
-MUTED = Color.rgb(0x94, 0xA3, 0xB8)     # #94a3b8  labels, hints, secondary text
-ACCENT = Color.rgb(0x38, 0xBD, 0xF8)    # #38bdf8  main control accent
-SUCCESS = Color.rgb(0x34, 0xD3, 0x99)   # #34d399  running/ready/real
-WARNING = Color.rgb(0xF5, 0x9E, 0x0B)   # #f59e0b  preview/caution
-ERROR = Color.rgb(0xFB, 0x71, 0x85)     # #fb7185  destructive/error
-HAIRLINE = Color.rgb(0x33, 0x41, 0x55)  # #334155  rules / dividers / borders
+# "Nord proper" (2026-08-16, user-picked after the graphite frost read too monochrome):
+# the Nord scheme's structure on a slightly darkened polar-night ground. Two related
+# frost hues carry hierarchy (cyan = interactive accent, blue = section titles) and the
+# aurora colors carry semantics — cool, blue-gray, alive without running hot.
+BG = Color.rgb(0x23, 0x28, 0x31)        # #232831  polar night, darkened for depth
+SURFACE = Color.rgb(0x2A, 0x31, 0x3D)   # #2a313d  raised panels
+PANEL = Color.rgb(0x3B, 0x42, 0x52)     # #3b4252  chips and active controls (nord1)
+TEXT = Color.rgb(0xEC, 0xEF, 0xF4)      # #eceff4  primary text (nord6)
+MUTED = Color.rgb(0x9A, 0xA5, 0xB5)     # #9aa5b5  labels, hints, secondary text
+ACCENT = Color.rgb(0x88, 0xC0, 0xD0)    # #88c0d0  frost cyan: selection/keys/rules (nord8)
+SUCCESS = Color.rgb(0xA3, 0xBE, 0x8C)   # #a3be8c  running/ready/real (aurora green)
+WARNING = Color.rgb(0xEB, 0xCB, 0x8B)   # #ebcb8b  preview/caution (aurora yellow)
+ERROR = Color.rgb(0xBF, 0x61, 0x6A)     # #bf616a  destructive/error (aurora red)
+HAIRLINE = Color.rgb(0x43, 0x4C, 0x5E)  # #434c5e  rules / dividers / borders (nord2)
 
 # Role aliases requested by the contract (R6) so screens can use either name.
 OK = SUCCESS
@@ -78,15 +82,18 @@ YELLOW = WARNING
 ERR = ERROR
 RED = ERROR
 
-PURPLE = Color.rgb(0xA7, 0x8B, 0xFA)    # #a78bfa  section / secondary accent
-FAINT = Color.rgb(0x5B, 0x6B, 0x82)     # #5b6b82  tertiary text: notes, log meta
+# The secondary accent: Nord's frost BLUE — section titles get a hue of their own again
+# (the graphite frost's gray titles read flat). Named PURPLE for historical reasons;
+# every screen styles sections through SECTION_STYLE anyway.
+PURPLE = Color.rgb(0x81, 0xA1, 0xC1)    # #81a1c1  frost blue: section titles (nord9)
+FAINT = Color.rgb(0x6B, 0x76, 0x89)     # #6b7689  tertiary text: notes, log meta
 
 # ── derived shades ────────────────────────────────────────────────────────────
-# Focus band: a desaturated accent tint (was #0e354a) — reads as "selected", not "lit".
-_TINT_18_ACCENT = (0x13, 0x23, 0x3D)    # #13233d
+# Focus band: a desaturated accent tint — reads as "selected", not "lit".
+_TINT_18_ACCENT = (0x2C, 0x3B, 0x47)    # #2c3b47  frost-cyan tint over polar night
 HIGHLIGHT_BG = Color.rgb(*_TINT_18_ACCENT)
 
-_SURFACE_LIGHTEN_2 = (0x24, 0x32, 0x44)  # #243244
+_SURFACE_LIGHTEN_2 = (0x39, 0x42, 0x4F)  # #39424f
 SURFACE_LIGHTEN_2 = Color.rgb(*_SURFACE_LIGHTEN_2)
 
 # ── composed styles ───────────────────────────────────────────────────────────
@@ -104,6 +111,8 @@ FAINT_STYLE = _style(fg=FAINT)
 #: reads differently from a reported one at a glance.
 CHOICE_STYLE = _style(fg=ACCENT, bold=True)
 
+# Nord: section titles wear the frost blue — related to the cyan accent but distinct,
+# so hierarchy comes from two shades of the same family rather than a clashing hue.
 SECTION_STYLE = _style(fg=PURPLE, bold=True)
 
 HIGHLIGHT_STYLE = _style(bg=HIGHLIGHT_BG, reverse=not COLOR_ENABLED)

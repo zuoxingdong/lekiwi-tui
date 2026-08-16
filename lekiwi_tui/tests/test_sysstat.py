@@ -128,41 +128,70 @@ def test_real_cpu_reading_is_a_percentage():
     assert 0.0 <= cpu <= 100.0
 
 
-# ── the rendered row ──────────────────────────────────────────────────────────
-def test_machine_row_shows_cpu_ram_gpu_and_vram():
+# ── the rendered meter card ───────────────────────────────────────────────────
+def _card_text(screen: MenuScreen, width: int = 52) -> str:
+    return "\n".join(_text(line.spans) for line in screen._compute_lines(width))
+
+
+def test_meter_card_shows_cpu_ram_gpu_and_vram_packed_2x2():
+    """Labels are UPPERCASE (user rule); four meters pack into two rows: CPU | RAM
+    over GPU | VRAM."""
     screen = _screen(Sample(34.0, 12.4, 31.0, 18, 2.1, 8.0))
 
-    text = _text(screen._machine_spans())
+    lines = [_text(line.spans)
+             for line in screen._compute_lines(52, spacious=False)]
 
-    assert text.startswith("laptop  "), "the row must say whose numbers these are"
-    assert "cpu 34%" in text
-    assert "ram 12.4/31 GB" in text
-    assert "RTX 4090 18%" in text, "the GPU name doubles as the label"
-    assert "vram 2.1/8 GB" in text
+    assert len(lines) == 2, "2×2: two meters per row"
+    assert "CPU" in lines[0] and "RAM" in lines[0]
+    assert "34%" in lines[0] and "12.4/31 GB" in lines[0]
+    assert "RTX 4090" in lines[1], "the GPU's FULL name is its label — never truncated"
+    assert "18%" in lines[1] and "2.1/8 GB" in lines[1]
 
 
-def test_machine_row_omits_fields_it_could_not_read():
+def test_meter_card_omits_meters_it_could_not_read():
     screen = _screen(Sample(cpu_pct=55.0), gpu_name="")
 
-    text = _text(screen._machine_spans())
+    text = _card_text(screen)
 
-    assert "cpu 55%" in text
-    assert "ram" not in text
-    assert "vram" not in text
+    assert "CPU" in text
+    assert "55%" in text
+    assert "RAM" not in text
+    assert "VRAM" not in text
 
 
-def test_machine_row_says_so_when_nothing_is_readable():
+def test_meter_card_says_so_when_nothing_is_readable():
     screen = _screen(Sample(), gpu_name="")
 
-    text = _text(screen._machine_spans())
+    text = _card_text(screen)
 
-    assert "unavailable" in text, "an empty row would look like a rendering bug"
+    assert "unavailable" in text, "an empty card would look like a rendering bug"
 
 
-def test_machine_row_keeps_the_gpu_name_when_utilisation_is_unavailable():
+def test_meter_card_keeps_the_gpu_name_when_utilisation_is_unavailable():
     screen = _screen(Sample(cpu_pct=10.0), gpu_name="RTX 4090")
 
-    assert "RTX 4090" in _text(screen._machine_spans())
+    assert "RTX 4090" in _card_text(screen)
+
+
+def test_meter_rows_are_separated_by_blank_lines_when_spacious():
+    """The breathing room is part of the design: meter rows packed edge to edge read
+    as one texture."""
+    screen = _screen(Sample(34.0, 12.4, 31.0, 18, 2.1, 8.0))
+
+    lines = [_text(line.spans) for line in screen._compute_lines(52)]
+
+    assert len(lines) == 3, "2 meter rows with a blank between them"
+    assert lines[1] == ""
+
+
+def test_compact_mode_drops_only_the_blank_lines():
+    """On a short terminal the card sheds its breathing room, never its meters."""
+    screen = _screen(Sample(34.0, 12.4, 31.0, 18, 2.1, 8.0))
+
+    lines = [_text(line.spans) for line in screen._compute_lines(52, spacious=False)]
+
+    assert len(lines) == 2
+    assert all(line for line in lines)
 
 
 def test_load_colour_escalates_with_load():
@@ -173,7 +202,9 @@ def test_load_colour_escalates_with_load():
     assert MenuScreen._load_style(95) is theme.ERR_STYLE
 
 
-def test_the_status_card_has_three_rows_and_the_middle_one_is_the_laptop():
+def test_the_status_grid_is_four_cards_with_compute_meters_last():
+    """The 2×2 status grid: HARDWARE | SESSION over SOFTWARE | COMPUTE — a regression to
+    one merged card would bury the meters back into a text row."""
     import pyratatui as p
 
     screen = _screen(Sample(34.0, 12.4, 31.0, 18, 2.1, 8.0))
@@ -185,7 +216,7 @@ def test_the_status_card_has_three_rows_and_the_middle_one_is_the_laptop():
     finally:
         MenuScreen._draw_panel = original
 
-    title, lines = captured[0]
-    assert title == "ROBOT"
-    assert len(lines) == 3
-    assert _text(lines[1].spans).startswith("laptop")
+    assert [t for t, _ in captured[:4]] == ["HARDWARE", "SESSION", "SOFTWARE", "COMPUTE"]
+    compute_lines = captured[3][1]
+    assert len(compute_lines) == 3, "2 meter rows with breathing room between them"
+    assert "34%" in _text(compute_lines[0].spans)

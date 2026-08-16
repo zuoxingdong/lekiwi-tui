@@ -159,6 +159,13 @@ class App:
             self._running = False
         return result
 
+    def quit(self) -> None:
+        """Request app shutdown from inside an :class:`Invoke` flow — the public form
+        of returning a ``Quit`` action from ``handle_key`` (a flow's return value is
+        discarded by ``_safe_invoke``, so it cannot return one). The main loop and any
+        ``run_modal`` sub-loop both watch ``_running`` and exit on their next tick."""
+        self._running = False
+
     # ── toasts ──────────────────────────────────────────────────────────────
     def notify(self, msg: str, level: str = "info", *, seconds: float | None = None) -> None:
         """Add a toast. *level* is ``"info"`` | ``"warn"`` | ``"error"``; it lives for
