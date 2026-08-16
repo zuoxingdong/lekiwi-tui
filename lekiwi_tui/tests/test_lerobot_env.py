@@ -119,8 +119,11 @@ def test_the_status_card_shows_lerobot_and_marks_a_problem(monkeypatch):
     """The whole point is that it is visible before you launch anything."""
     def card(*summary):
         monkeypatch.setattr(le, "summary", lambda: summary)
-        return "".join(sp.content for sp in
-                       MenuScreen(MagicMock(), make_ctx(gpu_name="RTX 4090"))._identity_spans())
+        rows = MenuScreen(MagicMock(), make_ctx(gpu_name="RTX 4090"))._software_lines(
+            spacious=False)
+        # collapse the label-column padding so assertions read naturally
+        return "\n".join(" ".join("".join(sp.content for sp in line.spans).split())
+                         for line in rows)
 
     assert "lerobot 0.6.1" in card("0.6.1", "", "ok")
     assert "⚠" not in card("0.6.1", "", "ok")

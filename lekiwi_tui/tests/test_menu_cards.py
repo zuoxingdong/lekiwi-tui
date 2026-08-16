@@ -185,30 +185,14 @@ def test_hjkl_mirror_the_arrows():
         assert a.selected is b.selected
 
 
-# ── descriptions ──────────────────────────────────────────────────────────────
-def test_card_description_prefers_the_short_brief():
+# ── card rows ─────────────────────────────────────────────────────────────────
+def test_cards_carry_no_description_lines():
+    """Dropped by request (2026-08-15): a daily driver knows what Teleoperate is. One
+    line per action — a reappearing muted description line is a regression."""
     screen = _screen()
-    record = next(a for a in ACTIONS if a.id == "record")
+    host_cell = _GRID[0][0]
 
-    assert screen._desc(record, 45) == record.brief
-
-
-def test_card_description_marks_truncation_instead_of_clipping_silently():
-    screen = _screen()
-    setup = next(a for a in ACTIONS if a.id == "setup-pi")   # long hint, no brief
-
-    text = screen._desc(setup, 30)
-
-    assert text.endswith("…")
-    assert len(text) <= 30 - MenuScreen._DESC_INDENT
-
-
-def test_every_daily_action_has_a_brief_that_fits_a_card():
-    """Cards are half-width; a daily action without a short description would render
-    truncated on the screen you look at most."""
-    for action in _JUMPABLE:
-        assert action.brief, f"{action.id} has no brief"
-        assert len(action.brief) <= 39, f"{action.id} brief is too long for a card"
+    assert len(screen._card_lines(host_cell, 40)) == len(host_cell)
 
 
 # ── the small-terminal fallback ───────────────────────────────────────────────
@@ -250,19 +234,74 @@ def test_the_real_card_draw_path_renders_every_panel():
     finally:
         MenuScreen._draw_panel = original
 
-    assert [t for t, _ in panels] == ["ROBOT", "HOST", "COLLECT", "DATA", "LEARN"]
-    # Two lines per action in a section card; the status card is robot / laptop / identity.
-    assert dict(panels)["ROBOT"] == 3
-    assert dict(panels)["DATA"] == 6
-    assert dict(panels)["LEARN"] == 4
+    assert [t for t, _ in panels] == ["HARDWARE", "SESSION", "SOFTWARE", "COMPUTE",
+                                      "HOST", "COLLECT", "DATA", "LEARN"]
+    # One line per action in a section card; the HARDWARE card is 4 rows with a blank
+    # between each at this height (the COMPUTE card's row count depends on what the live
+    # sampler could read, so it is pinned in test_sysstat instead).
+    assert dict(panels)["HARDWARE"] == 7
+    assert dict(panels)["DATA"] == 3
+    assert dict(panels)["LEARN"] == 2
 
 
-def test_status_card_identity_row_reads_real_config():
-    """robot type and conda env replaced the leader port and base state by request, so
-    they must come from the config rather than being hard-coded."""
+def test_a_terminal_just_above_minimum_keeps_the_grid_with_compact_cards():
+    """The regression from the band redesign: growing the status area must never demote a
+    terminal that used to get cards down to the flat list. Just above _MIN_CARD_H the
+    cards drop their blank lines (HARDWARE = 4 rows, not 7) and every panel renders."""
+    import pyratatui as p
+
+    screen = _screen()
+    panels: list[tuple[str, int]] = []
+    original = MenuScreen._draw_panel
+    MenuScreen._draw_panel = lambda self, f, a, t, ls: panels.append((t, len(ls)))
+    try:
+        screen.draw(MagicMock(), p.Rect(0, 0, 100, menu_mod._MIN_CARD_H + 1))
+    finally:
+        MenuScreen._draw_panel = original
+
+    assert [t for t, _ in panels] == ["HARDWARE", "SESSION", "SOFTWARE", "COMPUTE",
+                                      "HOST", "COLLECT", "DATA", "LEARN"]
+    assert dict(panels)["HARDWARE"] == 4, "compact cards: rows packed, no blanks"
+
+
+def test_hardware_and_software_cards_read_real_config():
+    """robot type, leader port, and conda env must come from the config rather than
+    being hard-coded; one item per line so the values form a scannable column."""
     screen = _screen()
 
-    text = "".join(sp.content for sp in screen._identity_spans())
+    hw = ["".join(sp.content for sp in line.spans)
+          for line in screen._hardware_lines(spacious=False)]
+    sw = ["".join(sp.content for sp in line.spans)
+          for line in screen._software_lines(spacious=False)]
 
-    assert text.startswith("robot ")
-    assert " env " in text
+    assert hw[0].startswith("robot type")
+    assert hw[1].startswith("leader arm")
+    assert hw[2].startswith("calibration")
+    assert hw[3].startswith("cameras")
+    assert sw[0].startswith("lerobot")
+    assert sw[1].startswith("conda env")
+
+
+def test_the_cameras_row_names_the_cameras_without_emoji():
+    """User rules (2026-08-15): show the cameras BY NAME on one line, plain glyphs only
+    inside the status cards."""
+    screen = _screen()
+
+    cams = "".join(sp.content for sp in
+                   screen._hardware_lines(60, spacious=False)[3].spans)
+
+    assert "front" in cams, "the camera names from lekiwi.yaml, not a count"
+    assert "wrist" in cams
+    assert all(ord(ch) < 0x2700 for ch in cams), f"emoji-range glyph in {cams!r}"
+
+
+def test_the_cameras_row_elides_instead_of_clipping():
+    """A narrow card must drop tail names into '+N', never let the border cut a name
+    mid-word (the delete-modal lesson, again)."""
+    screen = _screen()
+
+    cams = "".join(sp.content for sp in
+                   screen._hardware_lines(24, spacious=False)[3].spans)
+
+    assert "+" in cams, f"expected an elision marker in {cams!r}"
+    assert len(cams) <= 24, "the row must fit the width it was given"
