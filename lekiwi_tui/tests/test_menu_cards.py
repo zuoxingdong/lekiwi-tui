@@ -25,6 +25,13 @@ def _press(screen: MenuScreen, name: str) -> None:
     screen.handle_key(Key(name=name))
 
 
+def _select(screen: MenuScreen, action_id: str) -> None:
+    """Place the cursor on an action BY ID. Navigation tests must not address rows by
+    digit: adding one action shifts every digit after it, which is a property of the
+    registry, not of the navigation being tested."""
+    screen._sel = next(i for i, a in enumerate(ACTIONS) if a.id == action_id)
+
+
 # ── coverage: the grid must not lose an action ────────────────────────────────
 def test_every_action_appears_exactly_once_in_the_grid_or_strip():
     """A card name in _LAYOUT that no action claims would silently drop those actions off
@@ -47,10 +54,13 @@ def test_displayed_digit_matches_the_digit_that_jumps_there():
     """Cards regroup COLLECT into COLLECT + DATA, so the card order no longer matches
     ACTIONS order. The digit a row SHOWS must still be the digit that runs it."""
     screen = _screen()
-    for n, action in enumerate(_JUMPABLE, start=1):
-        result = screen.handle_key(Key(name=str(n)))
-        assert getattr(result, "id", None) == action.id, f"digit {n}"
+    for n, action in enumerate(_JUMPABLE[:10], start=1):
+        key = "0" if n == 10 else str(n)  # phone-style: the 10th row rides on 0
+        result = screen.handle_key(Key(name=key))
+        assert getattr(result, "id", None) == action.id, f"digit {key}"
         assert screen.selected is action
+    # rows past the ten digits carry no keycap (arrow/alias-reachable only; the
+    # reachability test below covers them) — no digit may steal their identity
 
 
 def test_setup_strip_has_no_digits():
@@ -111,8 +121,7 @@ def test_right_switches_column_keeping_the_index():
 
 def test_right_clamps_the_index_into_a_shorter_card():
     screen = _screen()
-    screen.handle_key(Key(name="7"))                # DATA[2] = View
-    assert screen.selected.id == "view"
+    _select(screen, "view")                         # DATA[2]: the third row of its card
 
     _press(screen, RIGHT)                           # LEARN has only two actions
     assert screen.selected.id == "eval"
@@ -127,7 +136,7 @@ def test_up_from_the_first_card_wraps_into_the_setup_strip():
 
 def test_down_from_the_last_card_enters_the_setup_strip_then_wraps_to_the_top():
     screen = _screen()
-    screen.handle_key(Key(name="9"))                # LEARN[1] = Run policy, last card
+    _select(screen, "eval")                         # LEARN[1]: the last row of the last card
     _press(screen, DOWN)
     assert screen.selected is _STRIP[0]
 

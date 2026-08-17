@@ -253,8 +253,8 @@ class MenuScreen(ScreenState):
         if name in (RIGHT, "l"):
             self._go(dc=1)
             return Nothing
-        if len(name) == 1 and name.isdigit() and name != "0":
-            d = int(name)
+        if len(name) == 1 and name.isdigit():
+            d = int(name) if name != "0" else 10  # phone-style: 0 = the 10th row
             if 1 <= d <= len(_JUMPABLE):
                 self._sel = ACTIONS.index(_JUMPABLE[d - 1])
                 return RunAction(_JUMPABLE[d - 1].id)
@@ -645,7 +645,9 @@ class MenuScreen(ScreenState):
 
     def _card_row(self, action: Action, *, selected: bool, width: int) -> Line:
         digit = _JUMPABLE.index(action) + 1 if action in _JUMPABLE else 0
-        keycap = f"{digit}  " if 1 <= digit <= 9 else "   "
+        # 10 daily-driver rows fit the digit row phone-style: the 10th shows (and is
+        # jumped to by) "0". Beyond that a row simply has no keycap.
+        keycap = f"{digit % 10}  " if 1 <= digit <= 10 else "   "
         cell = theme.icon_cell(action.icon)
         base = theme.HIGHLIGHT_STYLE if selected else theme.BASE_STYLE
         spans = [
