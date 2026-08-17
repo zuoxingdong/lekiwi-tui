@@ -95,6 +95,15 @@ def test_wrap_label_keeps_the_instruction_that_used_to_be_clipped():
     assert "Type 'delete' to confirm" in " ".join(rows)
 
 
+def test_wrap_label_honors_explicit_newlines_and_blank_gaps():
+    """Structured prompts (the dagger cheat-sheet): \\n is a hard break, an empty
+    segment stays a blank row, and each segment still word-wraps to width."""
+    rows = wrap_label("space — pause\n\ntab — correct", 66)
+    assert rows == ["space — pause", "", "tab — correct"]
+    rows = wrap_label("a long first line that wraps beyond width\nsecond", 20)
+    assert rows[-1] == "second" and len(rows) > 2
+
+
 def test_wrap_label_leaves_a_short_prompt_on_one_row():
     # Short prompts must keep the original single-row geometry (card height is derived
     # from the row count, so a spurious second row would resize every existing modal).

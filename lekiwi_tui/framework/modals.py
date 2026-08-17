@@ -98,8 +98,9 @@ if TYPE_CHECKING:
 _CARD_WIDTH = 72
 
 #: Ceiling on wrapped prompt-label rows. A label longer than this is a design smell, not
-#: something to render: the card would outgrow a short terminal. Generous on purpose.
-_MAX_LABEL_ROWS = 8
+#: something to render: the card would outgrow a short terminal. Generous on purpose
+#: (raised 8 → 12 for the structured dagger cheat-sheet: 3 key lines + gap + 3 tips).
+_MAX_LABEL_ROWS = 12
 
 
 def wrap_label(text: str, width: int, max_rows: int = _MAX_LABEL_ROWS) -> list[str]:
@@ -111,8 +112,15 @@ def wrap_label(text: str, width: int, max_rows: int = _MAX_LABEL_ROWS) -> list[s
     Never shorten a label without saying so: an over-long one ends in "…" rather than
     just stopping. Returns at least one (possibly empty) row so the caller's height
     arithmetic never sees zero.
+
+    Explicit ``\\n`` are hard line breaks (a blank segment stays a blank row), so a
+    caller can STRUCTURE a longer prompt — one key per line, a gap before the tips —
+    instead of it collapsing into one dense wrapped blob (the dagger cheat-sheet's
+    old fate).
     """
-    rows = textwrap.wrap(text, width=max(1, width)) or [""]
+    rows: list[str] = []
+    for segment in text.split("\n"):
+        rows.extend(textwrap.wrap(segment, width=max(1, width)) or [""])
     if len(rows) > max_rows:
         rows = rows[:max_rows]
         rows[-1] = rows[-1][: max(0, width - 1)].rstrip() + "…"
