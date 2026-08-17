@@ -1055,3 +1055,37 @@ def make_stdin_listener(fd: int | None = None, *, share: bool = False):
             source.stop()
 
     return _StdinListener(), events
+
+
+def make_dispatch_listener(dispatch, fd: int | None = None, *, share: bool = False):
+    """Build lerobot's ``create_key_listener`` contract: canonical key NAMES → dispatch.
+
+    The rollout strategies (dagger's space/tab/enter/ESC session keys) take a
+    ``dispatch(name)`` callback fed canonical names ("esc" / "space" / "tab" / "enter" /
+    arrows, or a character) — KeyEvent.key already IS that vocabulary, so this adapter
+    forwards presses verbatim (releases/repeats dropped: session keys are discrete taps).
+    Returns a listener exposing ``.stop()``, matching create_key_listener's return.
+
+    share=True (the dagger shim sets it) rides the SAME stdin reader as the base
+    KeyboardTeleop's listener, so on a kitty terminal the session keys and the base wasd
+    fan out from one reader instead of racing two on fd 0 — the exact coexistence problem
+    make_stdin_listener solves for record's episode keys.
+    """
+    if fd is None:
+        fd = 0  # stdin
+
+    def on_event(ev: KeyEvent):
+        if ev.event_type != "press":
+            return
+        try:
+            dispatch(ev.key)
+        except Exception:
+            pass
+
+    source = open_key_source(on_event, fd=fd, require_release=False, share=share)
+
+    class _DispatchListener:
+        def stop(self):
+            source.stop()
+
+    return _DispatchListener()

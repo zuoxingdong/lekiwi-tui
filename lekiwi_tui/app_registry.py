@@ -1,6 +1,6 @@
 """app_registry.py — the standalone action registry.
 
-The 13 actions are grouped into HOST/COLLECT/LEARN/SETUP sections and expose aliases for
+The 14 actions are grouped into HOST/COLLECT/LEARN/SETUP sections and expose aliases for
 direct-mode launch. Screen/stream/host actions point at
 ``lekiwi_tui.screens.<mod>:<Class>``; suspend actions name a handler the dispatcher
 (``dispatch.py``) resolves. This module is pure data + lookup — it imports no framework
@@ -45,6 +45,7 @@ ACTIONS: list[Action] = [
     Action("host-kill", "🛑", "Stop host", "stop the running Pi host server", "HOST", "host", "lekiwi_tui.screens.host_kill:HostKillScreen", brief="stop the running Pi host"),
     Action("teleop", "🎮", "Teleoperate", "drive the arm and mobile base manually", "COLLECT", "screen", "lekiwi_tui.screens.teleop:TeleopScreen", brief="drive the arm and base"),
     Action("record", "🔴", "Record", "record episodes into a local dataset", "COLLECT", "screen", "lekiwi_tui.screens.record:RecordScreen", brief="into the local dataset"),
+    Action("dagger", "🩹", "DAgger", "a policy drives; you record corrections when it fails", "COLLECT", "screen", "lekiwi_tui.screens.dagger:DaggerScreen", brief="policy drives, you correct"),
     Action("edit-dataset", "📊", "Edit dataset", "browse, triage, and delete episodes in place", "COLLECT", "screen", "lekiwi_tui.screens.dataset_edit:DatasetEditScreen", card="DATA", brief="browse, triage, delete"),
     Action("replay", "🎬", "Replay", "run recorded actions on the robot", "COLLECT", "suspend", "replay", card="DATA", brief="run actions on the robot"),
     Action("view", "🔍", "View", "open a recorded episode in Rerun", "COLLECT", "suspend", "view", card="DATA", brief="open an episode in Rerun"),
@@ -66,6 +67,7 @@ ALIASES: dict[str, str] = {
     "t": "teleop",
     "r": "record",
     "edit": "edit-dataset", "dataset": "edit-dataset",
+    "d": "dagger", "hil": "dagger",
     "p": "replay",
     "viz": "view", "v": "view",
     "c": "calibrate",
