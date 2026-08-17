@@ -1,7 +1,10 @@
 """eval.py — EvalScreen: configure + launch a policy rollout on the robot (lerobot-rollout).
 
 A form with a DYNAMIC field list (the exec-horizon row appears only for the rtc backend,
-the action-steps row only for sync), a PolicyPicker, an editable Task, a flow-steps row
+the action-steps row only for sync), a PolicyPicker, a Base dataset + Task pair (←→ cycles
+the base's own task strings, defaulting to the dataset the CHECKPOINT was trained on per its
+train_config.json — a policy only behaves on instructions it was trained on, and a
+near-duplicate string is a silently different prompt; ⏎ still opens free text), a flow-steps row
 (FM integration steps; a policy that never reads num_steps ignores the override, so
 deliberately NO model-type gating), a camera-slots mode (auto-detected from the
 checkpoint's config.json input_features — see detect_cam_slots),
@@ -27,6 +30,7 @@ from pyratatui import Clear, Line, Span
 
 from .. import ROOT
 from ..config import cfg_get, collapse_home
+from ..datasets import record_root
 from ..hostprobe import host_alive
 from ..framework import runner, theme
 from ..framework.events import BACKTAB, DOWN, ENTER, ESC, LEFT, RIGHT, TAB, UP, Key, is_char
@@ -37,10 +41,11 @@ from ..preflight import confirm_preflight, eval_issues
 from ..policies import discover_policies, is_valid_checkpoint, resolve_policy
 from ..scoreboard import append_score, ckpt_label, load_scores, score_tally
 from ..widgets.pickers import CUSTOM, PolicyPicker
+from ..widgets.task_choices import TaskChoices
 from .chrome import clip_end as _clip_end
 from .chrome import clip_middle as _clip_middle
 from .chrome import (
-    number_line, setting_line, toggle,
+    number_line, setting_line, task_stepper_cell, toggle,
     draw_form_page, padded_line, plan_row, section_line, seg, slim_status_spans,
 )
 
@@ -191,6 +196,34 @@ def training_rename_map(policy: str) -> dict[str, str] | None:
     return None
 
 
+def training_dataset_name(policy: str) -> str | None:
+    """The bare NAME of the dataset the checkpoint was trained on, or None.
+
+    Read from ``train_config.json``'s ``dataset.repo_id``. The task strings a policy
+    actually understands are the ones in ITS training data, so this is a better default
+    for the Base row than whatever dataset the yaml happens to point at.
+    """
+    try:
+        data = json.loads((Path(policy) / "train_config.json").read_text())
+    except Exception:
+        return None
+    repo = (data.get("dataset") or {}).get("repo_id")
+    return str(repo).rsplit("/", 1)[-1] if repo else None
+
+
+def resolve_base_dataset(policy: str, parent: str | Path) -> str | None:
+    """The local dataset dir under *parent* matching the checkpoint's training dataset.
+
+    None when the checkpoint records none or it is not on this machine. Paths stay
+    RELATIVE (the app runs with cwd=ROOT), like ``discover_datasets``.
+    """
+    name = training_dataset_name(policy)
+    if not name:
+        return None
+    candidate = Path(parent) / name
+    return str(candidate) if candidate.is_dir() else None
+
+
 def cam_map_conflicts(policy: str, rollout_map: dict | None) -> list[tuple[str, str, str]]:
     """Per-slot disagreements as ``[(slot, trained_from, rollout_from)]``.
 
@@ -276,6 +309,20 @@ class EvalScreen(ScreenState):
         self._policy = remembered_policy or default_policy
         if remembered_policy:
             self._fallback_note = None
+        # Base dataset: where the Task row's choices come from. Default = the dataset
+        # THIS checkpoint was trained on (from its train_config.json), resolved under the
+        # datasets dir; the yaml record dataset is the fallback. A base picked by hand is
+        # PINNED, so switching checkpoints afterwards no longer moves it.
+        self._ds_parent = str(Path(record_root(ctx.doc)).parent)
+        self._base_pinned = bool(state.get("base_pinned", False))
+        base = str(state.get("base") or "")
+        if base:
+            self._base_source = "pinned" if self._base_pinned else "remembered"
+        else:
+            derived = resolve_base_dataset(self._policy, self._ds_parent)
+            base = derived or record_root(ctx.doc)
+            self._base_source = "from checkpoint" if derived else "yaml default"
+        self._task_choices = TaskChoices(base)
         self._task_text = str(state.get("task", cfg_get("rollout.task", doc=ctx.doc) or ""))
         backend = str(state.get("backend", ctx.cfg["INFERENCE"]))
         self._backend = backend if backend in ("sync", "rtc") else ctx.cfg["INFERENCE"]
@@ -326,6 +373,8 @@ class EvalScreen(ScreenState):
     def _remember(self) -> None:
         _state(self.ctx).update({
             "policy": self._policy,
+            "base": self._task_choices.base,
+            "base_pinned": self._base_pinned,
             "task": self._task_text,
             "backend": self._backend,
             "exec_horizon": self._exec.value,
@@ -372,7 +421,7 @@ class EvalScreen(ScreenState):
         while backend and cameras shared one row and became a skipped row the moment they
         stopped sharing.
         """
-        f = ["policy", "task", "backend", "cameras"]
+        f = ["policy", "base", "task", "backend", "cameras"]
         if self._backend == "rtc":
             f.append("exec")
         else:
@@ -456,7 +505,9 @@ class EvalScreen(ScreenState):
         cur = self._cur()
         if name in (LEFT, "h", RIGHT, "l"):
             delta = -1 if name in (LEFT, "h") else 1
-            if cur == "backend":
+            if cur == "task":
+                self._cycle_task(delta)
+            elif cur == "backend":
                 self._backend = "sync" if self._backend == "rtc" else "rtc"
                 self._fpos = min(self._fpos, len(self._fields()) - 1)
                 self._remember()
@@ -474,6 +525,8 @@ class EvalScreen(ScreenState):
         if name == ENTER:
             if cur == "policy":
                 return Invoke(self._pick_policy)
+            if cur == "base":
+                return Invoke(self._pick_base)
             if cur == "task":
                 return Invoke(self._edit_task)
             if cur == "extra":
@@ -530,6 +583,32 @@ class EvalScreen(ScreenState):
         if ans is not None:
             self._task_text = ans.strip(); self._err = ""; self._remember()
 
+    def _cycle_task(self, delta: int) -> None:
+        """←→ walks the base dataset's strings (inert when it has none)."""
+        self._task_text = self._task_choices.cycle(self._task_text, delta)
+        self._remember()
+
+    async def _pick_base(self) -> None:
+        """Pick which dataset's task strings the Task row offers. Picking PINS the
+        choice, so a later checkpoint switch keeps it."""
+        from ..dispatch import pick_dataset
+
+        picked = await pick_dataset(self.app, self.ctx.doc,
+                                   title="Task strings - pick the base dataset")
+        if picked is None:
+            return
+        _repo, root = picked
+        self._task_choices.base = root
+        self._base_pinned = True
+        self._base_source = "pinned"
+        tasks = self._task_choices.tasks()
+        # Keep a blank task (it means "use the saved yaml default"); only a stale
+        # non-empty string snaps onto the new base's first choice.
+        if tasks and self._task_text and self._task_text not in tasks:
+            self._task_text = tasks[0]
+        self._err = ""
+        self._remember()
+
     async def _edit_extra(self) -> None:
         ans = await self.app.run_modal(PromptModalState(
             "Extra lerobot flags", value=self._extra_text,
@@ -556,6 +635,12 @@ class EvalScreen(ScreenState):
         self._fallback_note = None
         self._err = ""
         self._refresh_ckpt_defaults()  # new checkpoint -> new 0-sentinel labels
+        if not self._base_pinned:
+            # Follow the new checkpoint's own training dataset (a pinned base stays put).
+            derived = resolve_base_dataset(self._policy, self._ds_parent)
+            if derived:
+                self._task_choices.base = derived
+                self._base_source = "from checkpoint"
         self._remember()
 
     async def _start(self) -> None:
@@ -727,14 +812,37 @@ class EvalScreen(ScreenState):
         if self._fallback_note:
             lines.append(Line([Span(" " * (2 + self._LABEL_W), theme.BASE_STYLE),
                                Span(f"⚠ {self._fallback_note}", theme.WARN_STYLE)]))
+        # Base dataset — the source of the Task row's choices, with the count on the
+        # right so an empty/wrong base is visible before the policy is conditioned on
+        # a string it never trained on.
+        indent = " " * (2 + self._LABEL_W)
+        tasks = self._task_choices.tasks()
+        base_note = (f"{len(tasks)} task string(s) · {self._base_source}" if tasks
+                     else f"no task strings · {self._base_source}")
+        lines.append(padded_line(
+            [self._gutter("base"), self._lab("Base", cur == "base"),
+             Span(self._task_choices.name, theme.TEXT_STYLE)],
+            [Span(base_note, theme.FAINT_STYLE), Span("  ", theme.BASE_STYLE)], w))
         # Task wraps with a hanging indent rather than being clipped: the end of an
-        # instruction is the part that distinguishes two similar tasks.
+        # instruction is the part that distinguishes two similar tasks. The ‹ N/M › cell
+        # says the row is adjustable (←→ walks the base's strings).
+        position = self._task_choices.position(self._task_text)
+        cell_spans, cell_cols = task_stepper_cell(position, len(tasks), focused=cur == "task")
         task_segs = wrap_words(self._task_text or "(saved default)",
-                               max(20, w - 4 - self._LABEL_W))
+                               max(20, w - 4 - self._LABEL_W - cell_cols))
         lines.append(Line([self._gutter("task"), self._lab("Task", cur == "task"),
-                           Span(task_segs[0], theme.TEXT_STYLE)]))
-        lines.extend(Line([Span(" " * (2 + self._LABEL_W), theme.BASE_STYLE),
+                           *cell_spans, Span(task_segs[0], theme.TEXT_STYLE)]))
+        lines.extend(Line([Span(indent + " " * cell_cols, theme.BASE_STYLE),
                            Span(s, theme.TEXT_STYLE)]) for s in task_segs[1:])
+        if tasks and position is None and self._task_text:
+            # A string the base does not contain is a silently different prompt — the
+            # exact divergence the picker exists to prevent, so it is never left implicit.
+            for chunk in wrap_words(
+                    f"⚠ not one of {self._task_choices.name}'s strings — the policy was "
+                    "conditioned on those; ←→ picks them",
+                    max(20, w - 4 - self._LABEL_W)):
+                lines.append(Line([Span(indent, theme.BASE_STYLE),
+                                   Span(chunk, theme.WARN_STYLE)]))
         lines.append(Line([]))
         lines.append(section_line("RUN"))
         # One setting per row. Backend and Cameras used to share a line with the resolved
@@ -811,8 +919,12 @@ class EvalScreen(ScreenState):
         field = self._cur()
         if field == "policy":
             return "⏎ pick a checkpoint · newest first"
+        if field == "base":
+            return "⏎ pick the dataset whose task strings this form offers"
         if field == "task":
-            return "⏎ edit the task instruction (blank = saved default)"
+            return ("←→ cycle the base dataset's strings · ⏎ free text (blank = saved default)"
+                    if self._task_choices.tasks()
+                    else "⏎ edit the task instruction (base has no strings; blank = saved default)")
         if field == "backend":
             return ("RTC: smoother control for slower policies · ←→/⏎ switch"
                     if self._backend == "rtc"
@@ -849,6 +961,8 @@ class EvalScreen(ScreenState):
             suffix = "  default" if self._policy and self._policy == self._default_abs else ""
             disp = _clip_middle(disp, max(8, width - len(suffix))) + suffix
             return disp
+        if field == "base":
+            return _clip_end(self._task_choices.name, width)
         if field == "task":
             t = (self._task_text or "(saved default)").splitlines()[0]
             return _clip_end(t, width)
@@ -875,6 +989,9 @@ class EvalScreen(ScreenState):
             if self._policy and self._policy == self._default_abs:
                 disp += "  default"
             return disp
+        if field == "base":
+            n = len(self._task_choices.tasks())
+            return f"{self._task_choices.name} · {n} task string(s) · {self._base_source}"
         if field == "task":
             return (self._task_text or "(saved default)").replace("\n", " ")
         if field == "backend":

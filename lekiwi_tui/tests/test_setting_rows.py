@@ -378,8 +378,16 @@ def test_a_clean_auto_detection_does_not_cry_wolf(tmp_path):
     scr = _eval("auto")
     scr._policy = _ckpt(tmp_path, _TRAINED)
     scr._rename_map = _TRAINED
+    # Blank the task: the Task row runs its OWN check (is the string one the base dataset
+    # carries?), and this test is about the CAMERA detection not crying wolf. A blank task
+    # means "use the saved yaml default", which is never flagged.
+    scr._task_text = ""
 
-    assert "⚠" not in _body(scr, 88)
+    body = _body(scr, 88)
+    assert "⚠" not in body
+    for camera_complaint in ("MAPPING MISMATCH", "not verified against the checkpoint",
+                             "trained for"):
+        assert camera_complaint not in body
 
 
 def test_an_unverified_detection_is_marked_rather_than_shown_as_fact():
