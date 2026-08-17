@@ -70,6 +70,18 @@ def dataset_episodes(root: str | Path) -> str:
     return "?" if n is None else str(n)
 
 
+def dataset_features(root: str | Path) -> set[str]:
+    """The feature keys recorded in the dataset's meta/info.json; empty set on any
+    failure. Used by the merge flow to spot dagger datasets (they carry
+    `intervention`) and to name the output accordingly."""
+    try:
+        info = json.loads((Path(root) / "meta" / "info.json").read_text())
+    except Exception:
+        return set()
+    feats = info.get("features")
+    return set(feats) if isinstance(feats, dict) else set()
+
+
 def dataset_tasks(root: str | Path) -> list[str]:
     """The task strings recorded in the dataset at *root*, in stored order.
 
