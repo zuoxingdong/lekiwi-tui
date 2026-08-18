@@ -124,6 +124,37 @@ _dataset: &dataset
 _task: &task "Pick up the cube and place it in the box."
 
 
+# Everything a policy-driven run shares, whatever it does with the result: the same
+# robot, the same camera mapping, the same inference backend, the same instruction.
+# `rollout:` (watch it) and `dagger:` (correct it) merge this and then differ only in
+# their strategy and in what they record — so a change here reaches both, and the two
+# cannot fall out of step the way two hand-kept copies do.
+_policy_run: &policy_run
+  robot: *robot
+  inference:
+    type: sync                   # one policy forward per tick; for slow VLAs use rtc
+  # Robot camera key → the policy's trained input slot.
+  #
+  # This pairing is NOT a convention you can guess: it is whatever the training run
+  # happened to use, and the checkpoint records it in train_config.json (and in its
+  # saved policy_preprocessor.json). A PERMUTATION is the dangerous case, because
+  # both sides still use the same slot NAMES while the policy silently receives two
+  # of its three views swapped.
+  #
+  # So treat this block as a fallback. The Run policy screen's default `auto`
+  # camera-slots mode reads the mapping out of the checkpoint and sends that, and
+  # warns when the checkpoint disagrees with what is written here. Set it to match
+  # YOUR checkpoint, or leave it alone if your policy trained on the raw
+  # front/wrist/top keys and let `auto` resolve to native.
+  rename_map:
+    observation.images.front: observation.images.camera1
+    observation.images.wrist: observation.images.camera2
+    observation.images.top: observation.images.camera3
+  fps: 30
+  task: *task
+  display_data: false            # live camera / action view in Rerun
+
+
 # ============================================================================
 # host — the LeKiwi host process (runs ON the robot)
 # The launcher ships this block to the Pi and starts the host with
@@ -226,33 +257,11 @@ replay:
 # the CLI / the Run policy screen.
 # ============================================================================
 rollout:
-  robot: *robot
+  <<: *policy_run
   # No `teleop:` — the policy generates every action, including base velocities.
   strategy:
     type: base                   # autonomous, nothing recorded
-  inference:
-    type: sync                   # one policy forward per tick; for slow VLAs use rtc
-  # Robot camera key → the policy's trained input slot.
-  #
-  # This pairing is NOT a convention you can guess: it is whatever the training run
-  # happened to use, and the checkpoint records it in train_config.json (and in its
-  # saved policy_preprocessor.json). A PERMUTATION is the dangerous case, because
-  # both sides still use the same slot NAMES while the policy silently receives two
-  # of its three views swapped.
-  #
-  # So treat this block as a fallback. The Run policy screen's default `auto`
-  # camera-slots mode reads the mapping out of the checkpoint and sends that, and
-  # warns when the checkpoint disagrees with what is written here. Set it to match
-  # YOUR checkpoint, or leave it alone if your policy trained on the raw
-  # front/wrist/top keys and let `auto` resolve to native.
-  rename_map:
-    observation.images.front: observation.images.camera1
-    observation.images.wrist: observation.images.camera2
-    observation.images.top: observation.images.camera3
-  fps: 30
   duration: 60                   # seconds; 0 = run until Ctrl-C
-  task: *task
-  display_data: false            # live camera / action view in Rerun
 
 
 # ============================================================================
@@ -266,14 +275,12 @@ rollout:
 # (rollout refuses to reuse a dir).
 # ============================================================================
 dagger:
-  robot: *robot
+  <<: *policy_run
   teleop: *leader_arm            # corrections need the leader (arm + base keyboard)
   strategy:
     type: dagger
     record_autonomous: false     # corrections-only; true = sentry-style record-all
     input_device: keyboard       # or `pedal` (PCsensor footswitch, see strategy docs)
-  inference:
-    type: sync                   # one policy forward per tick; for slow VLAs use rtc
   dataset:
     # repo name MUST start with `rollout_` (lerobot validates) and gets a
     # timestamp appended per session. Location comes from --dataset.root.
@@ -291,16 +298,7 @@ dagger:
       vcodec: h264_nvenc         # or `hevc_nvenc` = smaller files
       extra_options:
         bf: 0
-  # Same fallback map as rollout's — the Run policy screen's `auto` cam-slots
-  # resolves the real one from the checkpoint. Keep the two blocks in sync.
-  rename_map:
-    observation.images.front: observation.images.camera1
-    observation.images.wrist: observation.images.camera2
-    observation.images.top: observation.images.camera3
-  fps: 30
   duration: 0                    # no time limit; session ends on num_episodes or ESC
-  task: *task
-  display_data: false
   play_sounds: true              # announces "Correction N saved" — useful hands-busy
 
 
