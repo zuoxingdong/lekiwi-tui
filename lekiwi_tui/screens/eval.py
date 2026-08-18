@@ -8,13 +8,16 @@ switch to collecting corrections.
 
 What is EvalScreen's own: it records nothing, so there is no dataset and no leader; its
 preflight is the eval one; Start SUSPENDS into the rollout (it owns the real TTY for its
-keyboard controls) and the run ends with a scoreboard verdict. Fronts scripts/eval.sh (the sole argv source). NO compile toggle
+keyboard controls) and the run ends with a scoreboard verdict. ``c`` hands the current
+configuration to the DAgger form, which is the natural next step the moment a rollout
+starts failing. Fronts scripts/eval.sh (the sole argv source). NO compile toggle
 (intentional: per-shape recompiles are a training optimisation, not an eval one).
 """
 from __future__ import annotations
 
 import shlex
 import time
+from typing import TYPE_CHECKING, Any
 
 from pyratatui import Line, Span
 
@@ -22,6 +25,7 @@ from .. import ROOT
 from ..config import cfg_get, collapse_home
 from ..framework import runner, theme
 from ..framework.modals import ConfirmModalState
+from ..framework.screen import Invoke
 from ..preflight import confirm_preflight, eval_issues
 from ..scoreboard import append_score, ckpt_label, load_scores, score_tally
 from .chrome import clip_end as _clip_end
@@ -33,6 +37,9 @@ from .policy_form import (
     resolve_base_dataset, resolve_eval_policy, shared_state, training_dataset_name,
     training_rename_map,
 )
+
+if TYPE_CHECKING:
+    from ..framework.events import Key
 
 # The run_headless hook name used by direct no-TTY CLI dispatch.
 HEADLESS_HOOK = "run_headless"
@@ -106,6 +113,24 @@ class EvalScreen(PolicyFormScreen):
             self.app.notify(f"scoreboard: {label} on this task → {s}/{n}", "info")
         else:
             self.app.notify("✗ could not write the scoreboard file", "warn")
+
+    # ── hand off to correction collection ─────────────────────────────────────
+    def _handle_own_key(self, key: "Key", cur: str) -> Any | None:
+        if key.name == "c":
+            return Invoke(self._collect_corrections)
+        return None
+
+    async def _collect_corrections(self) -> None:
+        """Open the DAgger form carrying this configuration.
+
+        The moment you want to collect corrections is while watching a rollout fail, and
+        the settings are already right. The shared session memory does the carrying, so
+        this only has to persist and push — there is no config to copy across.
+        """
+        self._remember()
+        from .dagger import DaggerScreen
+
+        self.app.push(DaggerScreen(self.app, self.ctx))
 
     # ── view ──────────────────────────────────────────────────────────────────
     def _header_right(self) -> list[Span]:
