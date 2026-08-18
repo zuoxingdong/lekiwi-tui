@@ -371,7 +371,9 @@ def test_forcing_a_mode_the_checkpoint_contradicts_warns(tmp_path):
     scr._rename_map = _TRAINED
 
     assert "⚠" in _body(scr, 88)
-    assert "trained for map" in _body(scr, 88)
+    # auto would resolve to "trained" here (the checkpoint records its own map), so the
+    # complaint names what forcing native throws away rather than a mode name.
+    assert "ignoring the mapping this checkpoint records" in _body(scr, 88)
 
 
 def test_a_clean_auto_detection_does_not_cry_wolf(tmp_path):
@@ -453,9 +455,11 @@ def test_a_swapped_pair_is_detected_even_though_the_slot_SETS_match(tmp_path):
 
     ckpt = _ckpt(tmp_path, _TRAINED)
 
-    # the old set-subset test is perfectly happy
-    assert detect_cam_slots(ckpt, _SWAPPED) == ("map", "camera1/camera2/camera3")
-    # the pairwise test is not
+    # A set-subset check cannot tell these apart, so detection no longer relies on one:
+    # the checkpoint records its own map, and that wins — the crossed pairing is not
+    # merely reported now, it is unsendable.
+    assert detect_cam_slots(ckpt, _SWAPPED) == ("trained", "from the checkpoint")
+    # the pairwise test still names it, for the modes a user can force
     assert cam_map_conflicts(ckpt, _SWAPPED) == [
         ("camera2", "top", "wrist"),
         ("camera3", "wrist", "top"),
@@ -536,7 +540,8 @@ def test_native_is_not_accused_of_sending_the_yaml_pairs(tmp_path):
     warning = scr._cam_warning()
 
     assert "MAPPING MISMATCH" not in warning
-    assert "forced native" in warning and "trained for map" in warning
+    assert "forced native" in warning
+    assert "ignoring the mapping this checkpoint records" in warning
 
 
 def test_the_picker_offers_exactly_two_modes():

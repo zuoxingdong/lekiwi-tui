@@ -23,6 +23,7 @@
 #       [--rename_map={...}                       when --cam-slots native|trained]
 #       [--policy.n_action_steps=<n>              when --action-steps n>0]
 #       [--policy.num_steps=<n>                   when --flow-steps n>0]
+#       [--policy.compile_model=<true|false>      when --compile on|off]
 #       [passthrough...]
 #
 #   * --config_path is the SPACE (two-token) form, NOT --config_path=... .
@@ -43,6 +44,9 @@
 #     Pedal device/key codes ride in via passthrough (--strategy.pedal.*).
 #   * --cam-slots map|native|trained: same semantics + helpers as eval.sh, reading
 #     THIS script's `dagger:` yaml section. `auto` is TUI-side, rejected here.
+#   * --compile auto|on|off: same semantics as eval.sh (the checkpoint's OWN
+#     policy.compile_model; auto emits no token). A DAgger session is long, so paying
+#     the compile once is usually right here — but it is the same knob either way.
 #   * --action-steps / --flow-steps: same semantics as eval.sh (sync chunk pacing /
 #     FM integration steps; 0 = the checkpoint's own value, no token emitted). The
 #     autonomous phase is a live rollout, so its pacing knobs matter here just as
@@ -86,6 +90,7 @@ gpu=""                 # GPU name; non-empty -> emit --device=cuda
 cam_slots="map"        # map -> keep the slice rename_map (same modes as eval.sh)
 steps="0"              # 0/blank -> omit --policy.n_action_steps (checkpoint default)
 flow="0"               # 0/blank -> omit --policy.num_steps (checkpoint default)
+compile_mode="auto"    # auto -> omit --policy.compile_model (checkpoint's own setting)
 dataset_root=""        # blank -> per-session stamped dir (computed below)
 dry="${DRY:-0}"
 extra=()
@@ -119,6 +124,8 @@ while [[ $# -gt 0 ]]; do
       steps="$2"; shift 2 ;;
     --flow-steps)
       flow="$2"; shift 2 ;;
+    --compile)
+      compile_mode="$2"; shift 2 ;;
     --dataset-root)
       dataset_root="$2"; shift 2 ;;
     --dry-run)
@@ -131,6 +138,11 @@ done
 case "$cam_slots" in
   map|native|trained) ;;
   *) die_usage "--cam-slots must be 'map', 'native' or 'trained' (got '$cam_slots'); 'auto' is TUI-side" ;;
+esac
+# --compile keeps its `auto` here (it just means "emit no token"); see eval.sh.
+case "$compile_mode" in
+  auto|on|off) ;;
+  *) die_usage "--compile must be 'auto', 'on' or 'off' (got '$compile_mode')" ;;
 esac
 case "$input" in
   keyboard|pedal) ;;
@@ -272,6 +284,10 @@ fi
 #  10) --policy.num_steps only when --flow-steps n>0 (0 = the checkpoint's own value).
 if [[ -n "$flow" && "$flow" -gt 0 ]]; then
   argv+=("--policy.num_steps=${flow}")
+fi
+#  11) --policy.compile_model only when --compile is on|off (auto = checkpoint's own).
+if [[ "$compile_mode" != "auto" ]]; then
+  argv+=("--policy.compile_model=$([[ "$compile_mode" == "on" ]] && echo true || echo false)")
 fi
 # Append any passthrough flags last (draccus last-wins). Empty in the TUI path.
 if [[ ${#extra[@]} -gt 0 ]]; then

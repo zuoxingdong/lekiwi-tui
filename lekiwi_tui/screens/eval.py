@@ -32,7 +32,8 @@ from .chrome import clip_end as _clip_end
 from .chrome import clip_middle as _clip_middle
 from .chrome import section_line, slim_status_spans
 from .policy_form import (
-    CAM_MODES, PolicyFormScreen, _checkpoint_error, _device_note, _policy_root_path,
+    CAM_MODES, COMPILE_MODES, PolicyFormScreen, _checkpoint_error, _device_note,
+    _policy_root_path,
     cam_map_conflicts, cam_pairs, detect_cam_detail, detect_cam_slots,
     resolve_base_dataset, resolve_eval_policy, shared_state, training_dataset_name,
     training_rename_map,
@@ -85,7 +86,7 @@ class EvalScreen(PolicyFormScreen):
             "bash", str(EVAL_SCRIPT),
             "--policy", self._policy, "--task", self._task_text, "--backend", self._backend,
             "--exec-horizon", str(self._exec.value), "--action-steps", str(self._steps.value),
-            "--flow-steps", str(self._flow.value),
+            "--flow-steps", str(self._flow.value), "--compile", self._compile,
             "--cam-slots", cam_slots, "--duration", str(self._dur.value),
             "--display", "on" if self._show else "off", "--gpu", self.ctx.gpu_name,
             *extra_tokens, *self._extra,
@@ -247,6 +248,8 @@ class EvalScreen(PolicyFormScreen):
             if self._cam_mode == "auto":
                 return _clip_end(f"{theme.choice('auto')} · {mode} · {note}", width)
             return _clip_end(f"{theme.choice(mode)} · {note}", width)
+        if field == "compile":
+            return _clip_end(f"{theme.choice(self._compile)} · {self._compile_note()}", width)
         if field == "display":
             return theme.choice("on") if self._show else theme.choice("off")
         if field == "extra":
@@ -274,6 +277,8 @@ class EvalScreen(PolicyFormScreen):
             mode, note = self._cam_resolved()
             origin = "auto-detected" if self._cam_mode == "auto" else "forced"
             return f"{mode} · {note} · {origin}"
+        if field == "compile":
+            return f"{self._compile} · {self._compile_note()}"
         if field == "duration":
             return self._dur.display()
         if field == "display":
@@ -300,15 +305,18 @@ def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001
         print(f"✗ {err}")
         return 1
     show = str(ctx.cfg["DISPLAY_DATA"]).lower() in ("1", "true", "yes", "on")
-    # Same auto camera-slots resolution as the form's default mode; action-steps has no
-    # env knob, so headless always passes 0 (the script omits the token = checkpoint
-    # default), exactly like an untouched form.
+    # Same auto camera-slots resolution as the form's default mode — the SAME function it
+    # calls, which is the point: this line used to reach a classifier that did not prefer
+    # the checkpoint's own map, so headless quietly sent the yaml's slots where the form
+    # sent the checkpoint's. action-steps has no env knob, so headless always passes 0
+    # (the script omits the token = checkpoint default), exactly like an untouched form.
     cam_slots, _note = detect_cam_slots(policy, cfg_get("rollout.rename_map", doc=ctx.doc) or {})
     argv = [
         "bash", str(EVAL_SCRIPT),
         "--policy", policy, "--backend", ctx.cfg["INFERENCE"],
         "--exec-horizon", str(ctx.cfg["EXECUTION_HORIZON"]),
-        "--action-steps", "0", "--flow-steps", "0", "--cam-slots", cam_slots,
+        "--action-steps", "0", "--flow-steps", "0", "--compile", "auto",
+        "--cam-slots", cam_slots,
         "--duration", "0", "--display", "on" if show else "off",
         "--gpu", ctx.gpu_name, *extra,
     ]
@@ -316,7 +324,8 @@ def run_headless(ctx, extra: list[str]) -> int:  # noqa: ANN001
 
 
 __all__ = [
-    "CAM_MODES", "EvalScreen", "HEADLESS_HOOK", "cam_map_conflicts", "cam_pairs",
+    "CAM_MODES", "COMPILE_MODES", "EvalScreen", "HEADLESS_HOOK", "cam_map_conflicts",
+    "cam_pairs",
     "detect_cam_detail", "detect_cam_slots", "resolve_base_dataset", "resolve_eval_policy",
     "run_headless", "shared_state", "training_dataset_name", "training_rename_map",
 ]

@@ -163,7 +163,7 @@ class DaggerScreen(PolicyFormScreen):
             "--policy", self._policy, "--task", self._task_text,
             "--backend", self._backend, "--exec-horizon", str(self._exec.value),
             "--action-steps", str(self._steps.value),
-            "--flow-steps", str(self._flow.value),
+            "--flow-steps", str(self._flow.value), "--compile", self._compile,
             "--target", str(self._target.value),
             "--record-autonomous", "on" if self._record_all else "off",
             "--input", "pedal" if self._pedal else "keyboard",
