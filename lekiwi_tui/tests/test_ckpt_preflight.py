@@ -43,11 +43,11 @@ def test_unknown_fields_are_named_and_block(tmp_path, monkeypatch):
     _no_cache(monkeypatch, tmp_path)
 
     def boom(_):
-        raise RuntimeError("The fields `attention_backend`, `chunk_drift` are not valid for SmolVLAConfig")
+        raise RuntimeError("The fields `attention_backend`, `chunk_scale` are not valid for SmolVLAConfig")
 
     code, text = pf.diagnose(str(_ckpt(tmp_path)), facts=FACTS, load=boom)
     assert code == pf.INCOMPATIBLE
-    assert "attention_backend, chunk_drift" in text
+    assert "attention_backend, chunk_scale" in text
     assert "smolvla" in text and "0.6.1" in text
     assert "Nothing was sent to the robot." in text
 
