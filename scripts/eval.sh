@@ -22,6 +22,7 @@
 #       [--rename_map={k: k, ...}                   when --cam-slots native]
 #       [--policy.n_action_steps=<n>                when --action-steps n>0]
 #       [--policy.num_steps=<n>                     when --flow-steps n>0]
+#       [--policy.compile_model=<true|false>        when --compile on|off]
 #       [passthrough...]
 #
 #   * --config_path is the SPACE (two-token) form, NOT --config_path=...
@@ -62,8 +63,14 @@
 #     integration steps per chunk — applies to sync AND rtc (rtc guides through the
 #     integrator). A policy that never reads num_steps simply ignores the override
 #     (inert), so there is no model-type gating anywhere.
-#   * deliberately NO --use_torch_compile: it was rejected for SmolVLA eval (per-shape
-#     recompiles are a training opt, not an eval one), so it stays absent here.
+#   * --compile auto|on|off maps to --policy.compile_model=true|false, ONLY when on|off
+#     (auto = the checkpoint's own value, no token). This is the POLICY's own compile
+#     flag, read by its constructor — pi05 ships compile_model=true with
+#     compile_mode="max-autotune", so `auto` there buys a multi-minute first forward with
+#     the robot already connected, and `off` is how you skip it for a quick check.
+#   * deliberately NO --use_torch_compile: that is lerobot's separate TRAIN-side flag
+#     (per-shape recompiles are a training opt, not an eval one), and unrelated to the
+#     per-checkpoint policy.compile_model above.
 #
 # Usage:
 #   scripts/eval.sh --policy ~/run/checkpoints/last/pretrained_model --display on
@@ -116,6 +123,7 @@ gpu=""                 # GPU name; non-empty -> emit --device=cuda
 cam_slots="map"        # map -> keep the slice rename_map; native -> identity override
 steps="0"              # 0/blank -> omit --policy.n_action_steps (checkpoint default)
 flow="0"               # 0/blank -> omit --policy.num_steps (checkpoint default)
+compile_mode="auto"    # auto -> omit --policy.compile_model (checkpoint's own setting)
 dry="${DRY:-0}"        # DRY=1 in the env is an alias for --dry-run
 extra=()               # passthrough flags appended after the built argv
 
@@ -146,6 +154,8 @@ while [[ $# -gt 0 ]]; do
       steps="$2"; shift 2 ;;
     --flow-steps)
       flow="$2"; shift 2 ;;
+    --compile)
+      compile_mode="$2"; shift 2 ;;
     --dry-run)
       dry=1; shift ;;
     *)
@@ -158,6 +168,13 @@ done
 case "$cam_slots" in
   map|native|trained) ;;
   *) die_usage "--cam-slots must be 'map', 'native' or 'trained' (got '$cam_slots'); 'auto' is TUI-side" ;;
+esac
+
+# --compile, unlike --cam-slots, keeps its `auto` HERE: auto means "emit no token", which
+# is a decision this script can make on its own (no checkpoint inspection needed).
+case "$compile_mode" in
+  auto|on|off) ;;
+  *) die_usage "--compile must be 'auto', 'on' or 'off' (got '$compile_mode')" ;;
 esac
 
 # rename_identity_token
@@ -295,6 +312,12 @@ fi
 #      value). Same -n guard as --duration.
 if [[ -n "$flow" && "$flow" -gt 0 ]]; then
   argv+=("--policy.num_steps=${flow}")
+fi
+#   8) --policy.compile_model only when --compile is on|off (auto = the checkpoint's
+#      own compile_model, which for a pi05 trained with compile_mode=max-autotune means
+#      a long first forward AFTER the robot is connected).
+if [[ "$compile_mode" != "auto" ]]; then
+  argv+=("--policy.compile_model=$([[ "$compile_mode" == "on" ]] && echo true || echo false)")
 fi
 # Append any passthrough flags last (so a user --device= wins, draccus last-wins).
 # Empty in the TUI path, so the launch test still matches.

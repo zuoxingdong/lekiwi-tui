@@ -58,12 +58,28 @@ SHARED_STATE_KEY = "policy_form"
 #   native — force NO renaming. The one case auto can get wrong in the other direction:
 #            a policy trained on raw front/top/wrist whose config auto cannot read.
 #
-# "map" and "trained" were dropped from the picker and remain valid `--cam-slots`
-# values for CLI/headless use. "trained" was identical to auto whenever it worked and a
-# lie when it did not (it reported "trained" while the launcher silently emitted no
-# token). "map" only ever DIFFERED from auto when the checkpoint recorded a map and the
-# yaml contradicted it, i.e. a button whose sole distinct behaviour is the bug we detect.
+# "map" and "trained" are not picker entries and remain valid `--cam-slots` values for
+# CLI/headless use. "trained" is not a button because it is what auto RESOLVES to
+# (detect_cam_detail's first branch) whenever the checkpoint records a map — a button for
+# it would only ever be redundant, or a lie for the checkpoints that record none, where
+# the launcher silently emits no token. "map" only ever DIFFERED from auto when the
+# checkpoint recorded a map and the yaml contradicted it, i.e. a button whose sole
+# distinct behaviour is the bug we detect.
 CAM_MODES = ("auto", "native")
+
+# torch.compile modes, in ←→ cycle order.
+#
+#   auto — whatever the CHECKPOINT recorded in its own config (no CLI token emitted).
+#   on   — force --policy.compile_model=true
+#   off  — force --policy.compile_model=false
+#
+# A knob rather than a policy, because the trade is genuinely per-session and the cost
+# lands at the worst moment: a checkpoint trained with compile_model=true (pi05 ships
+# compile_mode="max-autotune") recompiles on the FIRST forward, i.e. after the robot is
+# connected and the session clock is already running. Worth it for a long autonomous
+# run, not for a 60-second "does it move at all" check. `auto` is the default so an
+# untouched form still runs the checkpoint exactly as trained.
+COMPILE_MODES = ("auto", "on", "off")
 
 
 # ── checkpoint + camera-slot resolution (module-level: also used headless) ─────
@@ -128,7 +144,7 @@ def _device_note(policy: str, gpu_name: str) -> str:
 
 
 def detect_cam_slots(policy: str, rename_map: dict | None) -> tuple[str, str]:
-    """Resolve the camera-slots mode for a checkpoint: ("map"|"native", note)."""
+    """Resolve the camera-slots mode for a checkpoint: ("trained"|"map"|"native", note)."""
     mode, note, _confident = detect_cam_detail(policy, rename_map)
     return mode, note
 
@@ -136,11 +152,22 @@ def detect_cam_slots(policy: str, rename_map: dict | None) -> tuple[str, str]:
 def detect_cam_detail(policy: str, rename_map: dict | None) -> tuple[str, str, bool]:
     """As :func:`detect_cam_slots`, plus whether the answer was DERIVED or GUESSED.
 
-    The third element is the point. Three of the branches below are fallbacks — no rename
-    map, unreadable config, unrecognised keys — and they return the same "map" as a
-    confident match. Rendering a guess and a derivation identically is how a wrong image
-    routing reaches the robot silently, so the caller marks the guesses.
+    The checkpoint's OWN recorded map wins whenever it has one: it is the only
+    authoritative source, so sending it verbatim makes a yaml/checkpoint permutation
+    impossible rather than merely visible, and it is the only branch that can route a
+    checkpoint whose slot names appear nowhere in the yaml (a pi05 trained on
+    base_0_rgb/left_wrist_0_rgb/right_wrist_0_rgb). This preference used to live in
+    PolicyFormScreen._cam_detail, which meant the form and the HEADLESS path resolved
+    the same checkpoint differently; it belongs here, where every caller shares it.
+
+    Everything below that is inference from the yaml map, for checkpoints that record
+    nothing. The third element is the point there. Three of those branches are fallbacks
+    — no rename map, unreadable config, unrecognised keys — and they return the same
+    "map" as a confident match. Rendering a guess and a derivation identically is how a
+    wrong image routing reaches the robot silently, so the caller marks the guesses.
     """
+    if training_rename_map(policy):
+        return "trained", "from the checkpoint", True
     rmap = {str(k): str(v) for k, v in (rename_map or {}).items()}
     if not rmap:
         return "map", "no yaml rename_map", False
@@ -346,6 +373,8 @@ class PolicyFormScreen(ScreenState):
         self._flow = NumberField(
             "Flow steps", _state_int(state, "flow_steps", 0), minimum=0, step=1,
             zero_label="checkpoint default")
+        compile_mode = str(state.get("compile", "auto"))
+        self._compile = compile_mode if compile_mode in COMPILE_MODES else "auto"
         self._rename_map = self._cfg(f"{self.CONFIG_SECTION}.rename_map") or {}
         cam_mode = str(state.get("cam_mode", "auto"))
         self._cam_mode = cam_mode if cam_mode in CAM_MODES else "auto"
@@ -402,6 +431,7 @@ class PolicyFormScreen(ScreenState):
             "action_steps": self._steps.value,
             "flow_steps": self._flow.value,
             "cam_mode": self._cam_mode,
+            "compile": self._compile,
             "duration": self._dur.value,
             "display": self._show,
             "extra_flags": self._extra_text,
@@ -444,7 +474,7 @@ class PolicyFormScreen(ScreenState):
         and for all checkpoints — a policy that never reads num_steps ignores it.
         """
         return ["policy", "base", "task", "backend", "cameras",
-                "exec" if self._backend == "rtc" else "steps", "flow"]
+                "exec" if self._backend == "rtc" else "steps", "flow", "compile"]
 
     def _tail_fields(self) -> list[str]:
         return ["duration", "display", "extra"]
@@ -469,15 +499,14 @@ class PolicyFormScreen(ScreenState):
     def _cam_detail(self) -> tuple[str, str, bool]:
         """(effective mode, detection note, detection was confident).
 
-        AUTO PREFERS "trained": when the checkpoint records the mapping it was trained
-        with, that is authoritative and gets sent verbatim, which makes a yaml/checkpoint
-        permutation impossible rather than merely visible.
+        Auto is whatever :func:`detect_cam_detail` resolves — including "trained", its
+        first branch. The preference lived HERE until it was pushed down, which is what
+        let the form and ``run_headless`` disagree about the same checkpoint; this now
+        only applies the picker's override.
         """
         mode, note, confident = detect_cam_detail(self._policy, self._rename_map)
         if self._cam_mode != "auto":
             return self._cam_mode, note, confident
-        if training_rename_map(self._policy):
-            return "trained", "from the checkpoint", True
         return mode, note, confident
 
     def _cam_warning(self) -> str:
@@ -492,6 +521,9 @@ class PolicyFormScreen(ScreenState):
             return f"MAPPING MISMATCH — {detail}"
         auto_mode, auto_note, confident = detect_cam_detail(self._policy, self._rename_map)
         if self._cam_mode != "auto" and confident and self._cam_mode != auto_mode:
+            if auto_mode == "trained":
+                return (f"forced {self._cam_mode} — ignoring the mapping this checkpoint "
+                        f"records for itself")
             return (f"forced {self._cam_mode}, but this checkpoint was trained for "
                     f"{auto_mode} ({auto_note})")
         if not confident:
@@ -528,6 +560,10 @@ class PolicyFormScreen(ScreenState):
                 i = CAM_MODES.index(self._cam_mode)
                 self._cam_mode = CAM_MODES[(i + delta) % len(CAM_MODES)]
                 self._remember()
+            elif cur == "compile":
+                i = COMPILE_MODES.index(self._compile)
+                self._compile = COMPILE_MODES[(i + delta) % len(COMPILE_MODES)]
+                self._remember()
             elif cur == "display":
                 self._show = not self._show
                 self._remember()
@@ -550,6 +586,10 @@ class PolicyFormScreen(ScreenState):
             if cur == "cameras":
                 i = CAM_MODES.index(self._cam_mode)
                 self._cam_mode = CAM_MODES[(i + 1) % len(CAM_MODES)]
+                self._remember(); return Nothing
+            if cur == "compile":
+                i = COMPILE_MODES.index(self._compile)
+                self._compile = COMPILE_MODES[(i + 1) % len(COMPILE_MODES)]
                 self._remember(); return Nothing
             if cur == "display":
                 self._show = not self._show; self._remember(); return Nothing
@@ -792,6 +832,23 @@ class PolicyFormScreen(ScreenState):
         "duration": "how long the rollout runs",
     }
 
+    def _compile_note(self) -> str:
+        """What the Compile row says to the right of the choices.
+
+        Under `auto` it names the checkpoint's OWN setting, for the same reason the
+        pacing rows spell out their 0-sentinel: "auto" is only informative if you can
+        see what it resolved to, and compile_model=true is the expensive answer."""
+        if self._compile != "auto":
+            return ("torch.compile forced on · slow first forward"
+                    if self._compile == "on" else "eager · no compile wait")
+        info = self._ckpt_info()
+        flag = info.get("compile_model")
+        if not isinstance(flag, bool):
+            return "checkpoint default"
+        mode = info.get("compile_mode")
+        detail = f" ({mode})" if flag and isinstance(mode, str) and mode else ""
+        return f"checkpoint default ({str(flag).lower()}){detail}"
+
     def _pacing_rows(self, w: int) -> list[Line]:
         cur = self._cur()
         pace = "exec" if self._backend == "rtc" else "steps"
@@ -799,7 +856,13 @@ class PolicyFormScreen(ScreenState):
         return [number_line(self._num(pace), label, cur == pace, self._NOTES[pace],
                             width=w, label_width=self._LABEL_W),
                 number_line(self._flow, "Flow steps", cur == "flow", self._NOTES["flow"],
-                            width=w, label_width=self._LABEL_W)]
+                            width=w, label_width=self._LABEL_W),
+                setting_line(
+                    "Compile",
+                    [s for m in COMPILE_MODES for s in
+                     (seg(m, self._compile == m), Span(" ", theme.BASE_STYLE))][:-1],
+                    self._compile_note(),
+                    focused=cur == "compile", label_width=self._LABEL_W, width=w)]
 
     def _tail_rows(self, w: int, *, duration_note: str = "") -> list[Line]:
         cur = self._cur()
@@ -827,6 +890,8 @@ class PolicyFormScreen(ScreenState):
         "steps": "open-loop actions per forward (0 = checkpoint) · ←→ ±1 · ⏎ type",
         "flow": "FM integration steps (0 = checkpoint) · ←→ ±1 · ⏎ type",
         "cameras": "camera slots the policy expects · auto reads the checkpoint · ←→ cycle",
+        "compile": "torch.compile the policy (auto = the checkpoint's own setting; "
+                   "compiling costs a slow first forward) · ←→/⏎ cycle",
         "display": "show live Rerun view (off lowers CPU) · ←→/⏎ toggle",
         "extra": "⏎ edit extra lerobot flags passed through verbatim",
     }
@@ -847,7 +912,8 @@ class PolicyFormScreen(ScreenState):
 
 
 __all__ = [
-    "CAM_MODES", "PolicyFormScreen", "SHARED_STATE_KEY", "cam_map_conflicts", "cam_pairs",
+    "CAM_MODES", "COMPILE_MODES", "PolicyFormScreen", "SHARED_STATE_KEY",
+    "cam_map_conflicts", "cam_pairs",
     "detect_cam_detail", "detect_cam_slots", "resolve_base_dataset", "resolve_eval_policy",
     "shared_state", "training_dataset_name", "training_rename_map",
 ]

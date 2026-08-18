@@ -200,12 +200,14 @@ def test_fields_fold_advanced_and_swap_exec_with_backend(tmp_path):
     base = _base_dataset(tmp_path)
     screen = DaggerScreen(None, _ctx(tmp_path, base))
     fields = screen._fields()
+    # `compile` sits with the other policy-execution knobs (it is rendered by the shared
+    # _pacing_rows), so it is NOT foldable — nav order must equal visual order.
     assert fields == ["policy", "base", "task", "backend", "cameras", "steps", "flow",
-                      "target", "advanced", "start"]
+                      "compile", "target", "advanced", "start"]
     screen._advanced = True
     assert screen._fields() == ["policy", "base", "task", "backend", "cameras", "steps",
-                                "flow", "target", "advanced", "mode", "input", "duration",
-                                "display", "extra", "start"]
+                                "flow", "compile", "target", "advanced", "mode", "input",
+                                "duration", "display", "extra", "start"]
     # rtc paces via exec-horizon instead of n_action_steps; flow stays for both
     screen._backend = "rtc"
     assert "exec" in screen._fields() and "steps" not in screen._fields()
