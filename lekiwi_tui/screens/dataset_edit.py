@@ -130,12 +130,20 @@ class DatasetEditScreen(ScreenState):
 
     title = "dataset"
 
-    def __init__(self, app: "App", ctx: "Context", *, extra: list[str] | None = None) -> None:
+    def __init__(self, app: "App", ctx: "Context", *, extra: list[str] | None = None,
+                 root: str | None = None, repo_id: str | None = None) -> None:
         self.app = app
         self.ctx = ctx
         self._extra = list(extra or [])
-        d = dataset_defaults(ctx.doc)
-        self._repo_id, self._root = resolve_repo_root(d["name"], d["ns"], d["parent"])
+        if root:
+            # Direct entry on a specific dataset (the dagger post-session review opens
+            # the fresh session here, junk pre-marked via meta/quality.jsonl). `d` still
+            # switches datasets afterwards, exactly as from the default entry.
+            self._root = root
+            self._repo_id = repo_id or f"local/{Path(root).name}"
+        else:
+            d = dataset_defaults(ctx.doc)
+            self._repo_id, self._root = resolve_repo_root(d["name"], d["ns"], d["parent"])
         self._rows: list[EpRow] = []
         self._verdicts: dict[int, str] = {}
         self._anomalies: dict[int, str] = {}

@@ -256,6 +256,55 @@ rollout:
 
 
 # ============================================================================
+# dagger — lerobot-rollout --strategy.type=dagger (HIL correction collection)
+# The policy drives; you intervene with the leader when it goes wrong. Keys:
+# space = pause/resume (an actuated leader auto-mirrors the follower on pause),
+# tab = start/stop a correction (each correction saves as ONE episode, frames
+# tagged intervention=True), enter = push to hub, ESC = end session.
+# dagger.sh passes --policy.path, --task/--dataset.single_task, the corrections
+# target and --dataset.root on the CLI; the dataset root is stamped per session
+# (rollout refuses to reuse a dir).
+# ============================================================================
+dagger:
+  robot: *robot
+  teleop: *leader_arm            # corrections need the leader (arm + base keyboard)
+  strategy:
+    type: dagger
+    record_autonomous: false     # corrections-only; true = sentry-style record-all
+    input_device: keyboard       # or `pedal` (PCsensor footswitch, see strategy docs)
+  inference:
+    type: sync                   # one policy forward per tick; for slow VLAs use rtc
+  dataset:
+    # repo name MUST start with `rollout_` (lerobot validates) and gets a
+    # timestamp appended per session. Location comes from --dataset.root.
+    repo_id: local/rollout_dagger
+    single_task: *task           # dagger.sh overrides per session via --task
+    fps: 30
+    push_to_hub: false           # local-only; merged into training data later
+    streaming_encoding: true     # near-instant episode saves (same as record)
+    encoder_threads: 1
+    video_encoding_batch_size: 1 # KEEP AT 1 — batch>1 loses recordings at session end
+    num_image_writer_threads_per_camera: 3
+    # GPU NVENC — same trade-offs as record's rgb_encoder block; delete to
+    # fall back to the software codec.
+    rgb_encoder:
+      vcodec: h264_nvenc         # or `hevc_nvenc` = smaller files
+      extra_options:
+        bf: 0
+  # Same fallback map as rollout's — the Run policy screen's `auto` cam-slots
+  # resolves the real one from the checkpoint. Keep the two blocks in sync.
+  rename_map:
+    observation.images.front: observation.images.camera1
+    observation.images.wrist: observation.images.camera2
+    observation.images.top: observation.images.camera3
+  fps: 30
+  duration: 0                    # no time limit; session ends on num_episodes or ESC
+  task: *task
+  display_data: false
+  play_sounds: true              # announces "Correction N saved" — useful hands-busy
+
+
+# ============================================================================
 # train — lerobot-train
 # A local SmolVLA fine-tune sized for a small (4 GB) laptop GPU: vision encoder
 # frozen, only the ~100M action expert trains. --policy.path / --output_dir /

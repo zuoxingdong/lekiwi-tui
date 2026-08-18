@@ -173,6 +173,35 @@ def eval_issues(ctx: "Context", *, policy: str) -> list[PreflightIssue]:
     return issues
 
 
+def dagger_issues(ctx: "Context", *, policy: str, parent: str) -> list[PreflightIssue]:
+    """Eval's checks plus dagger's two extra dependencies: the LEADER (corrections are
+    teleoperated, so a dead leader port means the session can pause but never correct)
+    and DISK under the datasets parent (a correction session writes videos like record
+    does). The dagger yaml block itself is checked statically: a strategy that is not
+    `dagger` means someone repurposed the block and space/tab would drive a different
+    state machine than the cheat-sheet promises."""
+    from .config import cfg_get
+
+    issues = robot_runtime_issues(ctx, check_leader=True)
+    if not ctx.gpu_name:
+        issues.append(PreflightIssue("no NVIDIA GPU detected; the autonomous phase may run slowly on CPU"))
+    if policy and not Path(policy).expanduser().exists() and "/" not in policy:
+        issues.append(PreflightIssue(f"policy looks like a model id, not a local checkpoint: {policy}"))
+    disk = _disk_issue(parent or ".", "dataset parent", min_gb=10.0)
+    if disk is not None:
+        issues.append(disk)
+    doc = getattr(ctx, "doc", None)
+    strategy = str(cfg_get("dagger.strategy.type", doc=doc) or "")
+    if strategy != "dagger":
+        issues.append(PreflightIssue(
+            f"lekiwi.yaml's dagger block has strategy.type '{strategy or '(missing)'}' — "
+            "the session keys (space/tab) drive the dagger state machine only"))
+    if str(cfg_get("dagger.teleop.type", doc=doc) or "") == "":
+        issues.append(PreflightIssue(
+            "lekiwi.yaml's dagger block has no teleop — corrections need the leader"))
+    return issues
+
+
 def _centered_rect(area: Any, width: int, height: int) -> Any:
     w = min(width, max(1, area.width))
     h = min(height, max(1, area.height))

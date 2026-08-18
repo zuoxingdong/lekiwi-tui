@@ -130,6 +130,24 @@ def stepper(text: str, *, focused: bool, width: int = STEPPER_W) -> list[Span]:
     return [Span("‹ ", bracket), Span(f"{text:>{width}}", style), Span(" ›", bracket)]
 
 
+def task_stepper_cell(position: int | None, total: int, *,
+                      focused: bool) -> tuple[list[Span], int]:
+    """The ``‹ 2/8 ›`` cell that marks a Task row as ADJUSTABLE, plus its column width.
+
+    The task row used to render as plain text, so nothing said ←→ cycles the base
+    dataset's strings while every neighbouring row showed guillemets. ``position=None``
+    renders ``‹ –/8 ›``: the current text is not one of those strings, which is the
+    silent divergence the picker exists to prevent, and the caller pairs it with a warning.
+    ``total <= 0`` (a base with no strings) yields no cell at all — there is nothing
+    to cycle, so an affordance would lie.
+    """
+    if total <= 0:
+        return [], 0
+    body = f"{position}/{total}" if position else f"–/{total}"
+    spans = [*stepper(body, focused=focused, width=len(body)), Span("  ", theme.BASE_STYLE)]
+    return spans, len(body) + 6  # "‹ " + body + " ›" + the two trailing spaces
+
+
 def toggle(on: bool, *, focused: bool, labels: tuple[str, str] = ("on", "off")) -> list[Span]:
     """A two-pill toggle: both states visible, the live one filled.
 

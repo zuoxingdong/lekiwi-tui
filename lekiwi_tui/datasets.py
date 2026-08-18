@@ -70,6 +70,54 @@ def dataset_episodes(root: str | Path) -> str:
     return "?" if n is None else str(n)
 
 
+def dataset_features(root: str | Path) -> set[str]:
+    """The feature keys recorded in the dataset's meta/info.json; empty set on any
+    failure. Used by the merge flow to spot dagger datasets (they carry
+    `intervention`) and to name the output accordingly."""
+    try:
+        info = json.loads((Path(root) / "meta" / "info.json").read_text())
+    except Exception:
+        return set()
+    feats = info.get("features")
+    return set(feats) if isinstance(feats, dict) else set()
+
+
+def dataset_tasks(root: str | Path) -> list[str]:
+    """The task strings recorded in the dataset at *root*, in stored order.
+
+    Reads ``meta/tasks.parquet`` (v3 format: the strings live in the index; older
+    writers used a ``task`` column — both are read). This is the DaggerScreen's
+    task picker source: a dagger session must stamp a string that exists in the
+    base dataset, and reading the strings from the dataset itself is what makes a
+    typo'd near-duplicate impossible. Best-effort: any unreadable piece → [].
+    """
+    path = Path(root) / "meta" / "tasks.parquet"
+    if not path.is_file():
+        return []
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq  # deferred: heavy, and not per-frame material
+
+        table = pq.read_table(path)
+    except Exception:
+        return []
+    # v3 writes the strings as the frame's INDEX, which parquet materializes as a
+    # regular column (named "task"); older writers used a plain "task" column. Both
+    # therefore read the same way, and any other string column is a last resort.
+    names = table.schema.names
+    column = "task" if "task" in names else next(
+        (n for n in names if table.schema.field(n).type == pa.string()), None)
+    if column is None:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in table.column(column).to_pylist():
+        if isinstance(value, str) and value.strip() and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
 def args_have_resume(extra: Sequence[str]) -> bool:
     """True if --resume or --resume=… is already in the passthrough args. Bash
     args_have_resume (425)."""
