@@ -186,7 +186,7 @@ def test_task_row_shows_the_stepper_cell_and_flags_custom_text(tmp_path):
     # no strings in the base -> no stepper cell, just the free-text invitation
     empty = tmp_path / "datasets" / "empty"
     (empty / "data").mkdir(parents=True)
-    screen._base = str(empty)
+    screen._task_choices.base = str(empty)
     screen._task_text = ""
     rows = _row_text(screen._body_lines(120))
     task_row = next(r for r in rows if "Task" in r)
@@ -258,7 +258,7 @@ def test_start_fronts_dagger_sh_with_the_resolved_flags(tmp_path, monkeypatch):
     # afterwards (post-session review), so it is computed here, not in the script
     assert re.fullmatch(
         re.escape(str(tmp_path / "datasets")) + r"/rollout_dagger_\d{8}_\d{6}", root)
-    assert dagger_mod._state(screen.ctx)["last_root"] == root
+    assert screen._own_state()["last_root"] == root
 
 
 def test_start_blocks_without_a_task_string(tmp_path, monkeypatch):
